@@ -1,0 +1,16 @@
+[project]
+name = "arm-policy"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Abe Winter", email = "abe-winter@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "viam-sdk>=0.81.0",
+]
+
+[tool.uv.sources]
+# temporary until released
+viam-sdk = { path = "../viam_sdk-0.81.0-py3-none-manylinux2014_x86_64.whl" }
