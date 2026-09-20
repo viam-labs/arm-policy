@@ -1,0 +1,13 @@
+{
+  "module_name": "arm-policy",
+  "visibility": "public_unlisted",
+  "namespace": "awinter",
+  "language": "python",
+  "resource_type": "component",
+  "resource_subtype": "generic",
+  "model_name": "policy",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-09-20T02:37:01.140674631Z",
+  "module_readme_link": "README.md"
+}
