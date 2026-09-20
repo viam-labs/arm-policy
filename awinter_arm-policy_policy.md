@@ -39,7 +39,7 @@ The model does not host or download the inference server. Start an OpenPI-compat
 
 | Name | Default | Description |
 |---|---:|---|
-| `execution_backend` | `simulation` | `simulation` or `physical_lite6`. |
+| `execution_backend` | `simulation` | Selects gripper handling only: normalized simulator targets or binary physical Lite6 thresholds. Arm observation and execution always use the standard Viam arm APIs. |
 | `conditioner_algorithm` | `quintic` | `quintic` or `toppra`. |
 | `max_chunks` | `1` | Receding-horizon chunks per execution, from 1 through 100. |
 | `action_prefix_steps` | `8` | Steps executed from each conditioned chunk, from 1 through 32. Mutually exclusive with duration. |
@@ -51,6 +51,12 @@ The model does not host or download the inference server. Start an OpenPI-compat
 | `physical_gripper_open_threshold` | `0.4` | Physical Lite6 binary-open threshold. |
 | `physical_gripper_close_threshold` | `0.6` | Physical Lite6 binary-close threshold. |
 | `physical_gripper_initial_state` | `0` | Initial physical gripper state: `0` open or `1` closed. |
+
+For every backend, arm joint observations come from `GetJointPositions` and each
+validated prefix is sent through `MoveThroughJointPositionsStreamed`. The backend
+adapter remains only because the simulated gripper accepts normalized inputs while
+the physical Lite6 gripper uses binary `Open`/`Grab` commands without normalized
+position feedback.
 
 The current contracts require a 32x7 action chunk at 20 Hz. Supported embodiments are Lite6 with `lite6_gripper` and UR20 with `robotiq_2f_85`. Safety profiles pin joint order, units, limits, FK, reach, floor, and TCP offset; configuration cannot weaken them.
 

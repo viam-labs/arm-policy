@@ -657,11 +657,8 @@ class Policy(Generic, EasyResource):
         return np.ascontiguousarray(np.asarray(decoded, dtype=np.uint8))
 
     async def _joint_radians(self) -> list[float]:
-        if self._execution_backend == "physical_lite6":
-            positions = await self._arm.get_joint_positions()
-            return [math.radians(float(value)) for value in positions.values]
-        result = await self._arm.do_command({"command": "get_joint_positions_radians"})
-        return [float(value) for value in cast(Any, result).get("values", [])]
+        positions = await self._arm.get_joint_positions()
+        return [math.radians(float(value)) for value in positions.values]
 
     async def _gripper_input(self) -> list[float]:
         if self._execution_backend == "physical_lite6":
@@ -1034,65 +1031,9 @@ class Policy(Generic, EasyResource):
         self._status["conditioning"][-1] = _value_types(diagnostics)
         return actions, timing, diagnostics
 
-    async def _dispatch_simulated_prefix(
-        self,
-        actions: np.ndarray,
-        operation: Any,
-        generation: int,
-        deadline_tolerance: float,
-    ) -> dict[str, Any]:
-        prefix_started = time.monotonic()
-        lateness_samples: list[float] = []
-        for action_index, action in enumerate(actions):
-            deadline = prefix_started + action_index * PERIOD_S
-            delay = deadline - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            if await self._cancelled(operation, generation):
-                raise asyncio.CancelledError
-            lateness = time.monotonic() - deadline
-            if lateness > deadline_tolerance:
-                raise TimeoutError(
-                    f"action {action_index} missed its deadline by {lateness:.6f}s"
-                )
-            lateness_samples.append(lateness)
-            await self._wait_cancellable(
-                asyncio.gather(
-                    self._arm.do_command(
-                        {
-                            "command": "set_joint_targets_radians",
-                            "values": action[:6].tolist(),
-                        }
-                    ),
-                    self._gripper.do_command(
-                        {"command": "set_input", "value": float(action[6])}
-                    ),
-                ),
-                PERIOD_S + deadline_tolerance,
-                operation,
-                generation,
-                "target dispatch",
-            )
-            self._status["action_index"] = action_index + 1
-            self._status["actions_executed"] += 1
-        return {
-            "backend": "simulation",
-            "scheduled_steps": len(actions),
-            "elapsed_sec": time.monotonic() - prefix_started,
-            "max_dispatch_lateness_sec": max(lateness_samples, default=0.0),
-        }
-
-    async def _dispatch_physical_prefix(
-        self,
-        actions: np.ndarray,
-        current_joints: Sequence[float],
-        operation: Any,
-        generation: int,
-        deadline_tolerance: float,
-    ) -> dict[str, Any]:
-        prefix_started = time.monotonic()
-        lateness_samples: list[float] = []
-
+    async def _stream_arm_prefix(
+        self, actions: np.ndarray, current_joints: Sequence[float]
+    ) -> None:
         async def batches():
             trajectory_point = cast(Any, Arm).TrajectoryPoint
             points = [
@@ -1110,55 +1051,82 @@ class Policy(Generic, EasyResource):
             )
             yield points
 
-        async def stream_arm() -> None:
-            stream = cast(Any, self._arm).move_through_joint_positions_streamed(
-                batches()
+        stream = cast(Any, self._arm).move_through_joint_positions_streamed(batches())
+        async for _ in stream:
+            pass
+
+    async def _dispatch_simulated_gripper(
+        self,
+        actions: np.ndarray,
+        prefix_started: float,
+        operation: Any,
+        generation: int,
+        deadline_tolerance: float,
+    ) -> list[float]:
+        lateness_samples: list[float] = []
+        for action_index, action in enumerate(actions):
+            deadline = prefix_started + action_index * PERIOD_S
+            delay = deadline - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if await self._cancelled(operation, generation):
+                raise asyncio.CancelledError
+            lateness = time.monotonic() - deadline
+            if lateness > deadline_tolerance:
+                raise TimeoutError(
+                    f"action {action_index} missed its deadline by {lateness:.6f}s"
+                )
+            lateness_samples.append(lateness)
+            await self._wait_cancellable(
+                self._gripper.do_command(
+                    {"command": "set_input", "value": float(action[6])}
+                ),
+                PERIOD_S + deadline_tolerance,
+                operation,
+                generation,
+                "gripper target dispatch",
             )
-            async for _ in stream:
-                pass
+            self._status["action_index"] = action_index + 1
+            self._status["actions_executed"] += 1
+        return lateness_samples
 
-        async def command_gripper() -> None:
-            for action_index, action in enumerate(actions):
-                deadline = prefix_started + action_index * PERIOD_S
-                delay = deadline - time.monotonic()
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                if await self._cancelled(operation, generation):
-                    raise asyncio.CancelledError
-                lateness = time.monotonic() - deadline
-                if lateness > deadline_tolerance:
-                    raise TimeoutError(
-                        f"action {action_index} missed its deadline by {lateness:.6f}s"
-                    )
-                lateness_samples.append(lateness)
-                value = float(action[6])
-                desired = self._physical_gripper_state
-                if value <= self._physical_gripper_open_threshold:
-                    desired = 0.0
-                elif value >= self._physical_gripper_close_threshold:
-                    desired = 1.0
-                if desired != self._physical_gripper_state:
-                    if desired == 0.0:
-                        await self._gripper.open()
-                    else:
-                        await self._gripper.grab()
-                    self._physical_gripper_state = desired
-                self._status["action_index"] = action_index + 1
-                self._status["actions_executed"] += 1
-
-        await self._wait_cancellable(
-            asyncio.gather(stream_arm(), command_gripper()),
-            len(actions) * PERIOD_S + self._connect_timeout,
-            operation,
-            generation,
-            "physical trajectory dispatch",
-        )
-        return {
-            "backend": "physical_lite6",
-            "scheduled_steps": len(actions),
-            "elapsed_sec": time.monotonic() - prefix_started,
-            "max_dispatch_lateness_sec": max(lateness_samples, default=0.0),
-        }
+    async def _dispatch_physical_gripper(
+        self,
+        actions: np.ndarray,
+        prefix_started: float,
+        operation: Any,
+        generation: int,
+        deadline_tolerance: float,
+    ) -> list[float]:
+        lateness_samples: list[float] = []
+        for action_index, action in enumerate(actions):
+            deadline = prefix_started + action_index * PERIOD_S
+            delay = deadline - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if await self._cancelled(operation, generation):
+                raise asyncio.CancelledError
+            lateness = time.monotonic() - deadline
+            if lateness > deadline_tolerance:
+                raise TimeoutError(
+                    f"action {action_index} missed its deadline by {lateness:.6f}s"
+                )
+            lateness_samples.append(lateness)
+            value = float(action[6])
+            desired = self._physical_gripper_state
+            if value <= self._physical_gripper_open_threshold:
+                desired = 0.0
+            elif value >= self._physical_gripper_close_threshold:
+                desired = 1.0
+            if desired != self._physical_gripper_state:
+                if desired == 0.0:
+                    await self._gripper.open()
+                else:
+                    await self._gripper.grab()
+                self._physical_gripper_state = desired
+            self._status["action_index"] = action_index + 1
+            self._status["actions_executed"] += 1
+        return lateness_samples
 
     async def _dispatch_prefix(
         self,
@@ -1168,17 +1136,39 @@ class Policy(Generic, EasyResource):
         generation: int,
         deadline_tolerance: float,
     ) -> dict[str, Any]:
-        if self._execution_backend == "physical_lite6":
-            return await self._dispatch_physical_prefix(
+        prefix_started = time.monotonic()
+        gripper_dispatch = (
+            self._dispatch_physical_gripper(
                 actions,
-                current_joints,
+                prefix_started,
                 operation,
                 generation,
                 deadline_tolerance,
             )
-        return await self._dispatch_simulated_prefix(
-            actions, operation, generation, deadline_tolerance
+            if self._execution_backend == "physical_lite6"
+            else self._dispatch_simulated_gripper(
+                actions,
+                prefix_started,
+                operation,
+                generation,
+                deadline_tolerance,
+            )
         )
+        _, lateness_samples = await self._wait_cancellable(
+            asyncio.gather(
+                self._stream_arm_prefix(actions, current_joints), gripper_dispatch
+            ),
+            len(actions) * PERIOD_S + self._connect_timeout,
+            operation,
+            generation,
+            "trajectory dispatch",
+        )
+        return {
+            "backend": self._execution_backend,
+            "scheduled_steps": len(actions),
+            "elapsed_sec": time.monotonic() - prefix_started,
+            "max_dispatch_lateness_sec": max(lateness_samples, default=0.0),
+        }
 
     async def _safe_stop(self) -> list[str]:
         results = await asyncio.gather(

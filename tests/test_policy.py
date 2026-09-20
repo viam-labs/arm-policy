@@ -39,46 +39,60 @@ class FakeCamera:
 
 
 class FakeArm:
-    def __init__(self, delay=0.0):
-        self.joints = [0.0] * 6
+    def __init__(self, joints=None, *, block=False):
+        self.joints = list(joints or [0.0] * 6)
         self.targets = []
         self.stops = 0
         self.target_times = []
-        self.delay = delay
+        self.streamed_batches = []
+        self.stream_started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.block = block
 
-    async def do_command(self, command):
-        if command["command"] == "policy_metadata":
-            profile = SAFETY_PROFILES[("ur20", "robotiq_2f_85")]
-            return {
-                "simulation": True,
-                "arm_model": profile.arm_model,
-                "joint_names": list(profile.joint_names),
-            }
-        if command["command"] == "get_joint_positions_radians":
-            return {"values": list(self.joints)}
-        assert command["command"] == "set_joint_targets_radians"
-        if self.delay:
-            await asyncio.sleep(self.delay)
-        self.targets.append(command["values"])
-        self.target_times.append(time.monotonic())
-        return {"accepted": True}
+    async def get_joint_positions(self):
+        return JointPositions(values=[np.degrees(value) for value in self.joints])
+
+    async def move_through_joint_positions_streamed(self, batches):
+        async for batch in batches:
+            self.streamed_batches.append(batch)
+            self.stream_started.set()
+            if self.block:
+                await self.release.wait()
+            else:
+                started = time.monotonic()
+                for point in batch[1:]:
+                    delay = started + point.time.total_seconds() - time.monotonic()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    self.targets.append(
+                        [np.radians(value) for value in point.positions]
+                    )
+                    self.target_times.append(time.monotonic())
+                if self.targets:
+                    self.joints = list(self.targets[-1])
+            yield Arm.TrajectoryUpdate()
 
     async def stop(self):
         self.stops += 1
+        self.release.set()
+
+    async def do_command(self, command):
+        raise AssertionError(f"arm received custom command: {command}")
 
 
 class FakeGripper:
-    def __init__(self):
+    def __init__(self, delay=0.0):
         self.targets = []
         self.stops = 0
+        self.delay = delay
 
     async def get_current_inputs(self):
         return [0.0]
 
     async def do_command(self, command):
-        if command["command"] == "policy_metadata":
-            return {"simulation": True, "gripper_model": "robotiq_2f_85"}
         assert command["command"] == "set_input"
+        if self.delay:
+            await asyncio.sleep(self.delay)
         self.targets.append(command["value"])
         return {"accepted": True}
 
@@ -333,6 +347,18 @@ def test_fk_workspace_rejection_is_atomic():
         policy._validate_actions(_actions(), [np.zeros(6), np.zeros(6)], dynamics=False)
 
 
+def test_arm_observation_uses_standard_degree_api():
+    async def scenario():
+        expected = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6]
+        policy = FakePolicy(b"", arm=FakeArm(joints=expected))
+
+        observation = await policy._observation("pick")
+
+        assert observation["observation/joint_position"] == pytest.approx(expected)
+
+    asyncio.run(scenario())
+
+
 def test_valid_execution_sends_exact_protocol_and_timestamped_prefix():
     async def scenario():
         policy = FakePolicy(
@@ -350,6 +376,12 @@ def test_valid_execution_sends_exact_protocol_and_timestamped_prefix():
         assert result["conditioning"][0]["conditioned"] is False
         assert result["conditioning"][0]["selected_prefix_steps"] == 3
         assert len(policy._arm.targets) == len(policy._gripper.targets) == 3
+        assert len(policy._arm.streamed_batches) == 1
+        points = policy._arm.streamed_batches[0]
+        assert [point.time.total_seconds() for point in points] == pytest.approx(
+            [0.0, 0.05, 0.1, 0.15]
+        )
+        assert points[0].positions == [0.0] * 6
         observation = unpack_message(policy.socket.sent[0])
         assert set(observation) == {
             "prompt",
@@ -626,10 +658,10 @@ def test_sdk_operation_cancellation_stops_inference():
     asyncio.run(scenario())
 
 
-def test_slow_target_latch_causes_deadline_rejection_without_catchup():
+def test_slow_gripper_latch_causes_deadline_rejection_without_catchup():
     async def scenario():
         policy = FakePolicy(
-            pack_message({"action": _actions()}), arm=FakeArm(delay=0.08)
+            pack_message({"action": _actions()}), gripper=FakeGripper(delay=0.08)
         )
         policy._deadline_tolerance = 0.01
         result = await policy.do_command(
@@ -643,10 +675,10 @@ def test_slow_target_latch_causes_deadline_rejection_without_catchup():
     asyncio.run(scenario())
 
 
-def test_per_run_deadline_tolerance_allows_slow_simulator_dispatch():
+def test_per_run_deadline_tolerance_allows_slow_simulator_gripper():
     async def scenario():
         policy = FakePolicy(
-            pack_message({"action": _actions()}), arm=FakeArm(delay=0.08)
+            pack_message({"action": _actions()}), gripper=FakeGripper(delay=0.08)
         )
 
         result = await policy.do_command(
