@@ -1,16 +1,33 @@
 [project]
 name = "arm-policy"
 version = "0.1.0"
-description = "Add your description here"
+description = "Safely execute contract-validated arm policies through Viam resources"
 readme = "README.md"
 authors = [
     { name = "Abe Winter", email = "abe-winter@users.noreply.github.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
-    "viam-sdk>=0.81.0",
+    "msgpack>=1.0.0",
+    "numpy>=1.26.0",
+    "pillow>=10.0.0",
+    "toppra>=0.6.3,<0.7",
+    "typing-extensions>=4.8.0",
+    "viam-sdk @ git+https://github.com/viamrobotics/viam-python-sdk.git@4ba5f2a1021353d253cc89cb86268273838af346",
+    "websockets>=12.0",
 ]
 
-[tool.uv.sources]
-# temporary until released
-viam-sdk = { path = "../viam_sdk-0.81.0-py3-none-manylinux2014_x86_64.whl" }
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.9.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

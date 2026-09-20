@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
-# todo: install uv if missing
-
-exec uv run src/main.py $@
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+exec uv run --frozen --project "$ROOT" "$ROOT/src/main.py" "$@"

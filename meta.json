@@ -3,14 +3,20 @@
   "module_id": "awinter:arm-policy",
   "visibility": "public_unlisted",
   "url": "",
-  "description": "Modular generic component: policy",
+  "description": "Safely executes contract-validated arm policies through typed Viam resources",
+  "models": [
+    {
+      "model": "awinter:arm-policy:policy",
+      "api": "rdk:component:generic",
+      "short_description": "Bridges arms, grippers, cameras, and an OpenPI policy server with bounded execution"
+    }
+  ],
   "applications": null,
   "markdown_link": "README.md",
   "entrypoint": "run.sh",
-  "first_run": "",
   "build": {
     "build": "make module.tar.gz",
     "path": "module.tar.gz",
-    "arch": ["any"]
+    "arch": ["linux/amd64"]
   }
 }
