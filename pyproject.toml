@@ -11,6 +11,7 @@ dependencies = [
     "msgpack>=1.0.0",
     "numpy>=1.26.0",
     "pillow>=10.0.0",
+    "pydantic>=2.13.5",
     "toppra>=0.6.3,<0.7",
     "typing-extensions>=4.8.0",
     # switch to >= 0.81.0 when it lands. we need motion streaming
