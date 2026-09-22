@@ -17,9 +17,27 @@ class FakeMachine:
         self.pose = pose
 
     async def transform_pose(self, query, destination):
-        assert query.reference_frame == "pick-arm"
-        assert query.pose == Pose()
-        return PoseInFrame(reference_frame=destination, pose=self.pose)
+        assert query.reference_frame == "pick-arm:base"
+        assert query.pose.o_z == 1
+        assert destination == "world"
+        if self.pose.theta == 90:
+            x = self.pose.x - query.pose.y
+            y = self.pose.y + query.pose.x
+        else:
+            x = self.pose.x + query.pose.x
+            y = self.pose.y + query.pose.y
+        return PoseInFrame(
+            reference_frame=destination,
+            pose=Pose(
+                x=x,
+                y=y,
+                z=self.pose.z + query.pose.z,
+                o_x=self.pose.o_x,
+                o_y=self.pose.o_y,
+                o_z=self.pose.o_z,
+                theta=self.pose.theta,
+            ),
+        )
 
 
 class FakeArm:
@@ -73,8 +91,8 @@ def test_lite6_scene_setup_matches_episode_capture_initialization():
     assert reset["command"] == "reset_props"
     assert reset["seed"] == 7
     assert reset["props"] == ["pick_block"]
-    assert reset["region"]["min"] == pytest.approx([0.88, 2.25, 0.5])
-    assert reset["region"]["max"] == pytest.approx([1.12, 2.38, 0.5])
+    assert reset["region"]["min"] == pytest.approx([0.88, 2.25, 0.0])
+    assert reset["region"]["max"] == pytest.approx([1.12, 2.38, 0.0])
     assert reset["yaw_range_deg"] == list(PICK_YAW_RANGE_DEG)
     assert result["performed"] is True
     assert result["seed"] == 7

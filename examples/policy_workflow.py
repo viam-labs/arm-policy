@@ -10,7 +10,6 @@ import asyncio
 import json
 import math
 import os
-from itertools import product
 from pathlib import Path
 from typing import Any, Mapping, cast
 
@@ -28,60 +27,32 @@ PICK_YAW_RANGE_DEG = (-180.0, 180.0)
 WORLD_FRAME = "world"
 
 
-def _transform_point_from_arm(
-    point_m: tuple[float, float, float], base_pose: Pose
-) -> tuple[float, float, float]:
-    axis_norm = math.sqrt(base_pose.o_x**2 + base_pose.o_y**2 + base_pose.o_z**2)
-    angle = math.radians(base_pose.theta)
-    if math.isclose(angle, 0.0, abs_tol=1e-12):
-        rotated = point_m
-    else:
-        if math.isclose(axis_norm, 0.0, abs_tol=1e-12):
-            raise RuntimeError(
-                "arm base pose has a nonzero angle without a rotation axis"
+async def _world_pick_region(
+    machine: Any, arm_frame: str
+) -> dict[str, list[float]]:
+    corners: list[tuple[float, float]] = []
+    for x_m in (PICK_REGION_MIN_M[0], PICK_REGION_MAX_M[0]):
+        for y_m in (PICK_REGION_MIN_M[1], PICK_REGION_MAX_M[1]):
+            transformed = await machine.transform_pose(
+                PoseInFrame(
+                    reference_frame=f"{arm_frame}:base",
+                    pose=Pose(x=x_m * 1000.0, y=y_m * 1000.0, o_z=1),
+                ),
+                WORLD_FRAME,
             )
-        axis = (
-            base_pose.o_x / axis_norm,
-            base_pose.o_y / axis_norm,
-            base_pose.o_z / axis_norm,
-        )
-        cosine = math.cos(angle)
-        sine = math.sin(angle)
-        dot = sum(component * value for component, value in zip(axis, point_m))
-        cross = (
-            axis[1] * point_m[2] - axis[2] * point_m[1],
-            axis[2] * point_m[0] - axis[0] * point_m[2],
-            axis[0] * point_m[1] - axis[1] * point_m[0],
-        )
-        rotated = tuple(
-            value * cosine + cross_value * sine + axis_value * dot * (1 - cosine)
-            for value, cross_value, axis_value in zip(point_m, cross, axis)
-        )
-    return (
-        base_pose.x / 1000.0 + rotated[0],
-        base_pose.y / 1000.0 + rotated[1],
-        base_pose.z / 1000.0 + rotated[2],
-    )
-
-
-def _world_pick_region(base_pose: Pose) -> dict[str, list[float]]:
-    corners = [
-        _transform_point_from_arm(corner, base_pose)
-        for corner in product(
-            (PICK_REGION_MIN_M[0], PICK_REGION_MAX_M[0]),
-            (PICK_REGION_MIN_M[1], PICK_REGION_MAX_M[1]),
-            (PICK_REGION_MIN_M[2], PICK_REGION_MAX_M[2]),
-        )
-    ]
+            corners.append((transformed.pose.x / 1000.0, transformed.pose.y / 1000.0))
+    xs, ys = zip(*corners)
+    support_height = PICK_REGION_MIN_M[2]
     return {
-        "min": [min(point[axis] for point in corners) for axis in range(3)],
-        "max": [max(point[axis] for point in corners) for axis in range(3)],
+        "min": [min(xs), min(ys), support_height],
+        "max": [max(xs), max(ys), support_height],
     }
 
 
 async def _arm_base_pose(machine: Any, arm_frame: str) -> Pose:
     transformed = await machine.transform_pose(
-        PoseInFrame(reference_frame=arm_frame, pose=Pose()), WORLD_FRAME
+        PoseInFrame(reference_frame=f"{arm_frame}:base", pose=Pose(o_z=1)),
+        WORLD_FRAME,
     )
     pose = transformed.pose
     values = (pose.x, pose.y, pose.z, pose.o_x, pose.o_y, pose.o_z, pose.theta)
@@ -103,8 +74,10 @@ async def prepare_lite6_scene(
     """Put the simulator in the same initial state used by episode capture."""
     await arm.move_to_joint_positions(JointPositions(values=list(HOME_JOINT_DEGREES)))
     await gripper.open()
-    base_pose = await _arm_base_pose(machine, arm_frame)
-    world_region = _world_pick_region(base_pose)
+    base_pose, world_region = await asyncio.gather(
+        _arm_base_pose(machine, arm_frame),
+        _world_pick_region(machine, arm_frame),
+    )
     reset = await world.do_command(
         {
             "command": "reset_props",
