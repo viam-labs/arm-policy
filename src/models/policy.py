@@ -1483,33 +1483,17 @@ class Policy(Generic, EasyResource):
                 )
 
     def _finish_result(self, state: str, error: str) -> dict[str, Any]:
+        finished_at = _utc_now()
         self._status.state = state
         self._status.last_error = error
+        self._status.finished_at = finished_at
         result = {
-            "run_id": self._status.run_id,
+            **self._status.to_dict(),
             "state": state,
-            "prompt": self._status.prompt,
-            "chunks_inferred": self._status.chunks_inferred,
-            "inference_responses": self._status.inference_responses,
-            "actions_executed": self._status.actions_executed,
-            "executed_prefixes": self._status.executed_prefixes,
-            "inference_ms": list(self._status.inference_ms),
-            "server_timing": list(self._status.server_timing),
-            "raw_action_chunks": list(self._status.raw_action_chunks),
-            "conditioned_action_chunks": list(self._status.conditioned_action_chunks),
-            "conditioning": list(self._status.conditioning),
-            "progress": list(self._status.progress),
-            "actuation_timing": list(self._status.actuation_timing),
-            "embodiment": dict(self._status.embodiment),
-            "safety_profile": self._status.safety_profile,
-            "conditioner_algorithm": self._status.conditioner_algorithm,
-            "deadline_tolerance_sec": self._status.deadline_tolerance_sec,
-            "execution_backend": self._config.execution_backend,
-            "started_at": self._status.started_at,
-            "finished_at": _utc_now(),
             "error": error,
-            "stop_errors": [],
+            "finished_at": finished_at,
         }
+        result.pop("last_error")
         self._last_result = result
         return result
 
