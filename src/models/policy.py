@@ -10,13 +10,31 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Mapping, Optional, Sequence, Tuple, cast
-from urllib.parse import urlparse
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    ClassVar,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    cast,
+)
 from uuid import uuid4
 
 import msgpack
 import numpy as np
 from PIL import Image
+from pydantic import (
+    BaseModel,
+    Field,
+    PrivateAttr,
+    StringConstraints,
+    WebsocketUrl,
+    model_validator,
+)
 from typing_extensions import Self
 from viam.components.arm import Arm
 from viam.components.camera import Camera
@@ -59,6 +77,185 @@ CAMERA_KEYS = (
 CAMERA_ALIASES = {
     key: key.replace("observation.images.", "observation/", 1) for key in CAMERA_KEYS
 }
+
+
+FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
+PositiveFiniteFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+UnitFloat = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+NonEmptyStr = Annotated[str, StringConstraints(min_length=1)]
+PinnedControlHz = Annotated[float, Field(ge=20.0, le=20.0, allow_inf_nan=False)]
+BinaryFloat = Annotated[
+    float, Field(ge=0.0, le=1.0, multiple_of=1.0, allow_inf_nan=False)
+]
+Prompt = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+Vector3 = tuple[FiniteFloat, FiniteFloat, FiniteFloat]
+Vector6 = tuple[
+    FiniteFloat,
+    FiniteFloat,
+    FiniteFloat,
+    FiniteFloat,
+    FiniteFloat,
+    FiniteFloat,
+]
+
+
+class Config(BaseModel):
+    """Validated policy configuration, including its policy contract."""
+
+    world: NonEmptyStr
+    arm: NonEmptyStr
+    gripper: NonEmptyStr
+    fixed_camera: NonEmptyStr
+    wrist_camera: NonEmptyStr
+    server_uri: WebsocketUrl
+    prompt: Prompt
+    policy_contract_path: NonEmptyStr
+
+    # Fixed by the checkpoint.
+    action_chunk_size: Literal[32] = 32
+    control_hz: PinnedControlHz = 20.0
+    fixed_camera_width: Literal[1280] = 1280
+    fixed_camera_height: Literal[720] = 720
+    wrist_camera_width: Literal[640] = 640
+    wrist_camera_height: Literal[480] = 480
+
+    connect_timeout_sec: PositiveFiniteFloat = 10.0
+    inference_timeout_sec: PositiveFiniteFloat = 120.0
+    deadline_tolerance_sec: PositiveFiniteFloat = 0.025
+
+    # Optional declarations may only repeat values selected by the contract.
+    max_reach_m: FiniteFloat | None = None
+    workspace_floor_m: FiniteFloat | None = None
+    tcp_offset_m: FiniteFloat | None = None
+    joint_min_radians: Vector6 | None = None
+    joint_max_radians: Vector6 | None = None
+    velocity_limits_rad_s: Vector6 | None = None
+    acceleration_limits_rad_s2: Vector6 | None = None
+
+    workspace_task_min_m: Vector3 | None = None
+    workspace_task_max_m: Vector3 | None = None
+    conditioner_algorithm: Literal["quintic", "toppra"] = "quintic"
+    execution_backend: Literal["simulation", "physical_lite6"] = "simulation"
+    physical_gripper_open_threshold: UnitFloat = 0.4
+    physical_gripper_close_threshold: UnitFloat = 0.6
+    physical_gripper_initial_state: BinaryFloat = 0.0
+    max_chunks: Annotated[int, Field(ge=1, le=100)] = 1
+    action_prefix_steps: Annotated[int, Field(ge=1, le=32)] | None = None
+    action_prefix_duration_sec: PositiveFiniteFloat | None = None
+
+    _contract: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _profile: SafetyProfile
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> Self:
+        contract, profile = _read_policy_contract(self.policy_contract_path)
+        self._contract = contract
+        self._profile = profile
+
+        pinned_scalars = {
+            "max_reach_m": profile.max_reach_m,
+            "workspace_floor_m": profile.workspace_floor_m,
+            "tcp_offset_m": profile.tcp_offset_m,
+        }
+        for key, expected in pinned_scalars.items():
+            value = getattr(self, key)
+            if value is not None and value != expected:
+                raise ValueError(f"{key} is fixed by safety profile {profile.name}")
+
+        pinned_vectors = {
+            "joint_min_radians": profile.joint_min,
+            "joint_max_radians": profile.joint_max,
+            "velocity_limits_rad_s": profile.velocity_limits,
+            "acceleration_limits_rad_s2": profile.acceleration_limits,
+        }
+        for key, expected in pinned_vectors.items():
+            value = getattr(self, key)
+            if value is not None and value != expected:
+                raise ValueError(f"{key} is fixed by safety profile {profile.name}")
+
+        if (self.workspace_task_min_m is None) != (self.workspace_task_max_m is None):
+            raise ValueError(
+                "workspace_task_min_m and workspace_task_max_m must be set together"
+            )
+        if (
+            self.workspace_task_min_m is not None
+            and self.workspace_task_max_m is not None
+        ):
+            if any(
+                low >= high
+                for low, high in zip(
+                    self.workspace_task_min_m, self.workspace_task_max_m
+                )
+            ):
+                raise ValueError("workspace task minimums must be below maximums")
+        if self.execution_backend == "physical_lite6" and profile.arm_model != "lite6":
+            raise ValueError(
+                "physical_lite6 execution requires a Lite6 policy contract"
+            )
+        if not (
+            self.physical_gripper_open_threshold < self.physical_gripper_close_threshold
+        ):
+            raise ValueError(
+                "physical gripper thresholds must satisfy 0 <= open < close <= 1"
+            )
+        if (
+            self.action_prefix_steps is not None
+            and self.action_prefix_duration_sec is not None
+        ):
+            raise ValueError(
+                "set only one of action_prefix_steps and action_prefix_duration_sec"
+            )
+        if self.action_prefix_duration_sec is not None:
+            _prefix_steps_from_duration(self.action_prefix_duration_sec)
+        return self
+
+    @property
+    def contract(self) -> dict[str, Any]:
+        return self._contract
+
+    @property
+    def profile(self) -> SafetyProfile:
+        return self._profile
+
+    @property
+    def dependencies(self) -> tuple[str, ...]:
+        return (
+            self.world,
+            self.arm,
+            self.gripper,
+            self.fixed_camera,
+            self.wrist_camera,
+        )
+
+    @property
+    def fixed_camera_size(self) -> tuple[int, int]:
+        return self.fixed_camera_width, self.fixed_camera_height
+
+    @property
+    def wrist_camera_size(self) -> tuple[int, int]:
+        return self.wrist_camera_width, self.wrist_camera_height
+
+    @property
+    def default_prefix_steps(self) -> int:
+        if self.action_prefix_duration_sec is not None:
+            return _prefix_steps_from_duration(self.action_prefix_duration_sec)
+        return self.action_prefix_steps if self.action_prefix_steps is not None else 8
+
+    @classmethod
+    def _unconfigured(cls) -> Self:
+        config = cls.model_construct(
+            world="",
+            arm="",
+            gripper="",
+            fixed_camera="",
+            wrist_camera="",
+            server_uri="",
+            prompt="",
+            policy_contract_path="",
+        )
+        config._contract = {}
+        config._profile = SAFETY_PROFILES[("ur20", "robotiq_2f_85")]
+        return config
 
 
 @dataclass(frozen=True)
@@ -320,26 +517,6 @@ def unpack_message(value: bytes) -> Any:
     return msgpack.unpackb(value, object_hook=_unpack_array, raw=False)
 
 
-def _finite_vector(
-    attrs: Mapping[str, Any],
-    key: str,
-    default: Sequence[float],
-    *,
-    positive: bool = False,
-) -> tuple[float, ...]:
-    raw = attrs.get(key, default)
-    if not isinstance(raw, (list, tuple)) or len(raw) != len(default):
-        raise ValueError(f"{key} must contain {len(default)} values")
-    values = tuple(float(item) for item in raw)
-    if not all(
-        math.isfinite(item) and (item > 0 if positive else True) for item in values
-    ):
-        raise ValueError(
-            f"{key} must contain {'positive ' if positive else ''}finite values"
-        )
-    return values
-
-
 def _positive(attrs: Mapping[str, Any], key: str, default: float) -> float:
     value = float(attrs.get(key, default))
     if not math.isfinite(value) or value <= 0:
@@ -390,23 +567,7 @@ class Policy(Generic, EasyResource):
         self._gripper: Gripper
         self._fixed_camera: Camera
         self._wrist_camera: Camera
-        self._server_uri = ""
-        self._prompt = ""
-        self._contract: dict[str, Any] = {}
-        self._profile = SAFETY_PROFILES[("ur20", "robotiq_2f_85")]
-        self._connect_timeout = 10.0
-        self._inference_timeout = 120.0
-        self._deadline_tolerance = 0.025
-        self._fixed_size = (1280, 720)
-        self._wrist_size = (640, 480)
-        self._task_min: Optional[tuple[float, ...]] = None
-        self._task_max: Optional[tuple[float, ...]] = None
-        self._default_max_chunks = 1
-        self._default_prefix = 8
-        self._conditioner_algorithm = "quintic"
-        self._execution_backend = "simulation"
-        self._physical_gripper_open_threshold = 0.4
-        self._physical_gripper_close_threshold = 0.6
+        self._config = Config._unconfigured()
         self._physical_gripper_state = 0.0
         self._owner_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
@@ -421,7 +582,7 @@ class Policy(Generic, EasyResource):
         return {
             "state": "idle",
             "run_id": "",
-            "deadline_tolerance_sec": self._deadline_tolerance,
+            "deadline_tolerance_sec": self._config.deadline_tolerance_sec,
             "prompt": "",
             "chunk_index": 0,
             "action_index": 0,
@@ -441,10 +602,10 @@ class Policy(Generic, EasyResource):
             "finished_at": "",
             "last_error": "",
             "stop_errors": [],
-            "embodiment": dict(self._contract.get("embodiment", {})),
-            "safety_profile": self._profile.name,
-            "conditioner_algorithm": self._conditioner_algorithm,
-            "execution_backend": self._execution_backend,
+            "embodiment": dict(self._config.contract.get("embodiment", {})),
+            "safety_profile": self._config.profile.name,
+            "conditioner_algorithm": self._config.conditioner_algorithm,
+            "execution_backend": self._config.execution_backend,
         }
 
     @classmethod
@@ -459,112 +620,8 @@ class Policy(Generic, EasyResource):
     def validate_config(
         cls, config: ComponentConfig
     ) -> Tuple[Sequence[str], Sequence[str]]:
-        attrs = get_attrs(config)
-        _, profile = _read_policy_contract(attrs.get("policy_contract_path"))
-        dependency_keys = ("world", "arm", "gripper", "fixed_camera", "wrist_camera")
-        dependencies = []
-        for key in dependency_keys:
-            value = attrs.get(key)
-            if not isinstance(value, str) or not value:
-                raise ValueError(f'{config.name}: "{key}" must name a resource')
-            dependencies.append(value)
-        uri = attrs.get("server_uri")
-        if (
-            not isinstance(uri, str)
-            or urlparse(uri).scheme not in ("ws", "wss")
-            or not urlparse(uri).netloc
-        ):
-            raise ValueError(
-                f'{config.name}: "server_uri" must be a ws:// or wss:// URI'
-            )
-        prompt = attrs.get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError(f'{config.name}: "prompt" must be non-empty')
-        if int(attrs.get("action_chunk_size", 32)) != 32:
-            raise ValueError("action_chunk_size must be 32 for this checkpoint")
-        if float(attrs.get("control_hz", 20.0)) != 20.0:
-            raise ValueError("control_hz must be 20 for this checkpoint")
-        expected_sizes = {
-            "fixed_camera_width": 1280,
-            "fixed_camera_height": 720,
-            "wrist_camera_width": 640,
-            "wrist_camera_height": 480,
-        }
-        for key, expected in expected_sizes.items():
-            if int(attrs.get(key, expected)) != expected:
-                raise ValueError(f"{key} must be {expected} for this checkpoint")
-        for key, default in (
-            ("connect_timeout_sec", 10.0),
-            ("inference_timeout_sec", 120.0),
-            ("deadline_tolerance_sec", 0.025),
-        ):
-            _positive(attrs, key, default)
-        pinned_scalars = {
-            "max_reach_m": profile.max_reach_m,
-            "workspace_floor_m": profile.workspace_floor_m,
-            "tcp_offset_m": profile.tcp_offset_m,
-        }
-        for key, expected in pinned_scalars.items():
-            if key in attrs and float(attrs[key]) != expected:
-                raise ValueError(f"{key} is fixed by safety profile {profile.name}")
-        pinned_vectors = {
-            "joint_min_radians": profile.joint_min,
-            "joint_max_radians": profile.joint_max,
-            "velocity_limits_rad_s": profile.velocity_limits,
-            "acceleration_limits_rad_s2": profile.acceleration_limits,
-        }
-        for key, expected in pinned_vectors.items():
-            if key in attrs and _finite_vector(attrs, key, expected) != expected:
-                raise ValueError(f"{key} is fixed by safety profile {profile.name}")
-        task_min, task_max = (
-            attrs.get("workspace_task_min_m"),
-            attrs.get("workspace_task_max_m"),
-        )
-        if (task_min is None) != (task_max is None):
-            raise ValueError(
-                "workspace_task_min_m and workspace_task_max_m must be set together"
-            )
-        if task_min is not None:
-            lows = _finite_vector(attrs, "workspace_task_min_m", (0.0, 0.0, 0.0))
-            highs = _finite_vector(attrs, "workspace_task_max_m", (0.0, 0.0, 0.0))
-            if any(low >= high for low, high in zip(lows, highs)):
-                raise ValueError("workspace task minimums must be below maximums")
-        conditioner = str(attrs.get("conditioner_algorithm", "quintic"))
-        if conditioner not in ("quintic", "toppra"):
-            raise ValueError("conditioner_algorithm must be 'quintic' or 'toppra'")
-        backend = str(attrs.get("execution_backend", "simulation"))
-        if backend not in ("simulation", "physical_lite6"):
-            raise ValueError(
-                "execution_backend must be 'simulation' or 'physical_lite6'"
-            )
-        if backend == "physical_lite6" and profile.arm_model != "lite6":
-            raise ValueError(
-                "physical_lite6 execution requires a Lite6 policy contract"
-            )
-        gripper_open = float(attrs.get("physical_gripper_open_threshold", 0.4))
-        gripper_close = float(attrs.get("physical_gripper_close_threshold", 0.6))
-        if not 0.0 <= gripper_open < gripper_close <= 1.0:
-            raise ValueError(
-                "physical gripper thresholds must satisfy 0 <= open < close <= 1"
-            )
-        gripper_initial = float(attrs.get("physical_gripper_initial_state", 0.0))
-        if gripper_initial not in (0.0, 1.0):
-            raise ValueError("physical_gripper_initial_state must be 0 or 1")
-        if "action_prefix_steps" in attrs and "action_prefix_duration_sec" in attrs:
-            raise ValueError(
-                "set only one of action_prefix_steps and action_prefix_duration_sec"
-            )
-        max_chunks = int(attrs.get("max_chunks", 1))
-        prefix = (
-            _prefix_steps_from_duration(attrs["action_prefix_duration_sec"])
-            if "action_prefix_duration_sec" in attrs
-            else int(attrs.get("action_prefix_steps", 8))
-        )
-        if not 1 <= max_chunks <= 100:
-            raise ValueError("max_chunks must be in [1, 100]")
-        if not 1 <= prefix <= 32:
-            raise ValueError("action_prefix_steps must be in [1, 32]")
-        return dependencies, []
+        parsed = Config.model_validate(get_attrs(config))
+        return parsed.dependencies, []
 
     @staticmethod
     def _dependency(
@@ -581,65 +638,20 @@ class Policy(Generic, EasyResource):
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
-        attrs = get_attrs(config)
-        self._contract, self._profile = _read_policy_contract(
-            attrs.get("policy_contract_path")
-        )
-        self._world = self._dependency(
-            dependencies, Generic, str(attrs["world"]), "world"
-        )
-        self._arm = self._dependency(dependencies, Arm, str(attrs["arm"]), "arm")
+        parsed = Config.model_validate(get_attrs(config))
+        self._world = self._dependency(dependencies, Generic, parsed.world, "world")
+        self._arm = self._dependency(dependencies, Arm, parsed.arm, "arm")
         self._gripper = self._dependency(
-            dependencies, Gripper, str(attrs["gripper"]), "gripper"
+            dependencies, Gripper, parsed.gripper, "gripper"
         )
         self._fixed_camera = self._dependency(
-            dependencies, Camera, str(attrs["fixed_camera"]), "fixed camera"
+            dependencies, Camera, parsed.fixed_camera, "fixed camera"
         )
         self._wrist_camera = self._dependency(
-            dependencies, Camera, str(attrs["wrist_camera"]), "wrist camera"
+            dependencies, Camera, parsed.wrist_camera, "wrist camera"
         )
-        self._server_uri = str(attrs["server_uri"])
-        self._prompt = str(attrs["prompt"])
-        self._connect_timeout = _positive(attrs, "connect_timeout_sec", 10.0)
-        self._inference_timeout = _positive(attrs, "inference_timeout_sec", 120.0)
-        self._deadline_tolerance = _positive(attrs, "deadline_tolerance_sec", 0.025)
-        self._fixed_size = (
-            int(attrs.get("fixed_camera_width", 1280)),
-            int(attrs.get("fixed_camera_height", 720)),
-        )
-        self._wrist_size = (
-            int(attrs.get("wrist_camera_width", 640)),
-            int(attrs.get("wrist_camera_height", 480)),
-        )
-        self._task_min = (
-            tuple(float(v) for v in attrs["workspace_task_min_m"])
-            if "workspace_task_min_m" in attrs
-            else None
-        )
-        self._task_max = (
-            tuple(float(v) for v in attrs["workspace_task_max_m"])
-            if "workspace_task_max_m" in attrs
-            else None
-        )
-        self._default_max_chunks = int(attrs.get("max_chunks", 1))
-        self._default_prefix = (
-            _prefix_steps_from_duration(attrs["action_prefix_duration_sec"])
-            if "action_prefix_duration_sec" in attrs
-            else int(attrs.get("action_prefix_steps", 8))
-        )
-        self._conditioner_algorithm = str(attrs.get("conditioner_algorithm", "quintic"))
-        self._execution_backend = str(attrs.get("execution_backend", "simulation"))
-        self._physical_gripper_open_threshold = float(
-            attrs.get("physical_gripper_open_threshold", 0.4)
-        )
-        self._physical_gripper_close_threshold = float(
-            attrs.get("physical_gripper_close_threshold", 0.6)
-        )
-        self._physical_gripper_state = float(
-            attrs.get("physical_gripper_initial_state", 0.0)
-        )
-        if self._physical_gripper_state not in (0.0, 1.0):
-            raise ValueError("physical_gripper_initial_state must be 0 or 1")
+        self._config = parsed
+        self._physical_gripper_state = parsed.physical_gripper_initial_state
         self._status = self._idle_status()
 
     @staticmethod
@@ -661,7 +673,7 @@ class Policy(Generic, EasyResource):
         return [math.radians(float(value)) for value in positions.values]
 
     async def _gripper_input(self) -> list[float]:
-        if self._execution_backend == "physical_lite6":
+        if self._config.execution_backend == "physical_lite6":
             return [self._physical_gripper_state]
         return [float(value) for value in await self._gripper.get_current_inputs()]
 
@@ -686,8 +698,12 @@ class Policy(Generic, EasyResource):
             or not 0.0 <= float(gripper[0]) <= 1.0
         ):
             raise ValueError("gripper returned invalid normalized state")
-        fixed = self._decode_image(fixed_images[0], self._fixed_size, "fixed camera")
-        wrist = self._decode_image(wrist_images[0], self._wrist_size, "wrist camera")
+        fixed = self._decode_image(
+            fixed_images[0], self._config.fixed_camera_size, "fixed camera"
+        )
+        wrist = self._decode_image(
+            wrist_images[0], self._config.wrist_camera_size, "wrist camera"
+        )
         return {
             "prompt": prompt,
             "observation/wrist_image_left": wrist,
@@ -758,17 +774,19 @@ class Policy(Generic, EasyResource):
 
         socket = await asyncio.wait_for(
             websockets.connect(
-                self._server_uri,
+                str(self._config.server_uri),
                 ping_interval=None,
                 compression=None,
                 max_size=64 * 1024 * 1024,
-                open_timeout=self._connect_timeout,
+                open_timeout=self._config.connect_timeout_sec,
             ),
-            timeout=self._connect_timeout,
+            timeout=self._config.connect_timeout_sec,
         )
         self._socket = socket
         try:
-            raw = await self._recv(socket, self._connect_timeout, operation, generation)
+            raw = await self._recv(
+                socket, self._config.connect_timeout_sec, operation, generation
+            )
             if not isinstance(raw, bytes):
                 raise RuntimeError(f"policy server metadata was text: {raw}")
             metadata = unpack_message(raw)
@@ -798,7 +816,7 @@ class Policy(Generic, EasyResource):
         return np.asarray(actions, dtype=np.float64), dict(timing)
 
     def _validate_joint_positions(self, actions: np.ndarray) -> None:
-        profile = self._profile
+        profile = self._config.profile
         for index, action in enumerate(actions):
             if any(
                 value < low or value > high
@@ -824,7 +842,7 @@ class Policy(Generic, EasyResource):
         dynamics: bool,
     ) -> None:
         previous_previous, previous = history[-2], history[-1]
-        profile = self._profile
+        profile = self._config.profile
         velocity_limits = np.asarray(profile.velocity_limits)
         acceleration_limits = np.asarray(profile.acceleration_limits)
         self._validate_position_and_gripper(actions)
@@ -852,12 +870,14 @@ class Policy(Generic, EasyResource):
                     f"action {index} TCP is below {profile.name} workspace floor"
                 )
             if (
-                self._task_min is not None
-                and self._task_max is not None
+                self._config.workspace_task_min_m is not None
+                and self._config.workspace_task_max_m is not None
                 and any(
                     value < low or value > high
                     for value, low, high in zip(
-                        (x, y, z), self._task_min, self._task_max
+                        (x, y, z),
+                        self._config.workspace_task_min_m,
+                        self._config.workspace_task_max_m,
                     )
                 )
             ):
@@ -869,7 +889,7 @@ class Policy(Generic, EasyResource):
     def _workspace_metrics(self, actions: np.ndarray) -> Mapping[str, Any]:
         positions = np.asarray(
             [
-                self._profile.fk(action[:6], self._profile.tcp_offset_m)
+                self._config.profile.fk(action[:6], self._config.profile.tcp_offset_m)
                 for action in actions
             ],
             dtype=np.float64,
@@ -880,7 +900,7 @@ class Policy(Generic, EasyResource):
             "tcp_max_m": np.max(positions, axis=0).tolist(),
             "max_reach_m": float(np.max(reach)),
             "minimum_floor_margin_m": float(
-                np.min(positions[:, 2]) - self._profile.workspace_floor_m
+                np.min(positions[:, 2]) - self._config.profile.workspace_floor_m
             ),
         }
 
@@ -896,7 +916,9 @@ class Policy(Generic, EasyResource):
         if joint_values.shape != (6,) or not np.isfinite(joint_values).all():
             raise ValueError("progress capture received invalid joint state")
         tcp = np.asarray(
-            self._profile.fk(joint_values.tolist(), self._profile.tcp_offset_m),
+            self._config.profile.fk(
+                joint_values.tolist(), self._config.profile.tcp_offset_m
+            ),
             dtype=np.float64,
         )
         record: dict[str, Any] = {
@@ -941,13 +963,15 @@ class Policy(Generic, EasyResource):
                 **trajectory_metrics(raw_actions, history, PERIOD_S),
                 "workspace": self._workspace_metrics(raw_actions),
             },
-            "selected_profile": self._profile.name,
+            "selected_profile": self._config.profile.name,
             "position_limits_rad": {
-                "minimum": list(self._profile.joint_min),
-                "maximum": list(self._profile.joint_max),
+                "minimum": list(self._config.profile.joint_min),
+                "maximum": list(self._config.profile.joint_max),
             },
-            "velocity_limits_rad_s": list(self._profile.velocity_limits),
-            "acceleration_limits_rad_s2": list(self._profile.acceleration_limits),
+            "velocity_limits_rad_s": list(self._config.profile.velocity_limits),
+            "acceleration_limits_rad_s2": list(
+                self._config.profile.acceleration_limits
+            ),
             "selected_prefix_steps": prefix,
             "selected_prefix_duration_s": prefix * PERIOD_S,
             "observation_age_at_prefix_end_s": prefix * PERIOD_S,
@@ -962,13 +986,13 @@ class Policy(Generic, EasyResource):
                 else condition_trajectory
             )
             actions, raw_diagnostics = conditioner(
-                raw_actions, history, self._profile, period_s=PERIOD_S
+                raw_actions, history, self._config.profile, period_s=PERIOD_S
             )
         except ValueError as exc:
             if conditioner_algorithm != "toppra":
                 raise
             actions, raw_diagnostics = condition_trajectory(
-                raw_actions, history, self._profile, period_s=PERIOD_S
+                raw_actions, history, self._config.profile, period_s=PERIOD_S
             )
             raw_diagnostics = {
                 **dict(raw_diagnostics),
@@ -987,7 +1011,7 @@ class Policy(Generic, EasyResource):
                 "gripper_projection_tolerance": GRIPPER_PROJECTION_TOLERANCE,
             }
         diagnostics.update(raw_diagnostics)
-        diagnostics["selected_profile"] = self._profile.name
+        diagnostics["selected_profile"] = self._config.profile.name
         diagnostics["raw_metrics"] = {
             **dict(diagnostics["raw_metrics"]),
             "workspace": self._workspace_metrics(raw_actions),
@@ -1114,9 +1138,9 @@ class Policy(Generic, EasyResource):
             lateness_samples.append(lateness)
             value = float(action[6])
             desired = self._physical_gripper_state
-            if value <= self._physical_gripper_open_threshold:
+            if value <= self._config.physical_gripper_open_threshold:
                 desired = 0.0
-            elif value >= self._physical_gripper_close_threshold:
+            elif value >= self._config.physical_gripper_close_threshold:
                 desired = 1.0
             if desired != self._physical_gripper_state:
                 if desired == 0.0:
@@ -1145,7 +1169,7 @@ class Policy(Generic, EasyResource):
                 generation,
                 deadline_tolerance,
             )
-            if self._execution_backend == "physical_lite6"
+            if self._config.execution_backend == "physical_lite6"
             else self._dispatch_simulated_gripper(
                 actions,
                 prefix_started,
@@ -1158,13 +1182,13 @@ class Policy(Generic, EasyResource):
             asyncio.gather(
                 self._stream_arm_prefix(actions, current_joints), gripper_dispatch
             ),
-            len(actions) * PERIOD_S + self._connect_timeout,
+            len(actions) * PERIOD_S + self._config.connect_timeout_sec,
             operation,
             generation,
             "trajectory dispatch",
         )
         return {
-            "backend": self._execution_backend,
+            "backend": self._config.execution_backend,
             "scheduled_steps": len(actions),
             "elapsed_sec": time.monotonic() - prefix_started,
             "max_dispatch_lateness_sec": max(lateness_samples, default=0.0),
@@ -1215,7 +1239,7 @@ class Policy(Generic, EasyResource):
                 )
                 older_values = await self._wait_cancellable(
                     self._joint_radians(),
-                    self._connect_timeout,
+                    self._config.connect_timeout_sec,
                     operation,
                     generation,
                     "first measured joint sample",
@@ -1232,7 +1256,7 @@ class Policy(Generic, EasyResource):
                 )
                 observation = await self._wait_cancellable(
                     self._observation(prompt),
-                    self._inference_timeout,
+                    self._config.inference_timeout_sec,
                     operation,
                     generation,
                     "observation capture",
@@ -1247,7 +1271,7 @@ class Policy(Generic, EasyResource):
                         self._world.do_command(
                             {"command": "get_prop_pose", "prop": progress_prop}
                         ),
-                        self._connect_timeout,
+                        self._config.connect_timeout_sec,
                         operation,
                         generation,
                         "progress prop query",
@@ -1266,13 +1290,13 @@ class Policy(Generic, EasyResource):
                 started = time.monotonic()
                 await self._wait_cancellable(
                     socket.send(pack_message(observation)),
-                    self._inference_timeout,
+                    self._config.inference_timeout_sec,
                     operation,
                     generation,
                     "policy request send",
                 )
                 raw = await self._recv(
-                    socket, self._inference_timeout, operation, generation
+                    socket, self._config.inference_timeout_sec, operation, generation
                 )
                 inference_ms = (time.monotonic() - started) * 1000.0
                 if await self._cancelled(operation, generation):
@@ -1302,7 +1326,7 @@ class Policy(Generic, EasyResource):
                                     if conditioner_algorithm == "toppra"
                                     else ALGORITHM_VERSION
                                 ),
-                                "selected_profile": self._profile.name,
+                                "selected_profile": self._config.profile.name,
                                 "rejection_reason": "",
                             }
                         )
@@ -1326,7 +1350,7 @@ class Policy(Generic, EasyResource):
                 self._status["executed_prefixes"] += 1
                 after_arm, after_gripper = await self._wait_cancellable(
                     asyncio.gather(self._joint_radians(), self._gripper_input()),
-                    self._connect_timeout,
+                    self._config.connect_timeout_sec,
                     operation,
                     generation,
                     "post-prefix progress capture",
@@ -1337,7 +1361,7 @@ class Policy(Generic, EasyResource):
                         self._world.do_command(
                             {"command": "get_prop_pose", "prop": progress_prop}
                         ),
-                        self._connect_timeout,
+                        self._config.connect_timeout_sec,
                         operation,
                         generation,
                         "post-prefix prop query",
@@ -1409,7 +1433,7 @@ class Policy(Generic, EasyResource):
             "safety_profile": self._status["safety_profile"],
             "conditioner_algorithm": self._status["conditioner_algorithm"],
             "deadline_tolerance_sec": self._status["deadline_tolerance_sec"],
-            "execution_backend": self._execution_backend,
+            "execution_backend": self._config.execution_backend,
             "started_at": self._status["started_at"],
             "finished_at": _utc_now(),
             "error": error,
@@ -1423,10 +1447,10 @@ class Policy(Generic, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         if self._closed:
             raise RuntimeError(f"policy {self.name} is closed")
-        prompt = str(command.get("prompt", self._prompt)).strip()
+        prompt = str(command.get("prompt", self._config.prompt)).strip()
         if not prompt:
             raise ValueError("execute prompt must be non-empty")
-        max_chunks = int(cast(Any, command.get("max_chunks", self._default_max_chunks)))
+        max_chunks = int(cast(Any, command.get("max_chunks", self._config.max_chunks)))
         if "action_prefix_steps" in command and "action_prefix_duration_sec" in command:
             raise ValueError(
                 "set only one of action_prefix_steps and action_prefix_duration_sec"
@@ -1435,18 +1459,23 @@ class Policy(Generic, EasyResource):
             _prefix_steps_from_duration(command["action_prefix_duration_sec"])
             if "action_prefix_duration_sec" in command
             else int(
-                cast(Any, command.get("action_prefix_steps", self._default_prefix))
+                cast(
+                    Any,
+                    command.get(
+                        "action_prefix_steps", self._config.default_prefix_steps
+                    ),
+                )
             )
         )
         conditioner_algorithm = str(
-            command.get("conditioner_algorithm", self._conditioner_algorithm)
+            command.get("conditioner_algorithm", self._config.conditioner_algorithm)
         )
         if conditioner_algorithm not in ("quintic", "toppra"):
             raise ValueError("conditioner_algorithm must be 'quintic' or 'toppra'")
         deadline_tolerance = _positive(
             command,
             "deadline_tolerance_sec",
-            self._deadline_tolerance,
+            self._config.deadline_tolerance_sec,
         )
         progress_prop = str(command.get("progress_prop", "")).strip()
         if not 1 <= max_chunks <= 100:

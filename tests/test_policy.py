@@ -139,10 +139,14 @@ class FakePolicy(Policy, register=False):
         self._fixed_camera = FakeCamera(_image(1280, 720, (1, 2, 3)))
         self._wrist_camera = FakeCamera(_image(640, 480, (4, 5, 6)))
         self.socket = FakeSocket(response, block)
-        self._prompt = "pick"
-        self._execution_backend = backend
-        if backend == "physical_lite6":
-            self._profile = SAFETY_PROFILES[("lite6", "lite6_gripper")]
+        self._config.server_uri = "ws://policy.test"
+        self._config.prompt = "pick"
+        self._config.execution_backend = backend
+        self._config._profile = SAFETY_PROFILES[
+            ("lite6", "lite6_gripper")
+            if backend == "physical_lite6"
+            else ("ur20", "robotiq_2f_85")
+        ]
 
     async def _connect(self, operation, generation):
         self._socket = self.socket
@@ -331,18 +335,18 @@ def test_lite6_and_ur20_position_limits_cannot_be_interchanged():
     actions[:, 6] = 2.0
     history = [np.asarray(actions[0, :6]), np.asarray(actions[0, :6])]
 
-    policy._profile = SAFETY_PROFILES[("lite6", "lite6_gripper")]
+    policy._config._profile = SAFETY_PROFILES[("lite6", "lite6_gripper")]
     with pytest.raises(ValueError, match="lite6 joint position"):
         policy._validate_actions(actions, history, dynamics=False)
-    policy._profile = SAFETY_PROFILES[("ur20", "robotiq_2f_85")]
+    policy._config._profile = SAFETY_PROFILES[("ur20", "robotiq_2f_85")]
     with pytest.raises(ValueError, match="gripper"):
         policy._validate_actions(actions, history, dynamics=False)
 
 
 def test_fk_workspace_rejection_is_atomic():
     policy = FakePolicy(b"")
-    policy._task_min = (10.0, 10.0, 10.0)
-    policy._task_max = (11.0, 11.0, 11.0)
+    policy._config.workspace_task_min_m = (10.0, 10.0, 10.0)
+    policy._config.workspace_task_max_m = (11.0, 11.0, 11.0)
     with pytest.raises(ValueError, match="task workspace"):
         policy._validate_actions(_actions(), [np.zeros(6), np.zeros(6)], dynamics=False)
 
@@ -528,7 +532,7 @@ def test_late_workspace_violation_does_not_block_safe_prefix():
         actions[4:, 0] = 0.4
         policy = FakePolicy(pack_message({"action": actions}))
         profile = SAFETY_PROFILES[("ur20", "robotiq_2f_85")]
-        policy._profile = replace(
+        policy._config._profile = replace(
             profile,
             workspace_floor_m=0.1,
             fk=lambda joints, _offset: (
@@ -558,7 +562,7 @@ def test_prefix_truncates_before_first_unsafe_conditioned_target():
         actions[1:, 0] = 0.4
         policy = FakePolicy(pack_message({"action": actions}))
         profile = SAFETY_PROFILES[("ur20", "robotiq_2f_85")]
-        policy._profile = replace(
+        policy._config._profile = replace(
             profile,
             workspace_floor_m=0.1,
             fk=lambda joints, _offset: (
