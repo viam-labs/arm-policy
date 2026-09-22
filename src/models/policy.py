@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -29,8 +28,8 @@ import numpy as np
 from PIL import Image
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
-    PrivateAttr,
     StringConstraints,
     WebsocketUrl,
     model_validator,
@@ -99,6 +98,66 @@ Vector6 = tuple[
 ]
 
 
+class ContractEmbodiment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    arm_model: NonEmptyStr
+    gripper_model: NonEmptyStr
+    joint_names: tuple[str, ...]
+
+
+class ContractActionSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: Literal["action"]
+    type: Literal["absolute_joint_target"]
+    shape: tuple[Literal[7]]
+    names: tuple[str, ...]
+    units: tuple[str, ...]
+    fps: Literal[20]
+    gripper_convention: Literal["0=open, 1=closed"]
+
+
+class ContractObservationSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    joint_names: tuple[str, ...]
+    joint_units: Literal["rad"]
+    gripper_units: Literal["normalized"]
+    gripper_convention: Literal["0=open, 1=closed"]
+    camera_keys: tuple[str, ...]
+    camera_aliases: dict[str, str]
+
+
+class ContractFramework(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    action_space: Literal["joint_pos"]
+    joint_count: Literal[6]
+    use_state: Literal[True]
+
+
+class ContractTransform(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    camera_keys: tuple[str, ...]
+    camera_aliases: dict[str, str]
+
+
+class PolicyContract(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: Literal[2]
+    embodiment: ContractEmbodiment
+    action_schema: ContractActionSchema
+    observation_schema: ContractObservationSchema
+    framework: ContractFramework
+    transform: ContractTransform
+    action_chunk_size: Literal[32]
+    conditioning_fps: PinnedControlHz
+    domain_name: NonEmptyStr
+
+
 class Config(BaseModel):
     """Validated policy configuration, including its policy contract."""
 
@@ -143,7 +202,7 @@ class Config(BaseModel):
     action_prefix_steps: Annotated[int, Field(ge=1, le=32)] | None = None
     action_prefix_duration_sec: PositiveFiniteFloat | None = None
 
-    _contract: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _contract: PolicyContract
     _profile: SafetyProfile
 
     @model_validator(mode="after")
@@ -210,7 +269,7 @@ class Config(BaseModel):
         return self
 
     @property
-    def contract(self) -> dict[str, Any]:
+    def contract(self) -> PolicyContract:
         return self._contract
 
     @property
@@ -253,9 +312,81 @@ class Config(BaseModel):
             prompt="",
             policy_contract_path="",
         )
-        config._contract = {}
+        config._contract = PolicyContract.model_construct(
+            embodiment=ContractEmbodiment.model_construct(
+                arm_model="", gripper_model="", joint_names=()
+            )
+        )
         config._profile = SAFETY_PROFILES[("ur20", "robotiq_2f_85")]
         return config
+
+
+class ExecuteCommand(BaseModel):
+    command: Literal["execute"] = "execute"
+    prompt: Prompt
+    max_chunks: Annotated[int, Field(ge=1, le=100)]
+    action_prefix_steps: Annotated[int, Field(ge=1, le=32)] | None = None
+    action_prefix_duration_sec: PositiveFiniteFloat | None = None
+    conditioner_algorithm: Literal["quintic", "toppra"]
+    deadline_tolerance_sec: PositiveFiniteFloat
+    progress_prop: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
+
+    @model_validator(mode="after")
+    def validate_prefix(self) -> Self:
+        if (
+            self.action_prefix_steps is not None
+            and self.action_prefix_duration_sec is not None
+        ):
+            raise ValueError(
+                "set only one of action_prefix_steps and action_prefix_duration_sec"
+            )
+        if self.action_prefix_steps is None and self.action_prefix_duration_sec is None:
+            raise ValueError(
+                "set one of action_prefix_steps and action_prefix_duration_sec"
+            )
+        if self.action_prefix_duration_sec is not None:
+            _prefix_steps_from_duration(self.action_prefix_duration_sec)
+        return self
+
+    @property
+    def prefix_steps(self) -> int:
+        if self.action_prefix_duration_sec is not None:
+            return _prefix_steps_from_duration(self.action_prefix_duration_sec)
+        assert self.action_prefix_steps is not None
+        return self.action_prefix_steps
+
+
+@dataclass(slots=True)
+class RunStatus:
+    deadline_tolerance_sec: float
+    embodiment: dict[str, Any]
+    safety_profile: str
+    conditioner_algorithm: str
+    execution_backend: str
+    state: str = "idle"
+    run_id: str = ""
+    prompt: str = ""
+    chunk_index: int = 0
+    action_index: int = 0
+    actions_executed: int = 0
+    executed_prefixes: int = 0
+    chunks_inferred: int = 0
+    inference_responses: int = 0
+    inference_ms: list[float] = field(default_factory=list)
+    server_timing: list[Any] = field(default_factory=list)
+    raw_action_chunks: list[list[list[float]]] = field(default_factory=list)
+    conditioned_action_chunks: list[list[list[float]]] = field(default_factory=list)
+    conditioning: list[dict[str, Any]] = field(default_factory=list)
+    progress: list[dict[str, Any]] = field(default_factory=list)
+    actuation_timing: list[dict[str, Any]] = field(default_factory=list)
+    server_metadata: Any = field(default_factory=dict)
+    started_at: str = ""
+    finished_at: str = ""
+    last_error: str = ""
+    stop_errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -392,78 +523,48 @@ SAFETY_PROFILES = {
 }
 
 
-def _read_policy_contract(path_value: Any) -> tuple[dict[str, Any], SafetyProfile]:
+def _read_policy_contract(path_value: Any) -> tuple[PolicyContract, SafetyProfile]:
     if not isinstance(path_value, str) or not path_value.strip():
         raise ValueError("policy_contract_path must name a policy contract JSON file")
     path = Path(path_value).expanduser()
     try:
-        contract = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        contract_json = path.read_text(encoding="utf-8")
+    except OSError as exc:
         raise ValueError(f"cannot read policy contract {path}: {exc}") from exc
-    if not isinstance(contract, dict) or contract.get("schema_version") != 2:
-        raise ValueError("policy contract must use schema_version 2")
-    embodiment = contract.get("embodiment")
-    if not isinstance(embodiment, dict):
-        raise ValueError("policy contract embodiment must be an object")
+    contract = PolicyContract.model_validate_json(contract_json)
+
     identity = (
-        str(embodiment.get("arm_model", "")),
-        str(embodiment.get("gripper_model", "")),
+        contract.embodiment.arm_model,
+        contract.embodiment.gripper_model,
     )
     profile = SAFETY_PROFILES.get(identity)
     if profile is None:
         raise ValueError(f"no simulator safety profile for embodiment {identity!r}")
-    joint_names = embodiment.get("joint_names")
-    if joint_names != list(profile.joint_names):
+    if contract.embodiment.joint_names != profile.joint_names:
         raise ValueError(
             "policy contract joint order does not match its safety profile"
         )
-    expected_action = {
-        "key": "action",
-        "type": "absolute_joint_target",
-        "shape": [7],
-        "names": [*profile.joint_names, "gripper"],
-        "units": [*(["rad"] * 6), "normalized"],
-        "fps": 20,
-        "gripper_convention": "0=open, 1=closed",
-    }
-    if contract.get("action_schema") != expected_action:
+    if contract.action_schema.names != (
+        *profile.joint_names,
+        "gripper",
+    ) or contract.action_schema.units != (*(("rad",) * 6), "normalized"):
         raise ValueError("policy contract action schema does not match its embodiment")
-    observation = contract.get("observation_schema")
-    expected_observation = {
-        "joint_names": list(profile.joint_names),
-        "joint_units": "rad",
-        "gripper_units": "normalized",
-        "gripper_convention": "0=open, 1=closed",
-        "camera_keys": list(CAMERA_KEYS),
-        "camera_aliases": CAMERA_ALIASES,
-    }
-    if observation != expected_observation:
+    observation = contract.observation_schema
+    if (
+        observation.joint_names != profile.joint_names
+        or observation.camera_keys != CAMERA_KEYS
+        or observation.camera_aliases != CAMERA_ALIASES
+    ):
         raise ValueError(
             "policy contract observation schema does not match the Viam bridge"
         )
-    framework = contract.get("framework")
-    if not isinstance(framework, dict) or any(
-        (
-            framework.get("action_space") != "joint_pos",
-            framework.get("joint_count") != 6,
-            framework.get("use_state") is not True,
-        )
-    ):
-        raise ValueError("policy contract framework is not six-joint stateful control")
-    transform = contract.get("transform")
     if (
-        not isinstance(transform, dict)
-        or transform.get("camera_keys") != list(CAMERA_KEYS)
-        or transform.get("camera_aliases") != CAMERA_ALIASES
+        contract.transform.camera_keys != CAMERA_KEYS
+        or contract.transform.camera_aliases != CAMERA_ALIASES
     ):
         raise ValueError(
             "policy contract transform camera mapping does not match the Viam bridge"
         )
-    if (
-        contract.get("action_chunk_size") != ACTION_SHAPE[0]
-        or contract.get("conditioning_fps") != CONTROL_HZ
-    ):
-        raise ValueError("policy contract must declare 32 steps at 20 Hz")
     return contract, profile
 
 
@@ -517,13 +618,6 @@ def unpack_message(value: bytes) -> Any:
     return msgpack.unpackb(value, object_hook=_unpack_array, raw=False)
 
 
-def _positive(attrs: Mapping[str, Any], key: str, default: float) -> float:
-    value = float(attrs.get(key, default))
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{key} must be positive and finite")
-    return value
-
-
 def _prefix_steps_from_duration(value: Any) -> int:
     duration = float(value)
     steps_float = duration / PERIOD_S
@@ -575,38 +669,17 @@ class Policy(Generic, EasyResource):
         self._socket: Any = None
         self._generation = 0
         self._closed = False
-        self._status: dict[str, Any] = self._idle_status()
+        self._status: RunStatus = self._idle_status()
         self._last_result: Optional[dict[str, Any]] = None
 
-    def _idle_status(self) -> dict[str, Any]:
-        return {
-            "state": "idle",
-            "run_id": "",
-            "deadline_tolerance_sec": self._config.deadline_tolerance_sec,
-            "prompt": "",
-            "chunk_index": 0,
-            "action_index": 0,
-            "actions_executed": 0,
-            "executed_prefixes": 0,
-            "chunks_inferred": 0,
-            "inference_responses": 0,
-            "inference_ms": [],
-            "server_timing": [],
-            "raw_action_chunks": [],
-            "conditioned_action_chunks": [],
-            "conditioning": [],
-            "progress": [],
-            "actuation_timing": [],
-            "server_metadata": {},
-            "started_at": "",
-            "finished_at": "",
-            "last_error": "",
-            "stop_errors": [],
-            "embodiment": dict(self._config.contract.get("embodiment", {})),
-            "safety_profile": self._config.profile.name,
-            "conditioner_algorithm": self._config.conditioner_algorithm,
-            "execution_backend": self._config.execution_backend,
-        }
+    def _idle_status(self) -> RunStatus:
+        return RunStatus(
+            deadline_tolerance_sec=self._config.deadline_tolerance_sec,
+            embodiment=self._config.contract.embodiment.model_dump(mode="json"),
+            safety_profile=self._config.profile.name,
+            conditioner_algorithm=self._config.conditioner_algorithm,
+            execution_backend=self._config.execution_backend,
+        )
 
     @classmethod
     def new(
@@ -911,7 +984,7 @@ class Policy(Generic, EasyResource):
         joints: Any,
         gripper: float,
         prop_result: Optional[Mapping[str, Any]],
-    ) -> Mapping[str, Any]:
+    ) -> dict[str, Any]:
         joint_values = np.asarray(joints, dtype=np.float64)
         if joint_values.shape != (6,) or not np.isfinite(joint_values).all():
             raise ValueError("progress capture received invalid joint state")
@@ -977,7 +1050,7 @@ class Policy(Generic, EasyResource):
             "observation_age_at_prefix_end_s": prefix * PERIOD_S,
             "rejection_reason": "",
         }
-        self._status["conditioning"][-1] = _value_types(diagnostics)
+        self._status.conditioning[-1] = _value_types(diagnostics)
         self._validate_joint_positions(raw_actions)
         try:
             conditioner = (
@@ -1051,8 +1124,8 @@ class Policy(Generic, EasyResource):
         diagnostics["validated_prefix_duration_s"] = validated_prefix * PERIOD_S
         diagnostics["observation_age_at_prefix_end_s"] = validated_prefix * PERIOD_S
         diagnostics["rejection_reason"] = ""
-        self._status["conditioned_action_chunks"].append(actions.tolist())
-        self._status["conditioning"][-1] = _value_types(diagnostics)
+        self._status.conditioned_action_chunks.append(actions.tolist())
+        self._status.conditioning[-1] = _value_types(diagnostics)
         return actions, timing, diagnostics
 
     async def _stream_arm_prefix(
@@ -1110,8 +1183,8 @@ class Policy(Generic, EasyResource):
                 generation,
                 "gripper target dispatch",
             )
-            self._status["action_index"] = action_index + 1
-            self._status["actions_executed"] += 1
+            self._status.action_index = action_index + 1
+            self._status.actions_executed += 1
         return lateness_samples
 
     async def _dispatch_physical_gripper(
@@ -1148,8 +1221,8 @@ class Policy(Generic, EasyResource):
                 else:
                     await self._gripper.grab()
                 self._physical_gripper_state = desired
-            self._status["action_index"] = action_index + 1
-            self._status["actions_executed"] += 1
+            self._status.action_index = action_index + 1
+            self._status.actions_executed += 1
         return lateness_samples
 
     async def _dispatch_prefix(
@@ -1228,15 +1301,15 @@ class Policy(Generic, EasyResource):
         try:
             # The configured backend selects simulator target latching or the
             # Viam timestamped trajectory API used by physical arms.
-            self._status["state"] = "connecting"
+            self._status.state = "connecting"
             socket, metadata = await self._connect(operation, generation)
-            self._status["server_metadata"] = _value_types(metadata)
+            self._status.server_metadata = _value_types(metadata)
             for chunk_index in range(max_chunks):
                 if await self._cancelled(operation, generation):
                     raise asyncio.CancelledError
-                self._status.update(
-                    state="inferring", chunk_index=chunk_index, action_index=0
-                )
+                self._status.state = "inferring"
+                self._status.chunk_index = chunk_index
+                self._status.action_index = 0
                 older_values = await self._wait_cancellable(
                     self._joint_radians(),
                     self._config.connect_timeout_sec,
@@ -1276,7 +1349,7 @@ class Policy(Generic, EasyResource):
                         generation,
                         "progress prop query",
                     )
-                self._status["progress"].append(
+                self._status.progress.append(
                     self._progress_record(
                         chunk_index,
                         "before_prefix",
@@ -1304,8 +1377,8 @@ class Policy(Generic, EasyResource):
                 if not isinstance(raw, bytes):
                     raise RuntimeError(f"policy server returned text error: {raw}")
                 response = unpack_message(raw)
-                self._status["inference_responses"] += 1
-                self._status["inference_ms"].append(inference_ms)
+                self._status.inference_responses += 1
+                self._status.inference_ms.append(inference_ms)
                 if isinstance(response, Mapping):
                     raw_actions = response.get("action")
                     if (
@@ -1313,8 +1386,8 @@ class Policy(Generic, EasyResource):
                         and raw_actions.shape == ACTION_SHAPE
                         and np.isfinite(raw_actions).all()
                     ):
-                        self._status["raw_action_chunks"].append(raw_actions.tolist())
-                        self._status["conditioning"].append(
+                        self._status.raw_action_chunks.append(raw_actions.tolist())
+                        self._status.conditioning.append(
                             {
                                 "algorithm": (
                                     TOPPRA_ALGORITHM
@@ -1332,13 +1405,13 @@ class Policy(Generic, EasyResource):
                         )
                     raw_timing = response.get("server_timing")
                     if isinstance(raw_timing, Mapping):
-                        self._status["server_timing"].append(_value_types(raw_timing))
+                        self._status.server_timing.append(_value_types(raw_timing))
                 actions, _, diagnostics = self._condition_chunk(
                     response, history, prefix, conditioner_algorithm
                 )
                 execution_prefix = int(diagnostics["validated_prefix_steps"])
-                self._status["chunks_inferred"] += 1
-                self._status["state"] = "executing"
+                self._status.chunks_inferred += 1
+                self._status.state = "executing"
                 timing = await self._dispatch_prefix(
                     actions[:execution_prefix],
                     current.tolist(),
@@ -1346,8 +1419,8 @@ class Policy(Generic, EasyResource):
                     generation,
                     deadline_tolerance,
                 )
-                self._status["actuation_timing"].append(timing)
-                self._status["executed_prefixes"] += 1
+                self._status.actuation_timing.append(timing)
+                self._status.executed_prefixes += 1
                 after_arm, after_gripper = await self._wait_cancellable(
                     asyncio.gather(self._joint_radians(), self._gripper_input()),
                     self._config.connect_timeout_sec,
@@ -1366,7 +1439,7 @@ class Policy(Generic, EasyResource):
                         generation,
                         "post-prefix prop query",
                     )
-                self._status["progress"].append(
+                self._status.progress.append(
                     self._progress_record(
                         chunk_index,
                         "after_prefix",
@@ -1387,8 +1460,8 @@ class Policy(Generic, EasyResource):
             else:
                 terminal_state = "failed"
                 error = f"{type(exc).__name__}: {exc}"
-            if self._status["conditioning"]:
-                latest = self._status["conditioning"][-1]
+            if self._status.conditioning:
+                latest = self._status.conditioning[-1]
                 if not latest.get("rejection_reason"):
                     latest["rejection_reason"] = error
             return self._finish_result(terminal_state, error)
@@ -1396,45 +1469,43 @@ class Policy(Generic, EasyResource):
             self._generation += 1
             await self._close_socket()
             stop_errors = await self._safe_stop()
-            self._status["stop_errors"] = stop_errors
+            self._status.stop_errors = stop_errors
             if stop_errors:
                 stop_error = "safe stop failed: " + "; ".join(stop_errors)
-                self._status["state"] = "failed"
-                self._status["last_error"] = stop_error
+                self._status.state = "failed"
+                self._status.last_error = stop_error
                 if self._last_result is not None:
                     self._last_result.update(state="failed", error=stop_error)
-            self._status["finished_at"] = _utc_now()
+            self._status.finished_at = _utc_now()
             if self._last_result is not None:
                 self._last_result.update(
-                    stop_errors=stop_errors, finished_at=self._status["finished_at"]
+                    stop_errors=stop_errors, finished_at=self._status.finished_at
                 )
 
     def _finish_result(self, state: str, error: str) -> dict[str, Any]:
-        self._status["state"] = state
-        self._status["last_error"] = error
+        self._status.state = state
+        self._status.last_error = error
         result = {
-            "run_id": self._status["run_id"],
+            "run_id": self._status.run_id,
             "state": state,
-            "prompt": self._status["prompt"],
-            "chunks_inferred": self._status["chunks_inferred"],
-            "inference_responses": self._status["inference_responses"],
-            "actions_executed": self._status["actions_executed"],
-            "executed_prefixes": self._status["executed_prefixes"],
-            "inference_ms": list(self._status["inference_ms"]),
-            "server_timing": list(self._status["server_timing"]),
-            "raw_action_chunks": list(self._status["raw_action_chunks"]),
-            "conditioned_action_chunks": list(
-                self._status["conditioned_action_chunks"]
-            ),
-            "conditioning": list(self._status["conditioning"]),
-            "progress": list(self._status["progress"]),
-            "actuation_timing": list(self._status["actuation_timing"]),
-            "embodiment": dict(self._status["embodiment"]),
-            "safety_profile": self._status["safety_profile"],
-            "conditioner_algorithm": self._status["conditioner_algorithm"],
-            "deadline_tolerance_sec": self._status["deadline_tolerance_sec"],
+            "prompt": self._status.prompt,
+            "chunks_inferred": self._status.chunks_inferred,
+            "inference_responses": self._status.inference_responses,
+            "actions_executed": self._status.actions_executed,
+            "executed_prefixes": self._status.executed_prefixes,
+            "inference_ms": list(self._status.inference_ms),
+            "server_timing": list(self._status.server_timing),
+            "raw_action_chunks": list(self._status.raw_action_chunks),
+            "conditioned_action_chunks": list(self._status.conditioned_action_chunks),
+            "conditioning": list(self._status.conditioning),
+            "progress": list(self._status.progress),
+            "actuation_timing": list(self._status.actuation_timing),
+            "embodiment": dict(self._status.embodiment),
+            "safety_profile": self._status.safety_profile,
+            "conditioner_algorithm": self._status.conditioner_algorithm,
+            "deadline_tolerance_sec": self._status.deadline_tolerance_sec,
             "execution_backend": self._config.execution_backend,
-            "started_at": self._status["started_at"],
+            "started_at": self._status.started_at,
             "finished_at": _utc_now(),
             "error": error,
             "stop_errors": [],
@@ -1447,41 +1518,25 @@ class Policy(Generic, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         if self._closed:
             raise RuntimeError(f"policy {self.name} is closed")
-        prompt = str(command.get("prompt", self._config.prompt)).strip()
-        if not prompt:
-            raise ValueError("execute prompt must be non-empty")
-        max_chunks = int(cast(Any, command.get("max_chunks", self._config.max_chunks)))
-        if "action_prefix_steps" in command and "action_prefix_duration_sec" in command:
-            raise ValueError(
-                "set only one of action_prefix_steps and action_prefix_duration_sec"
-            )
-        prefix = (
-            _prefix_steps_from_duration(command["action_prefix_duration_sec"])
-            if "action_prefix_duration_sec" in command
-            else int(
-                cast(
-                    Any,
-                    command.get(
-                        "action_prefix_steps", self._config.default_prefix_steps
-                    ),
-                )
-            )
-        )
-        conditioner_algorithm = str(
-            command.get("conditioner_algorithm", self._config.conditioner_algorithm)
-        )
-        if conditioner_algorithm not in ("quintic", "toppra"):
-            raise ValueError("conditioner_algorithm must be 'quintic' or 'toppra'")
-        deadline_tolerance = _positive(
-            command,
-            "deadline_tolerance_sec",
-            self._config.deadline_tolerance_sec,
-        )
-        progress_prop = str(command.get("progress_prop", "")).strip()
-        if not 1 <= max_chunks <= 100:
-            raise ValueError("max_chunks must be in [1, 100]")
-        if not 1 <= prefix <= 32:
-            raise ValueError("action_prefix_steps must be in [1, 32]")
+        defaults: dict[str, Any] = {
+            "command": "execute",
+            "prompt": self._config.prompt,
+            "max_chunks": self._config.max_chunks,
+            "conditioner_algorithm": self._config.conditioner_algorithm,
+            "deadline_tolerance_sec": self._config.deadline_tolerance_sec,
+        }
+        if (
+            "action_prefix_steps" not in command
+            and "action_prefix_duration_sec" not in command
+        ):
+            defaults["action_prefix_steps"] = self._config.default_prefix_steps
+        request = ExecuteCommand.model_validate({**defaults, **command})
+        prompt = request.prompt
+        max_chunks = request.max_chunks
+        prefix = request.prefix_steps
+        conditioner_algorithm = request.conditioner_algorithm
+        deadline_tolerance = request.deadline_tolerance_sec
+        progress_prop = request.progress_prop
         async with self._owner_lock:
             if self._execution_task is not None and not self._execution_task.done():
                 raise RuntimeError("policy execution is already in progress")
@@ -1490,14 +1545,12 @@ class Policy(Generic, EasyResource):
             generation = self._generation
             self._last_result = None
             self._status = self._idle_status()
-            self._status.update(
-                state="connecting",
-                run_id=str(uuid4()),
-                prompt=prompt,
-                started_at=_utc_now(),
-                conditioner_algorithm=conditioner_algorithm,
-                deadline_tolerance_sec=deadline_tolerance,
-            )
+            self._status.state = "connecting"
+            self._status.run_id = str(uuid4())
+            self._status.prompt = prompt
+            self._status.started_at = _utc_now()
+            self._status.conditioner_algorithm = conditioner_algorithm
+            self._status.deadline_tolerance_sec = deadline_tolerance
             operation = self.get_operation(kwargs)
             task = asyncio.create_task(
                 self._execute_run(
@@ -1526,12 +1579,14 @@ class Policy(Generic, EasyResource):
         self._generation += 1
         task = self._execution_task
         if task is not None and not task.done():
-            self._status["state"] = "stopping"
+            self._status.state = "stopping"
         await self._close_socket()
         immediate_errors = await self._safe_stop()
         if task is not None and not task.done() and task is not asyncio.current_task():
             await asyncio.shield(task)
-        result = dict(self._last_result or self._status)
+        result = (
+            self._last_result.copy() if self._last_result else self._status.to_dict()
+        )
         if immediate_errors:
             result["stop_errors"] = (
                 list(result.get("stop_errors", [])) + immediate_errors
@@ -1551,7 +1606,7 @@ class Policy(Generic, EasyResource):
         if cmd == "stop":
             return await self._stop_command()
         if cmd == "status":
-            return dict(self._status)
+            return self._status.to_dict()
         raise ValueError("unknown command; supported: execute, stop, status")
 
     async def close(self) -> None:

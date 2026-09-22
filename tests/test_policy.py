@@ -317,7 +317,7 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
 def test_contract_selects_matching_profile_and_rejects_wrong_joint_order(tmp_path):
     path, contract, profile = _write_contract(tmp_path, "lite6")
     loaded, selected = _read_policy_contract(str(path))
-    assert loaded == contract
+    assert loaded.model_dump(mode="json") == contract
     assert selected is profile
 
     contract["action_schema"]["names"][0:2] = reversed(
