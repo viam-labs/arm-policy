@@ -160,7 +160,7 @@ class PolicyContract(BaseModel):
 class Config(BaseModel):
     """Validated policy configuration, including its policy contract."""
 
-    world: NonEmptyStr
+    world: NonEmptyStr | None = None
     arm: NonEmptyStr
     gripper: NonEmptyStr
     fixed_camera: NonEmptyStr
@@ -277,13 +277,8 @@ class Config(BaseModel):
 
     @property
     def dependencies(self) -> tuple[str, ...]:
-        return (
-            self.world,
-            self.arm,
-            self.gripper,
-            self.fixed_camera,
-            self.wrist_camera,
-        )
+        required = (self.arm, self.gripper, self.fixed_camera, self.wrist_camera)
+        return (self.world, *required) if self.world is not None else required
 
     @property
     def fixed_camera_size(self) -> tuple[int, int]:
@@ -302,7 +297,7 @@ class Config(BaseModel):
     @classmethod
     def _unconfigured(cls) -> Self:
         config = cls.model_construct(
-            world="",
+            world=None,
             arm="",
             gripper="",
             fixed_camera="",
@@ -655,7 +650,7 @@ class Policy(Generic, EasyResource):
 
     def __init__(self, name: str) -> None:
         super().__init__(name)
-        self._world: Generic
+        self._world: Generic | None
         self._arm: Arm
         self._gripper: Gripper
         self._fixed_camera: Camera
@@ -711,7 +706,11 @@ class Policy(Generic, EasyResource):
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> None:
         parsed = Config.model_validate(get_attrs(config))
-        self._world = self._dependency(dependencies, Generic, parsed.world, "world")
+        self._world = (
+            self._dependency(dependencies, Generic, parsed.world, "world")
+            if parsed.world is not None
+            else None
+        )
         self._arm = self._dependency(dependencies, Arm, parsed.arm, "arm")
         self._gripper = self._dependency(
             dependencies, Gripper, parsed.gripper, "gripper"
@@ -1517,6 +1516,8 @@ class Policy(Generic, EasyResource):
         conditioner_algorithm = request.conditioner_algorithm
         deadline_tolerance = request.deadline_tolerance_sec
         progress_prop = request.progress_prop
+        if progress_prop and self._world is None:
+            raise ValueError("progress_prop requires a configured world dependency")
         async with self._owner_lock:
             if self._execution_task is not None and not self._execution_task.done():
                 raise RuntimeError("policy execution is already in progress")

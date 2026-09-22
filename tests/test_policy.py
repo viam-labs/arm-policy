@@ -281,6 +281,15 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
         "wrist-cam",
     ]
     assert list(optional) == []
+    dependencies_without_world, _ = Policy.validate_config(
+        _config({key: value for key, value in attrs.items() if key != "world"})
+    )
+    assert list(dependencies_without_world) == [
+        "pick-arm",
+        "pick-gripper",
+        "scene-cam",
+        "wrist-cam",
+    ]
     with pytest.raises(ValueError, match="action_chunk_size"):
         Policy.validate_config(_config({**attrs, "action_chunk_size": 31}))
     with pytest.raises(ValueError, match="fixed_camera_width"):
@@ -503,6 +512,28 @@ def test_duration_prefix_executes_exact_20_hz_horizon():
             "after_prefix",
         ]
         assert all("tcp_to_prop_distance_m" in record for record in result["progress"])
+
+    asyncio.run(scenario())
+
+
+def test_execution_without_world_succeeds_unless_progress_prop_is_requested():
+    async def scenario():
+        policy = FakePolicy(pack_message({"action": _actions()}))
+        policy._world = None
+
+        result = await policy.do_command(
+            {"command": "execute", "action_prefix_steps": 1}
+        )
+        assert result["state"] == "completed"
+
+        with pytest.raises(ValueError, match="progress_prop requires"):
+            await policy.do_command(
+                {
+                    "command": "execute",
+                    "action_prefix_steps": 1,
+                    "progress_prop": "pick_block",
+                }
+            )
 
     asyncio.run(scenario())
 

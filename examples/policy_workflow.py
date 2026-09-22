@@ -169,8 +169,8 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
             command["conditioner_algorithm"] = args.conditioner_algorithm
         if args.deadline_tolerance_sec is not None:
             command["deadline_tolerance_sec"] = args.deadline_tolerance_sec
-        if args.prop:
-            command["progress_prop"] = args.prop
+        if args.progress_prop:
+            command["progress_prop"] = args.progress_prop
         if args.prompt:
             command["prompt"] = args.prompt
         result = await policy.do_command(command)
@@ -222,6 +222,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prop", default="pick_block", help="prop placed in the training region"
+    )
+    parser.add_argument(
+        "--progress-prop",
+        default="",
+        help="optional world prop queried before and after each executed prefix",
     )
     parser.add_argument(
         "--seed", type=int, default=0, help="deterministic scene reset seed"

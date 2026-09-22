@@ -26,7 +26,6 @@ The model does not host or download the inference server. Start an OpenPI-compat
 
 | Name | Type | Description |
 |---|---|---|
-| `world` | string | Generic world resource. Used for optional progress-object queries. |
 | `arm` | string | Arm resource receiving validated targets. |
 | `gripper` | string | Gripper resource receiving normalized commands. |
 | `fixed_camera` | string | Camera returning exactly one 1280x720 image. |
@@ -39,6 +38,7 @@ The model does not host or download the inference server. Start an OpenPI-compat
 
 | Name | Default | Description |
 |---|---:|---|
+| `world` | — | Optional Generic world resource. Required only when an execute command sets `progress_prop`. |
 | `execution_backend` | `simulation` | Selects gripper handling only: normalized simulator targets or binary physical Lite6 thresholds. Arm observation and execution always use the standard Viam arm APIs. |
 | `conditioner_algorithm` | `quintic` | `quintic` or `toppra`. |
 | `max_chunks` | `1` | Receding-horizon chunks per execution, from 1 through 100. |
@@ -81,6 +81,10 @@ Execute one or more policy chunks:
   "progress_prop": "pick_block"
 }
 ```
+
+`progress_prop` is optional. When set, the policy queries the configured `world`
+for that prop's pose before and after each executed prefix. Omit both fields when
+ground-truth world poses are unavailable, including normal physical execution.
 
 Stop inference/execution and hold both actuators:
 
