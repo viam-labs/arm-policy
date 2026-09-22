@@ -507,10 +507,10 @@ def test_duration_prefix_executes_exact_20_hz_horizon():
     asyncio.run(scenario())
 
 
-def test_small_gripper_normalization_overshoot_is_projected_and_recorded():
+def test_finite_gripper_outputs_are_projected_to_actuator_limits():
     async def scenario():
         actions = _actions()
-        actions[:, 6] = 1.004
+        actions[:3, 6] = (-0.4, 1.4, -0.2)
         policy = FakePolicy(pack_message({"action": actions}))
 
         result = await policy.do_command(
@@ -518,9 +518,9 @@ def test_small_gripper_normalization_overshoot_is_projected_and_recorded():
         )
 
         assert result["state"] == "completed"
-        assert policy._gripper.targets == [1.0, 1.0, 1.0]
+        assert policy._gripper.targets == [0.0, 1.0, 0.0]
         assert result["conditioning"][0]["gripper_projection_max"] == pytest.approx(
-            0.004, abs=1e-6
+            0.4, abs=1e-6
         )
 
     asyncio.run(scenario())
@@ -593,10 +593,6 @@ def test_prefix_truncates_before_first_unsafe_conditioned_target():
         (
             np.column_stack((np.full((32, 6), 7.0), np.zeros(32))).astype(np.float32),
             "position",
-        ),
-        (
-            np.column_stack((np.zeros((32, 6)), np.full(32, 1.1))).astype(np.float32),
-            "gripper",
         ),
     ],
 )

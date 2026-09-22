@@ -64,7 +64,6 @@ def get_attrs(config: ComponentConfig) -> dict[str, Any]:
     return struct_to_dict(config.attributes)
 
 
-GRIPPER_PROJECTION_TOLERANCE = 0.05
 ACTION_SHAPE = (32, 7)
 CONTROL_HZ = 20.0
 PERIOD_S = 1.0 / CONTROL_HZ
@@ -1073,16 +1072,13 @@ class Policy(Generic, EasyResource):
                 "fallback_reason": f"{type(exc).__name__}: {exc}",
             }
         clipped_gripper = np.clip(actions[:, 6], 0.0, 1.0)
-        gripper_delta = np.abs(clipped_gripper - actions[:, 6])
-        max_gripper_delta = float(np.max(gripper_delta))
-        if max_gripper_delta <= GRIPPER_PROJECTION_TOLERANCE:
-            actions = actions.copy()
-            actions[:, 6] = clipped_gripper
-            raw_diagnostics = {
-                **dict(raw_diagnostics),
-                "gripper_projection_max": max_gripper_delta,
-                "gripper_projection_tolerance": GRIPPER_PROJECTION_TOLERANCE,
-            }
+        max_gripper_delta = float(np.max(np.abs(clipped_gripper - actions[:, 6])))
+        actions = actions.copy()
+        actions[:, 6] = clipped_gripper
+        raw_diagnostics = {
+            **dict(raw_diagnostics),
+            "gripper_projection_max": max_gripper_delta,
+        }
         diagnostics.update(raw_diagnostics)
         diagnostics["selected_profile"] = self._config.profile.name
         diagnostics["raw_metrics"] = {

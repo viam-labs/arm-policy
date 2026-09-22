@@ -58,6 +58,13 @@ adapter remains only because the simulated gripper accepts normalized inputs whi
 the physical Lite6 gripper uses binary `Open`/`Grab` commands without normalized
 position feedback.
 
+Finite policy gripper outputs are saturated to `[0, 1]` before validation and
+dispatch, with the maximum projection recorded in conditioning diagnostics.
+Trajectory conditioning interpolates the gripper command over retimed samples;
+TOPPRA constraints apply only to the six arm joints. The simulation backend uses
+continuous normalized targets, while `physical_lite6` converts them to binary
+open/close commands with hysteresis thresholds.
+
 The current contracts require a 32x7 action chunk at 20 Hz. Supported embodiments are Lite6 with `lite6_gripper` and UR20 with `robotiq_2f_85`. Safety profiles pin joint order, units, limits, FK, reach, floor, and TCP offset; configuration cannot weaken them.
 
 ## Commands
