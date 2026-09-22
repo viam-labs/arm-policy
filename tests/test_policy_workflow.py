@@ -1,6 +1,7 @@
 import asyncio
 
 import pytest
+from viam.proto.common import Pose, PoseInFrame
 
 from examples.policy_workflow import (
     HOME_JOINT_DEGREES,
@@ -9,6 +10,16 @@ from examples.policy_workflow import (
     PICK_YAW_RANGE_DEG,
     prepare_lite6_scene,
 )
+
+
+class FakeMachine:
+    def __init__(self, pose):
+        self.pose = pose
+
+    async def transform_pose(self, query, destination):
+        assert query.reference_frame == "pick-arm"
+        assert query.pose == Pose()
+        return PoseInFrame(reference_frame=destination, pose=self.pose)
 
 
 class FakeArm:
@@ -46,10 +57,12 @@ def test_lite6_scene_setup_matches_episode_capture_initialization():
     events = []
     result = asyncio.run(
         prepare_lite6_scene(
+            FakeMachine(Pose(x=1000, y=2000, z=500, o_z=1, theta=90)),
             FakeWorld(events),
             FakeArm(events),
             FakeGripper(events),
             seed=7,
+            arm_frame="pick-arm",
             prop="pick_block",
         )
     )
@@ -57,29 +70,35 @@ def test_lite6_scene_setup_matches_episode_capture_initialization():
     assert events[0] == ("home", list(HOME_JOINT_DEGREES))
     assert events[1] == ("open",)
     reset = events[2][1]
-    assert reset == {
-        "command": "reset_props",
-        "seed": 7,
-        "props": ["pick_block"],
-        "region": {
-            "min": list(PICK_REGION_MIN_M),
-            "max": list(PICK_REGION_MAX_M),
-        },
-        "yaw_range_deg": list(PICK_YAW_RANGE_DEG),
-    }
+    assert reset["command"] == "reset_props"
+    assert reset["seed"] == 7
+    assert reset["props"] == ["pick_block"]
+    assert reset["region"]["min"] == pytest.approx([0.88, 2.25, 0.5])
+    assert reset["region"]["max"] == pytest.approx([1.12, 2.38, 0.5])
+    assert reset["yaw_range_deg"] == list(PICK_YAW_RANGE_DEG)
     assert result["performed"] is True
     assert result["seed"] == 7
     assert result["pose"] == {"position": [0.3, 0.0, 0.0125]}
+    assert result["region_in_arm_frame"] == {
+        "min": list(PICK_REGION_MIN_M),
+        "max": list(PICK_REGION_MAX_M),
+    }
+    assert result["arm_base_pose_world"] == {
+        "position_m": [1.0, 2.0, 0.5],
+        "orientation_vector_degrees": [0.0, 0.0, 1.0, 90.0],
+    }
 
 
 def test_lite6_scene_setup_rejects_missing_reset_pose():
     with pytest.raises(RuntimeError, match="did not return pose"):
         asyncio.run(
             prepare_lite6_scene(
+                FakeMachine(Pose()),
                 FakeWorld([], include_pose=False),
                 FakeArm([]),
                 FakeGripper([]),
                 seed=0,
+                arm_frame="pick-arm",
                 prop="pick_block",
             )
         )
