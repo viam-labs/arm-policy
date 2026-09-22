@@ -15,7 +15,7 @@ dependencies = [
     "toppra>=0.6.3,<0.7",
     "typing-extensions>=4.8.0",
     # switch to >= 0.81.0 when it lands. we need motion streaming
-    "viam-sdk @ git+https://github.com/viamrobotics/viam-python-sdk.git@4ba5f2a1021353d253cc89cb86268273838af346",
+    "viam-sdk>=0.82.0",
     "websockets>=12.0",
 ]
 
