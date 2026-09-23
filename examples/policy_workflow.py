@@ -11,7 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, Mapping, Sequence, cast
 
 from viam.components.arm import Arm, JointPositions
 from viam.components.generic import Generic
@@ -137,7 +137,7 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
         before = await policy.do_command({"command": "status"})
         print(json.dumps({"before": before}, indent=2, sort_keys=True))
         setup: Mapping[str, Any] = {"performed": False}
-        if not args.no_setup:
+        if not args.no_setup and args.world is not None:
             embodiment = before.get("embodiment")
             arm_model = (
                 embodiment.get("arm_model") if isinstance(embodiment, Mapping) else None
@@ -205,14 +205,13 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
         return evidence
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("address", help="machine address from the Viam CONNECT tab")
     parser.add_argument("--policy", default="policy")
     parser.add_argument(
         "--world",
-        default="sim-world",
-        help="world resource used for default scene setup",
+        help="world resource; providing it enables deterministic Lite6 scene setup",
     )
     parser.add_argument(
         "--arm", default="pick-arm", help="arm resource homed before inference"
@@ -247,7 +246,7 @@ def parse_args() -> argparse.Namespace:
         "--output", help="write structured workflow evidence to this JSON file"
     )
     parser.add_argument("--disable-webrtc", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not 1 <= args.max_chunks <= 100:
         parser.error("--max-chunks must be in [1, 100]")
     if args.action_prefix_steps is not None and not 1 <= args.action_prefix_steps <= 32:

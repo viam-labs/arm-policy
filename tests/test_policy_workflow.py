@@ -8,6 +8,7 @@ from examples.policy_workflow import (
     PICK_REGION_MAX_M,
     PICK_REGION_MIN_M,
     PICK_YAW_RANGE_DEG,
+    parse_args,
     prepare_lite6_scene,
 )
 
@@ -69,6 +70,14 @@ class FakeWorld:
             else {}
         )
         return {"seed": command["seed"], "poses": poses}
+
+
+def test_world_is_optional_and_enables_scene_setup_explicitly():
+    without_world = parse_args(["machine.example"])
+    with_world = parse_args(["machine.example", "--world", "sim-world"])
+
+    assert without_world.world is None
+    assert with_world.world == "sim-world"
 
 
 def test_lite6_scene_setup_matches_episode_capture_initialization():
