@@ -61,9 +61,9 @@ async def _arm_base_pose(machine: Any, arm_frame: str) -> Pose:
     return pose
 
 
-async def prepare_lite6_scene(
+async def prepare_lite6_setup(
     machine: Any,
-    world: Any,
+    world: Any | None,
     arm: Any,
     gripper: Any,
     *,
@@ -71,9 +71,16 @@ async def prepare_lite6_scene(
     seed: int,
     prop: str,
 ) -> Mapping[str, Any]:
-    """Put the simulator in the same initial state used by episode capture."""
+    """Home the Lite6 and optionally reset its simulated pick scene."""
     await arm.move_to_joint_positions(JointPositions(values=list(HOME_JOINT_DEGREES)))
     await gripper.open()
+    robot_setup = {
+        "performed": True,
+        "robot_prepared": True,
+        "home_joint_degrees": list(HOME_JOINT_DEGREES),
+    }
+    if world is None:
+        return {**robot_setup, "scene_reset": False}
     base_pose, world_region = await asyncio.gather(
         _arm_base_pose(machine, arm_frame),
         _world_pick_region(machine, arm_frame),
@@ -91,11 +98,11 @@ async def prepare_lite6_scene(
     if not isinstance(poses, Mapping) or prop not in poses:
         raise RuntimeError(f"scene reset did not return pose for {prop!r}")
     return {
-        "performed": True,
+        **robot_setup,
+        "scene_reset": True,
         "seed": int(cast(Any, reset.get("seed", seed))),
         "prop": prop,
         "pose": poses[prop],
-        "home_joint_degrees": list(HOME_JOINT_DEGREES),
         "region": world_region,
         "region_in_arm_frame": {
             "min": list(PICK_REGION_MIN_M),
@@ -137,7 +144,7 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
         before = await policy.do_command({"command": "status"})
         print(json.dumps({"before": before}, indent=2, sort_keys=True))
         setup: Mapping[str, Any] = {"performed": False}
-        if not args.no_setup and args.world is not None:
+        if not args.no_setup:
             embodiment = before.get("embodiment")
             arm_model = (
                 embodiment.get("arm_model") if isinstance(embodiment, Mapping) else None
@@ -147,9 +154,13 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
                     "automatic scene setup only supports Lite6; pass --no-setup "
                     f"for embodiment {arm_model!r}"
                 )
-            setup = await prepare_lite6_scene(
+            setup = await prepare_lite6_setup(
                 machine,
-                Generic.from_robot(machine, args.world),
+                (
+                    Generic.from_robot(machine, args.world)
+                    if args.world is not None
+                    else None
+                ),
                 Arm.from_robot(machine, args.arm),
                 Gripper.from_robot(machine, args.gripper),
                 arm_frame=args.arm,

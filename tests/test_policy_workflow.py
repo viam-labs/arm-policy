@@ -9,7 +9,7 @@ from examples.policy_workflow import (
     PICK_REGION_MIN_M,
     PICK_YAW_RANGE_DEG,
     parse_args,
-    prepare_lite6_scene,
+    prepare_lite6_setup,
 )
 
 
@@ -80,10 +80,10 @@ def test_world_is_optional_and_enables_scene_setup_explicitly():
     assert with_world.world == "sim-world"
 
 
-def test_lite6_scene_setup_matches_episode_capture_initialization():
+def test_lite6_setup_matches_episode_capture_initialization():
     events = []
     result = asyncio.run(
-        prepare_lite6_scene(
+        prepare_lite6_setup(
             FakeMachine(Pose(x=1000, y=2000, z=500, o_z=1, theta=90)),
             FakeWorld(events),
             FakeArm(events),
@@ -104,6 +104,8 @@ def test_lite6_scene_setup_matches_episode_capture_initialization():
     assert reset["region"]["max"] == pytest.approx([1.12, 2.38, 0.0])
     assert reset["yaw_range_deg"] == list(PICK_YAW_RANGE_DEG)
     assert result["performed"] is True
+    assert result["robot_prepared"] is True
+    assert result["scene_reset"] is True
     assert result["seed"] == 7
     assert result["pose"] == {"position": [0.3, 0.0, 0.0125]}
     assert result["region_in_arm_frame"] == {
@@ -116,10 +118,37 @@ def test_lite6_scene_setup_matches_episode_capture_initialization():
     }
 
 
+def test_lite6_setup_without_world_still_homes_arm_and_opens_gripper():
+    events = []
+
+    result = asyncio.run(
+        prepare_lite6_setup(
+            object(),
+            None,
+            FakeArm(events),
+            FakeGripper(events),
+            seed=0,
+            arm_frame="pick-arm",
+            prop="pick_block",
+        )
+    )
+
+    assert events == [
+        ("home", list(HOME_JOINT_DEGREES)),
+        ("open",),
+    ]
+    assert result == {
+        "performed": True,
+        "robot_prepared": True,
+        "scene_reset": False,
+        "home_joint_degrees": list(HOME_JOINT_DEGREES),
+    }
+
+
 def test_lite6_scene_setup_rejects_missing_reset_pose():
     with pytest.raises(RuntimeError, match="did not return pose"):
         asyncio.run(
-            prepare_lite6_scene(
+            prepare_lite6_setup(
                 FakeMachine(Pose()),
                 FakeWorld([], include_pose=False),
                 FakeArm([]),

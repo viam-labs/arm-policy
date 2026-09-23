@@ -111,7 +111,8 @@ python3 examples/policy_workflow.py <machine-address> \
   --deadline-tolerance-sec 0.15
 ```
 
-The workflow does not require a world resource. Pass `--world sim-world` to opt
-into deterministic Lite6 scene setup; omit it for physical execution or an
-already-prepared scene. `--progress-prop` independently enables world-backed prop
-pose diagnostics and therefore requires the policy component to configure a world.
+The workflow homes the Lite6 to `[0, 0, 90, 0, 90, 0]` degrees and opens the
+gripper unless `--no-setup` is set. Pass `--world sim-world` to additionally
+reset the simulated prop; omit it for physical execution or an already-prepared
+scene. `--progress-prop` independently enables world-backed prop pose diagnostics
+and therefore requires the policy component to configure a world.
