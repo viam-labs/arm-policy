@@ -25,11 +25,10 @@ PICK_REGION_MIN_M = (0.25, -0.12, 0.0)
 PICK_REGION_MAX_M = (0.38, 0.12, 0.0)
 PICK_YAW_RANGE_DEG = (-180.0, 180.0)
 WORLD_FRAME = "world"
+DEFAULT_GRIPPER_SETTLE_SEC = 3.0
 
 
-async def _world_pick_region(
-    machine: Any, arm_frame: str
-) -> dict[str, list[float]]:
+async def _world_pick_region(machine: Any, arm_frame: str) -> dict[str, list[float]]:
     corners: list[tuple[float, float]] = []
     for x_m in (PICK_REGION_MIN_M[0], PICK_REGION_MAX_M[0]):
         for y_m in (PICK_REGION_MIN_M[1], PICK_REGION_MAX_M[1]):
@@ -70,10 +69,12 @@ async def prepare_lite6_setup(
     arm_frame: str,
     seed: int,
     prop: str,
+    gripper_settle_sec: float = DEFAULT_GRIPPER_SETTLE_SEC,
 ) -> Mapping[str, Any]:
     """Home the Lite6 and optionally reset its simulated pick scene."""
     await arm.move_to_joint_positions(JointPositions(values=list(HOME_JOINT_DEGREES)))
     await gripper.open()
+    await asyncio.sleep(gripper_settle_sec)
     robot_setup = {
         "performed": True,
         "robot_prepared": True,
@@ -165,6 +166,7 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 Gripper.from_robot(machine, args.gripper),
                 arm_frame=args.arm,
                 seed=args.seed,
+                gripper_settle_sec=args.gripper_settle_sec,
                 prop=args.prop,
             )
             print(json.dumps({"setup": setup}, indent=2, sort_keys=True))
@@ -242,6 +244,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--seed", type=int, default=0, help="deterministic scene reset seed"
     )
     parser.add_argument(
+        "--gripper-settle-sec",
+        type=float,
+        default=DEFAULT_GRIPPER_SETTLE_SEC,
+        help="seconds to wait after the nonblocking setup Open command",
+    )
+    parser.add_argument(
         "--no-setup",
         action="store_true",
         help="skip homing and deterministic Lite6 pick reset",
@@ -272,6 +280,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             )
     if args.deadline_tolerance_sec is not None and args.deadline_tolerance_sec <= 0:
         parser.error("--deadline-tolerance-sec must be positive")
+    if args.gripper_settle_sec < 0:
+        parser.error("--gripper-settle-sec must be non-negative")
     return args
 
 

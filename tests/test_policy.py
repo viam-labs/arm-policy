@@ -130,7 +130,7 @@ class FakeWorld:
 
 class FakePolicy(Policy, register=False):
     def __init__(
-        self, response, *, arm=None, gripper=None, block=False, backend="simulation"
+        self, response, *, arm=None, gripper=None, block=False, gripper_mode="position"
     ):
         super().__init__("policy")
         self._world = FakeWorld()
@@ -141,10 +141,11 @@ class FakePolicy(Policy, register=False):
         self.socket = FakeSocket(response, block)
         self._config.server_uri = "ws://policy.test"
         self._config.prompt = "pick"
-        self._config.execution_backend = backend
+        self._config.contract.embodiment.gripper_mode = gripper_mode
+        self._config.binary_gripper_settle_sec = 0.0
         self._config._profile = SAFETY_PROFILES[
             ("lite6", "lite6_gripper")
-            if backend == "physical_lite6"
+            if gripper_mode == "binary"
             else ("ur20", "robotiq_2f_85")
         ]
 
@@ -222,11 +223,14 @@ def _write_contract(tmp_path, arm_model="ur20"):
         for profile in SAFETY_PROFILES.values()
         if profile.arm_model == arm_model
     )
+    gripper_mode = "binary" if profile.gripper_model == "lite6_gripper" else "position"
+    gripper_units = "binary" if gripper_mode == "binary" else "normalized"
     contract = {
-        "schema_version": 2,
+        "schema_version": 3,
         "embodiment": {
             "arm_model": profile.arm_model,
             "gripper_model": profile.gripper_model,
+            "gripper_mode": gripper_mode,
             "joint_names": list(profile.joint_names),
         },
         "action_schema": {
@@ -234,14 +238,14 @@ def _write_contract(tmp_path, arm_model="ur20"):
             "type": "absolute_joint_target",
             "shape": [7],
             "names": [*profile.joint_names, "gripper"],
-            "units": [*(["rad"] * 6), "normalized"],
+            "units": [*(["rad"] * 6), gripper_units],
             "fps": 20,
             "gripper_convention": "0=open, 1=closed",
         },
         "observation_schema": {
             "joint_names": list(profile.joint_names),
             "joint_units": "rad",
-            "gripper_units": "normalized",
+            "gripper_units": gripper_units,
             "gripper_convention": "0=open, 1=closed",
             "camera_keys": list(CAMERA_KEYS),
             "camera_aliases": CAMERA_ALIASES,
@@ -311,6 +315,10 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
     )
     with pytest.raises(ValueError, match="conditioner_algorithm"):
         Policy.validate_config(_config({**attrs, "conditioner_algorithm": "unknown"}))
+    with pytest.raises(ValueError, match="execution_backend"):
+        Policy.validate_config(_config({**attrs, "execution_backend": "simulation"}))
+    with pytest.raises(ValueError, match="binary_gripper_settle_sec"):
+        Policy.validate_config(_config({**attrs, "binary_gripper_settle_sec": -1}))
     with pytest.raises(ValueError, match="set only one"):
         Policy.validate_config(
             _config(
@@ -327,6 +335,8 @@ def test_contract_selects_matching_profile_and_rejects_wrong_joint_order(tmp_pat
     path, contract, profile = _write_contract(tmp_path, "lite6")
     loaded, selected = _read_policy_contract(str(path))
     assert loaded.model_dump(mode="json") == contract
+    assert loaded.embodiment.gripper_mode == "binary"
+    assert loaded.observation_schema.gripper_units == "binary"
     assert selected is profile
 
     contract["action_schema"]["names"][0:2] = reversed(
@@ -424,7 +434,7 @@ def test_valid_execution_sends_exact_protocol_and_timestamped_prefix():
     asyncio.run(scenario())
 
 
-def test_physical_lite6_uses_timestamped_viam_stream_and_binary_gripper():
+def test_binary_lite6_stops_at_gripper_barrier_and_settles():
     async def scenario():
         actions = _actions()
         actions[:4, 6] = [0.0, 0.75, 0.75, 0.2]
@@ -434,7 +444,7 @@ def test_physical_lite6_uses_timestamped_viam_stream_and_binary_gripper():
             pack_message({"action": actions}),
             arm=arm,
             gripper=gripper,
-            backend="physical_lite6",
+            gripper_mode="binary",
         )
 
         result = await policy.do_command(
@@ -442,22 +452,25 @@ def test_physical_lite6_uses_timestamped_viam_stream_and_binary_gripper():
         )
 
         assert result["state"] == "completed"
-        assert result["execution_backend"] == "physical_lite6"
-        assert result["actions_executed"] == 4
+        assert result["gripper_mode"] == "binary"
+        assert result["actions_executed"] == 2
         assert len(arm.streamed_batches) == 1
         points = arm.streamed_batches[0]
         assert [point.time.total_seconds() for point in points] == pytest.approx(
-            [0.0, 0.05, 0.1, 0.15, 0.2]
+            [0.0, 0.05, 0.1]
         )
         assert points[0].positions == [0.0] * 6
-        assert [command for command, _ in gripper.commands] == ["close", "open"]
-        assert np.diff([when for _, when in gripper.commands])[0] == pytest.approx(
-            0.1, abs=0.025
-        )
+        assert [command for command, _ in gripper.commands] == ["close"]
         timing = result["actuation_timing"][0]
-        assert timing["backend"] == "physical_lite6"
-        assert timing["scheduled_steps"] == 4
-        assert timing["max_dispatch_lateness_sec"] <= 0.025
+        assert timing == {
+            "gripper_mode": "binary",
+            "requested_steps": 4,
+            "scheduled_steps": 2,
+            "barrier_transition": "grab",
+            "settle_sec": 0.0,
+            "elapsed_sec": pytest.approx(0.1, abs=0.025),
+            "max_dispatch_lateness_sec": 0.0,
+        }
         assert arm.stops and gripper.stops
 
     asyncio.run(scenario())
@@ -471,7 +484,7 @@ def test_physical_stop_cancels_stream_and_stops_viam_resources():
             pack_message({"action": _actions()}),
             arm=arm,
             gripper=gripper,
-            backend="physical_lite6",
+            gripper_mode="binary",
         )
         executing = asyncio.create_task(
             policy.do_command({"command": "execute", "action_prefix_steps": 20})

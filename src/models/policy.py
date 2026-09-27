@@ -102,6 +102,7 @@ class ContractEmbodiment(BaseModel):
 
     arm_model: NonEmptyStr
     gripper_model: NonEmptyStr
+    gripper_mode: Literal["binary", "position"]
     joint_names: tuple[str, ...]
 
 
@@ -122,7 +123,7 @@ class ContractObservationSchema(BaseModel):
 
     joint_names: tuple[str, ...]
     joint_units: Literal["rad"]
-    gripper_units: Literal["normalized"]
+    gripper_units: Literal["binary", "normalized"]
     gripper_convention: Literal["0=open, 1=closed"]
     camera_keys: tuple[str, ...]
     camera_aliases: dict[str, str]
@@ -146,7 +147,7 @@ class ContractTransform(BaseModel):
 class PolicyContract(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     embodiment: ContractEmbodiment
     action_schema: ContractActionSchema
     observation_schema: ContractObservationSchema
@@ -159,6 +160,8 @@ class PolicyContract(BaseModel):
 
 class Config(BaseModel):
     """Validated policy configuration, including its policy contract."""
+
+    model_config = ConfigDict(extra="forbid")
 
     world: NonEmptyStr | None = None
     arm: NonEmptyStr
@@ -193,10 +196,10 @@ class Config(BaseModel):
     workspace_task_min_m: Vector3 | None = None
     workspace_task_max_m: Vector3 | None = None
     conditioner_algorithm: Literal["quintic", "toppra"] = "quintic"
-    execution_backend: Literal["simulation", "physical_lite6"] = "simulation"
-    physical_gripper_open_threshold: UnitFloat = 0.4
-    physical_gripper_close_threshold: UnitFloat = 0.6
-    physical_gripper_initial_state: BinaryFloat = 0.0
+    binary_gripper_open_threshold: UnitFloat = 0.4
+    binary_gripper_close_threshold: UnitFloat = 0.6
+    binary_gripper_initial_state: BinaryFloat = 0.0
+    binary_gripper_settle_sec: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 3.0
     max_chunks: Annotated[int, Field(ge=1, le=100)] = 1
     action_prefix_steps: Annotated[int, Field(ge=1, le=32)] | None = None
     action_prefix_duration_sec: PositiveFiniteFloat | None = None
@@ -246,15 +249,20 @@ class Config(BaseModel):
                 )
             ):
                 raise ValueError("workspace task minimums must be below maximums")
-        if self.execution_backend == "physical_lite6" and profile.arm_model != "lite6":
+        expected_gripper_units = (
+            "binary"
+            if self.contract.embodiment.gripper_mode == "binary"
+            else "normalized"
+        )
+        if self.contract.observation_schema.gripper_units != expected_gripper_units:
             raise ValueError(
-                "physical_lite6 execution requires a Lite6 policy contract"
+                "observation gripper_units must match embodiment gripper_mode"
             )
         if not (
-            self.physical_gripper_open_threshold < self.physical_gripper_close_threshold
+            self.binary_gripper_open_threshold < self.binary_gripper_close_threshold
         ):
             raise ValueError(
-                "physical gripper thresholds must satisfy 0 <= open < close <= 1"
+                "binary gripper thresholds must satisfy 0 <= open < close <= 1"
             )
         if (
             self.action_prefix_steps is not None
@@ -308,7 +316,7 @@ class Config(BaseModel):
         )
         config._contract = PolicyContract.model_construct(
             embodiment=ContractEmbodiment.model_construct(
-                arm_model="", gripper_model="", joint_names=()
+                arm_model="", gripper_model="", gripper_mode="position", joint_names=()
             )
         )
         config._profile = SAFETY_PROFILES[("ur20", "robotiq_2f_85")]
@@ -356,7 +364,7 @@ class RunStatus:
     embodiment: dict[str, Any]
     safety_profile: str
     conditioner_algorithm: str
-    execution_backend: str
+    gripper_mode: str
     state: str = "idle"
     run_id: str = ""
     prompt: str = ""
@@ -533,15 +541,19 @@ def _read_policy_contract(path_value: Any) -> tuple[PolicyContract, SafetyProfil
     )
     profile = SAFETY_PROFILES.get(identity)
     if profile is None:
-        raise ValueError(f"no simulator safety profile for embodiment {identity!r}")
+        raise ValueError(f"no safety profile for embodiment {identity!r}")
     if contract.embodiment.joint_names != profile.joint_names:
         raise ValueError(
             "policy contract joint order does not match its safety profile"
         )
+    expected_mode = "binary" if profile.gripper_model == "lite6_gripper" else "position"
+    expected_units = "binary" if expected_mode == "binary" else "normalized"
+    if contract.embodiment.gripper_mode != expected_mode:
+        raise ValueError("policy contract gripper mode does not match its embodiment")
     if contract.action_schema.names != (
         *profile.joint_names,
         "gripper",
-    ) or contract.action_schema.units != (*(("rad",) * 6), "normalized"):
+    ) or contract.action_schema.units != (*(("rad",) * 6), expected_units):
         raise ValueError("policy contract action schema does not match its embodiment")
     observation = contract.observation_schema
     if (
@@ -656,7 +668,7 @@ class Policy(Generic, EasyResource):
         self._fixed_camera: Camera
         self._wrist_camera: Camera
         self._config = Config._unconfigured()
-        self._physical_gripper_state = 0.0
+        self._binary_gripper_state = 0.0
         self._owner_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._execution_task: Optional[asyncio.Task[Mapping[str, ValueTypes]]] = None
@@ -672,7 +684,7 @@ class Policy(Generic, EasyResource):
             embodiment=self._config.contract.embodiment.model_dump(mode="json"),
             safety_profile=self._config.profile.name,
             conditioner_algorithm=self._config.conditioner_algorithm,
-            execution_backend=self._config.execution_backend,
+            gripper_mode=self._config.contract.embodiment.gripper_mode,
         )
 
     @classmethod
@@ -722,7 +734,7 @@ class Policy(Generic, EasyResource):
             dependencies, Camera, parsed.wrist_camera, "wrist camera"
         )
         self._config = parsed
-        self._physical_gripper_state = parsed.physical_gripper_initial_state
+        self._binary_gripper_state = parsed.binary_gripper_initial_state
         self._status = self._idle_status()
 
     @staticmethod
@@ -744,8 +756,8 @@ class Policy(Generic, EasyResource):
         return [math.radians(float(value)) for value in positions.values]
 
     async def _gripper_input(self) -> list[float]:
-        if self._config.execution_backend == "physical_lite6":
-            return [self._physical_gripper_state]
+        if self._config.contract.embodiment.gripper_mode == "binary":
+            return [self._binary_gripper_state]
         return [float(value) for value in await self._gripper.get_current_inputs()]
 
     async def _observation(self, prompt: str) -> dict[str, Any]:
@@ -1147,7 +1159,7 @@ class Policy(Generic, EasyResource):
         async for _ in stream:
             pass
 
-    async def _dispatch_simulated_gripper(
+    async def _dispatch_position_gripper(
         self,
         actions: np.ndarray,
         prefix_started: float,
@@ -1182,43 +1194,71 @@ class Policy(Generic, EasyResource):
             self._status.actions_executed += 1
         return lateness_samples
 
-    async def _dispatch_physical_gripper(
+    def _binary_prefix(self, actions: np.ndarray) -> tuple[np.ndarray, float | None]:
+        for action_index, action in enumerate(actions):
+            value = float(action[6])
+            desired = self._binary_gripper_state
+            if value <= self._config.binary_gripper_open_threshold:
+                desired = 0.0
+            elif value >= self._config.binary_gripper_close_threshold:
+                desired = 1.0
+            if desired != self._binary_gripper_state:
+                return actions[: action_index + 1], desired
+        return actions, None
+
+    async def _dispatch_binary_prefix(
         self,
         actions: np.ndarray,
-        prefix_started: float,
+        current_joints: Sequence[float],
         operation: Any,
         generation: int,
-        deadline_tolerance: float,
-    ) -> list[float]:
-        lateness_samples: list[float] = []
-        for action_index, action in enumerate(actions):
-            deadline = prefix_started + action_index * PERIOD_S
-            delay = deadline - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
+    ) -> dict[str, Any]:
+        prefix_started = time.monotonic()
+        selected, desired = self._binary_prefix(actions)
+        await self._wait_cancellable(
+            self._stream_arm_prefix(selected, current_joints),
+            len(selected) * PERIOD_S + self._config.connect_timeout_sec,
+            operation,
+            generation,
+            "binary gripper approach trajectory",
+        )
+        if await self._cancelled(operation, generation):
+            raise asyncio.CancelledError
+        transition = None
+        if desired is not None:
+            transition = "open" if desired == 0.0 else "grab"
+            command = self._gripper.open() if desired == 0.0 else self._gripper.grab()
+            await self._wait_cancellable(
+                command,
+                self._config.connect_timeout_sec,
+                operation,
+                generation,
+                f"gripper {transition} command",
+            )
+            self._binary_gripper_state = desired
+            if self._config.binary_gripper_settle_sec:
+                await self._wait_cancellable(
+                    asyncio.sleep(self._config.binary_gripper_settle_sec),
+                    self._config.binary_gripper_settle_sec + 1.0,
+                    operation,
+                    generation,
+                    "gripper settlement",
+                )
             if await self._cancelled(operation, generation):
                 raise asyncio.CancelledError
-            lateness = time.monotonic() - deadline
-            if lateness > deadline_tolerance:
-                raise TimeoutError(
-                    f"action {action_index} missed its deadline by {lateness:.6f}s"
-                )
-            lateness_samples.append(lateness)
-            value = float(action[6])
-            desired = self._physical_gripper_state
-            if value <= self._config.physical_gripper_open_threshold:
-                desired = 0.0
-            elif value >= self._config.physical_gripper_close_threshold:
-                desired = 1.0
-            if desired != self._physical_gripper_state:
-                if desired == 0.0:
-                    await self._gripper.open()
-                else:
-                    await self._gripper.grab()
-                self._physical_gripper_state = desired
-            self._status.action_index = action_index + 1
-            self._status.actions_executed += 1
-        return lateness_samples
+        self._status.action_index = len(selected)
+        self._status.actions_executed += len(selected)
+        return {
+            "gripper_mode": "binary",
+            "requested_steps": len(actions),
+            "scheduled_steps": len(selected),
+            "barrier_transition": transition,
+            "settle_sec": (
+                self._config.binary_gripper_settle_sec if transition else 0.0
+            ),
+            "elapsed_sec": time.monotonic() - prefix_started,
+            "max_dispatch_lateness_sec": 0.0,
+        }
 
     async def _dispatch_prefix(
         self,
@@ -1228,27 +1268,22 @@ class Policy(Generic, EasyResource):
         generation: int,
         deadline_tolerance: float,
     ) -> dict[str, Any]:
+        if self._config.contract.embodiment.gripper_mode == "binary":
+            return await self._dispatch_binary_prefix(
+                actions, current_joints, operation, generation
+            )
+
         prefix_started = time.monotonic()
-        gripper_dispatch = (
-            self._dispatch_physical_gripper(
-                actions,
-                prefix_started,
-                operation,
-                generation,
-                deadline_tolerance,
-            )
-            if self._config.execution_backend == "physical_lite6"
-            else self._dispatch_simulated_gripper(
-                actions,
-                prefix_started,
-                operation,
-                generation,
-                deadline_tolerance,
-            )
-        )
         _, lateness_samples = await self._wait_cancellable(
             asyncio.gather(
-                self._stream_arm_prefix(actions, current_joints), gripper_dispatch
+                self._stream_arm_prefix(actions, current_joints),
+                self._dispatch_position_gripper(
+                    actions,
+                    prefix_started,
+                    operation,
+                    generation,
+                    deadline_tolerance,
+                ),
             ),
             len(actions) * PERIOD_S + self._config.connect_timeout_sec,
             operation,
@@ -1256,8 +1291,11 @@ class Policy(Generic, EasyResource):
             "trajectory dispatch",
         )
         return {
-            "backend": self._config.execution_backend,
+            "gripper_mode": "position",
+            "requested_steps": len(actions),
             "scheduled_steps": len(actions),
+            "barrier_transition": None,
+            "settle_sec": 0.0,
             "elapsed_sec": time.monotonic() - prefix_started,
             "max_dispatch_lateness_sec": max(lateness_samples, default=0.0),
         }
@@ -1294,8 +1332,8 @@ class Policy(Generic, EasyResource):
         terminal_state = "completed"
         error = ""
         try:
-            # The configured backend selects simulator target latching or the
-            # Viam timestamped trajectory API used by physical arms.
+            # Arm execution is always timestamped; the contract selects only
+            # position-target versus binary-barrier gripper behavior.
             self._status.state = "connecting"
             socket, metadata = await self._connect(operation, generation)
             self._status.server_metadata = _value_types(metadata)

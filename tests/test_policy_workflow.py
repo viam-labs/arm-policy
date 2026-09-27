@@ -91,6 +91,7 @@ def test_lite6_setup_matches_episode_capture_initialization():
             seed=7,
             arm_frame="pick-arm",
             prop="pick_block",
+            gripper_settle_sec=0.0,
         )
     )
 
@@ -130,6 +131,7 @@ def test_lite6_setup_without_world_still_homes_arm_and_opens_gripper():
             seed=0,
             arm_frame="pick-arm",
             prop="pick_block",
+            gripper_settle_sec=0.0,
         )
     )
 
@@ -156,5 +158,6 @@ def test_lite6_scene_setup_rejects_missing_reset_pose():
                 seed=0,
                 arm_frame="pick-arm",
                 prop="pick_block",
+                gripper_settle_sec=0.0,
             )
         )
