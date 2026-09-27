@@ -1,8 +1,8 @@
 # arm-policy
 
-Viam module for safely executing contract-validated arm policies. The module gathers observations from typed arm, gripper, and camera dependencies, calls an external OpenPI-compatible WebSocket policy server, validates and conditions returned trajectories, and dispatches only a bounded safe prefix.
+Viam module for safely executing contract-validated arm policies. The module gathers observations from typed arm, gripper, and camera dependencies, calls an OpenPI-compatible WebSocket policy server, validates and conditions returned trajectories, and dispatches only a bounded safe prefix.
 
-The inference server remains a separate process. This keeps the robot-control module independent from Cosmos/PyTorch/CUDA startup and GPU failure modes.
+The inference server is optional but owned by the module: `models/download` atomically stores a configured immutable Hugging Face portable export only after its `.cosmos-policy-complete.json` publication marker validates, and `policy_server` starts its isolated, pinned-Cosmos runtime only on demand. Normal module startup and offline `models/list` use neither Cosmos nor Torch/CUDA. See the [model documentation](awinter_arm-policy_policy.md#model-and-server-management) for configuration, persistent-store layout, publication marker contract, and lifecycle commands.
 
 ## Model
 

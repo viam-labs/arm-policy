@@ -46,6 +46,14 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.utils import ValueTypes, struct_to_dict
 
+from .model_store import (
+    ModelStore,
+    default_data_root,
+    validate_data_root,
+    validate_repository,
+    validate_revision,
+)
+from .policy_server import PolicyServerSupervisor, runtime_command
 from .trajectory_conditioner import (
     ALGORITHM,
     ALGORITHM_VERSION,
@@ -204,6 +212,15 @@ class Config(BaseModel):
     action_prefix_steps: Annotated[int, Field(ge=1, le=32)] | None = None
     action_prefix_duration_sec: PositiveFiniteFloat | None = None
 
+    # The optional store is kept outside the normal module dependency set.
+    model_repository: str | None = None
+    model_revision: str | None = None
+    model_data_root: str | None = None
+    hf_token: str | None = None
+    policy_server_host: str = "127.0.0.1"
+    policy_server_port: Annotated[int, Field(ge=1, le=65535)] = 8000
+    policy_server_readiness_timeout_sec: PositiveFiniteFloat = 30.0
+
     _contract: PolicyContract
     _profile: SafetyProfile
 
@@ -273,6 +290,17 @@ class Config(BaseModel):
             )
         if self.action_prefix_duration_sec is not None:
             _prefix_steps_from_duration(self.action_prefix_duration_sec)
+        if (self.model_repository is None) != (self.model_revision is None):
+            raise ValueError("configure model_repository and model_revision together")
+        if self.model_repository is not None:
+            validate_repository(self.model_repository)
+            validate_revision(self.model_revision)
+        if self.model_data_root is not None:
+            validate_data_root(self.model_data_root)
+        if self.hf_token is not None and not self.hf_token.strip():
+            raise ValueError("hf_token must not be empty")
+        if not self.policy_server_host or any(char.isspace() for char in self.policy_server_host):
+            raise ValueError("policy_server_host must be a non-empty hostname or IP address")
         return self
 
     @property
@@ -322,6 +350,13 @@ class Config(BaseModel):
         config._profile = SAFETY_PROFILES[("ur20", "robotiq_2f_85")]
         return config
 
+
+def _model_data_root(config: Config) -> Path:
+    return (
+        validate_data_root(config.model_data_root)
+        if config.model_data_root is not None
+        else default_data_root()
+    )
 
 class ExecuteCommand(BaseModel):
     command: Literal["execute"] = "execute"
@@ -677,6 +712,7 @@ class Policy(Generic, EasyResource):
         self._closed = False
         self._status: RunStatus = self._idle_status()
         self._last_result: Optional[dict[str, Any]] = None
+        self._policy_server = PolicyServerSupervisor(default_data_root(), name)
 
     def _idle_status(self) -> RunStatus:
         return RunStatus(
@@ -733,9 +769,13 @@ class Policy(Generic, EasyResource):
         self._wrist_camera = self._dependency(
             dependencies, Camera, parsed.wrist_camera, "wrist camera"
         )
+        next_policy_server = PolicyServerSupervisor(_model_data_root(parsed), self.name)
+        if self._policy_server is not None:
+            self._policy_server.stop()
         self._config = parsed
         self._binary_gripper_state = parsed.binary_gripper_initial_state
         self._status = self._idle_status()
+        self._policy_server = next_policy_server
 
     @staticmethod
     def _decode_image(image: Any, expected: tuple[int, int], label: str) -> np.ndarray:
@@ -1612,6 +1652,67 @@ class Policy(Generic, EasyResource):
             )
         return result
 
+    def _require_model_store(self) -> ModelStore:
+        return ModelStore(_model_data_root(self._config))
+
+    async def _models_download_command(self) -> Mapping[str, ValueTypes]:
+        if self._config.model_repository is None or self._config.model_revision is None:
+            raise ValueError("models/download requires configured model_repository and model_revision")
+        record = await asyncio.to_thread(
+            self._require_model_store().download,
+            self._config.model_repository,
+            self._config.model_revision,
+            self._config.hf_token,
+        )
+        return record.response()
+
+    async def _models_list_command(self) -> Mapping[str, ValueTypes]:
+        records = await asyncio.to_thread(self._require_model_store().list)
+        return {"models": [record.response() for record in records]}
+
+    async def _policy_server_command(
+        self, command: Mapping[str, ValueTypes]
+    ) -> Mapping[str, ValueTypes]:
+        action = command.get("action")
+        if action == "status":
+            return await asyncio.to_thread(self._policy_server.status)
+        if action == "stop":
+            return await asyncio.to_thread(self._policy_server.stop)
+        if action != "start":
+            raise ValueError("policy_server action must be start, status, or stop")
+        records = await asyncio.to_thread(self._require_model_store().list)
+        model_path = command.get("model_path")
+        if model_path is None:
+            if self._config.model_repository is None or self._config.model_revision is None:
+                raise ValueError("policy_server start requires model_path or configured model_repository and model_revision")
+            records = [
+                record for record in records
+                if record.repository == self._config.model_repository
+                and record.resolved_revision == self._config.model_revision
+            ]
+            if len(records) != 1:
+                raise ValueError("configured model has not been downloaded and validated")
+            model = Path(records[0].path)
+        else:
+            if not isinstance(model_path, str):
+                raise ValueError("policy_server model_path must be a string")
+            model = Path(model_path).expanduser().resolve()
+            if str(model) not in {record.path for record in records}:
+                raise ValueError("policy_server model_path is not a validated local model")
+        runtime_root = Path(__file__).resolve().parents[2] / "policy_server_runtime"
+        return await asyncio.to_thread(
+            self._policy_server.start,
+            runtime_command(
+                runtime_root,
+                model,
+                self._config.policy_server_host,
+                self._config.policy_server_port,
+            ),
+            self._config.policy_server_host,
+            self._config.policy_server_port,
+            self._config.policy_server_readiness_timeout_sec,
+        )
+
     async def do_command(
         self,
         command: Mapping[str, ValueTypes],
@@ -1626,10 +1727,20 @@ class Policy(Generic, EasyResource):
             return await self._stop_command()
         if cmd == "status":
             return self._status.to_dict()
-        raise ValueError("unknown command; supported: execute, stop, status")
+        if cmd == "models/download":
+            return await self._models_download_command()
+        if cmd == "models/list":
+            return await self._models_list_command()
+        if cmd == "policy_server":
+            return await self._policy_server_command(command)
+        raise ValueError(
+            "unknown command; supported: execute, stop, status, models/download, models/list, policy_server"
+        )
 
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         await self._stop_command()
+        if self._policy_server is not None:
+            await asyncio.to_thread(self._policy_server.stop)

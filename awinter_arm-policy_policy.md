@@ -2,7 +2,7 @@
 
 A generic component that executes portable Cosmos/OpenPI arm-policy exports through normal Viam resources. It captures camera and joint observations, validates the export contract, conditions each 32-step trajectory, and executes only a validated receding-horizon prefix. Malformed output, unsafe kinematics, timeouts, cancellation, or missed dispatch deadlines fail closed and stop the arm and gripper.
 
-The model does not host or download the inference server. Start an OpenPI-compatible WebSocket server separately and configure its URI.
+The inference server is an optional module-owned subprocess. Its isolated `policy_server_runtime` environment is provisioned only by a `policy_server` start command, so normal robot-control startup never imports or installs Cosmos, Torch, or CUDA dependencies.
 
 ## Configuration
 
@@ -51,6 +51,14 @@ The model does not host or download the inference server. Start an OpenPI-compat
 | `binary_gripper_close_threshold` | `0.6` | Binary-close hysteresis threshold. |
 | `binary_gripper_initial_state` | `0` | Initial commanded binary state: `0` open or `1` closed. Setup should establish this state physically. |
 | `binary_gripper_settle_sec` | `3` | Cancellable wait after each nonblocking `Open` or `Grab` command. |
+
+### Downloaded model and server attributes
+
+Set `model_repository` to an HF `owner/name` and `model_revision` to its immutable lowercase 40-character commit. `model_data_root` is optional: when omitted the module uses `$VIAM_MODULE_DATA/arm-policy`, then `$XDG_DATA_HOME/arm-policy`, then `~/.local/share/viam/arm-policy`; set it to an absolute persistent directory to override that convention. `hf_token` is optional; `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN` are also supported. The token is never returned in command responses. `policy_server_host`, `policy_server_port`, and `policy_server_readiness_timeout_sec` select the module-owned server endpoint.
+
+Before a revision is downloadable, its Hub root must publish `.cosmos-policy-complete.json`: `{"schema_version":1,"repository":"owner/model","resolved_revision":"<40-char commit>","provenance":{"repository":"owner/training","revision":"<40-char commit>"}}`. The consumer rejects missing, redirected, mismatched, or provenance-free markers. This remote publication marker is copied and hash-covered in the export; it is distinct from the local atomic `.complete.json` publication record.
+
+The persistent store is `<data-root>/arm-policy-models/<owner--name>/<commit>/`. A directory is discoverable only after validation and atomic publication of its local `.complete.json`; interrupted or invalid staging directories are never listed.
 
 Arm joint observations always come from `GetJointPositions`, and validated arm
 prefixes always use `MoveThroughJointPositionsStreamed`. Gripper behavior comes
@@ -102,6 +110,30 @@ Read active and previous-run diagnostics:
 ```
 
 Only one execution owns the robot. Status and results include raw and conditioned chunks, conditioning metrics, validation scope, timing, safety profile, progress records, and rejection reasons.
+
+### Model and server management
+
+Download the configured immutable portable export (the response is stable JSON containing repository, requested/resolved revisions, path, and validation state):
+
+```json
+{"command": "models/download"}
+```
+
+List only locally complete, hash-validated downloads. This command is offline and makes no Hugging Face request:
+
+```json
+{"command": "models/list"}
+```
+
+Start the isolated pinned-Cosmos server for a validated model. Start is idempotent and waits for the local TCP endpoint; readiness failures include its log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
+
+```json
+{"command": "policy_server", "action": "start"}
+{"command": "policy_server", "action": "status"}
+{"command": "policy_server", "action": "stop"}
+```
+
+The supervisor is intentionally a module-owned subprocess rather than s6: it needs no host package, owns the server process group across module reconfiguration, records Linux start ticks to avoid PID-reuse kills, and can guarantee shutdown GPU cleanup without Docker. Module `close` performs the same stop cleanup.
 
 ## Workflow client
 
