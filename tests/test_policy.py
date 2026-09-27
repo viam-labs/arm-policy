@@ -321,6 +321,46 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
                 }
             )
         )
+    with pytest.raises(ValueError, match="model_revision"):
+        Policy.validate_config(
+            _config(
+                {
+                    **attrs,
+                    "model_repository": "owner/policy",
+                    "model_revision": "main",
+                    "model_data_root": str(tmp_path),
+                }
+            )
+        )
+    with pytest.raises(ValueError, match="absolute path"):
+        Policy.validate_config(
+            _config({**attrs, "model_data_root": "relative-model-store"})
+        )
+
+def test_reconfigure_stops_replaced_policy_server(tmp_path, monkeypatch):
+    contract_path, _, _ = _write_contract(tmp_path)
+    attrs = {
+        "arm": "pick-arm",
+        "gripper": "pick-gripper",
+        "fixed_camera": "scene-cam",
+        "wrist_camera": "wrist-cam",
+        "server_uri": "ws://127.0.0.1:8000",
+        "prompt": "pick",
+        "policy_contract_path": str(contract_path),
+    }
+
+    class ExistingServer:
+        stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    existing = ExistingServer()
+    policy = Policy("policy")
+    policy._policy_server = existing
+    monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
+    policy.reconfigure(_config(attrs), {})
+    assert existing.stopped
 
 
 def test_contract_selects_matching_profile_and_rejects_wrong_joint_order(tmp_path):

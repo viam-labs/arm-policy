@@ -1,0 +1,11 @@
+diff --git a/cosmos_framework/scripts/action_policy_server_robolab.py b/cosmos_framework/scripts/action_policy_server_robolab.py
+--- a/cosmos_framework/scripts/action_policy_server_robolab.py
++++ b/cosmos_framework/scripts/action_policy_server_robolab.py
+@@ -534,7 +534,7 @@ class RobolabPolicyService:
+         gripper_position = 1.0 - _ensure_gripper_array(obs["observation/gripper_position"])
+ 
+         if self.cfg.action_space == "joint_pos":
+-            joint_position = _ensure_2d_float_array(obs["observation/joint_position"], "observation/joint_position", 7)
++            joint_position = _ensure_2d_float_array(obs["observation/joint_position"], "observation/joint_position", self.cfg.action_dim - 1)
+             if self.cfg.use_state:
+                 action[0] = torch.from_numpy(np.concatenate((joint_position[-1], gripper_position[-1])))  # [D]
