@@ -51,6 +51,7 @@ The inference server is an optional module-owned subprocess. Its isolated `polic
 | `binary_gripper_close_threshold` | `0.6` | Binary-close hysteresis threshold. |
 | `binary_gripper_initial_state` | `0` | Initial commanded binary state: `0` open or `1` closed. Setup should establish this state physically. |
 | `binary_gripper_settle_sec` | `3` | Cancellable wait after each nonblocking `Open` or `Grab` command. |
+| `policy_server_autoclose` | `false` | Stop the managed policy-server process during component reconfiguration or close. Leave disabled to preserve the server across arm-policy and `viam-server` restarts. |
 
 ### Downloaded model and server attributes
 
@@ -133,7 +134,7 @@ Start the isolated pinned-Cosmos server for a validated model. Start is idempote
 {"command": "policy_server", "action": "stop"}
 ```
 
-The supervisor is intentionally a module-owned subprocess rather than s6: it needs no host package, owns the server process group across module reconfiguration, records Linux start ticks to avoid PID-reuse kills, and can guarantee shutdown GPU cleanup without Docker. Module `close` performs the same stop cleanup.
+The supervisor is intentionally a module-owned subprocess rather than s6: it needs no host package, records Linux start ticks to avoid PID-reuse kills, and recovers the persistent process state when the component restarts with the same name and data root. By default, only an explicit `policy_server stop` terminates the server. Set `policy_server_autoclose` to `true` to stop it automatically during component reconfiguration or close.
 
 ## Workflow client
 

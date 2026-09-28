@@ -345,7 +345,10 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
             _config({**attrs, "model_data_root": "relative-model-store"})
         )
 
-def test_reconfigure_stops_replaced_policy_server(tmp_path, monkeypatch):
+@pytest.mark.parametrize("autoclose", [False, True])
+def test_reconfigure_only_stops_policy_server_when_configured(
+    tmp_path, monkeypatch, autoclose
+):
     contract_path, _, _ = _write_contract(tmp_path)
     attrs = {
         "arm": "pick-arm",
@@ -355,6 +358,7 @@ def test_reconfigure_stops_replaced_policy_server(tmp_path, monkeypatch):
         "server_uri": "ws://127.0.0.1:8000",
         "prompt": "pick",
         "policy_contract_path": str(contract_path),
+        "policy_server_autoclose": autoclose,
     }
 
     class ExistingServer:
@@ -368,7 +372,32 @@ def test_reconfigure_stops_replaced_policy_server(tmp_path, monkeypatch):
     policy._policy_server = existing
     monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
     policy.reconfigure(_config(attrs), {})
-    assert existing.stopped
+    assert existing.stopped is autoclose
+
+
+@pytest.mark.parametrize("autoclose", [False, True])
+def test_close_only_stops_policy_server_when_configured(autoclose):
+    class ExistingServer:
+        stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    async def scenario():
+        existing = ExistingServer()
+        policy = Policy("policy")
+        policy._config.policy_server_autoclose = autoclose
+        policy._policy_server = existing
+
+        async def stop_execution():
+            return {}
+
+        policy._stop_command = stop_execution
+        await policy.close()
+        assert existing.stopped is autoclose
+
+    asyncio.run(scenario())
+
 
 
 def test_contract_selects_matching_profile_and_rejects_wrong_joint_order(tmp_path):

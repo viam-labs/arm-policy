@@ -220,6 +220,7 @@ class Config(BaseModel):
     policy_server_host: str = "127.0.0.1"
     policy_server_port: Annotated[int, Field(ge=1, le=65535)] = 8000
     policy_server_readiness_timeout_sec: PositiveFiniteFloat = 30.0
+    policy_server_autoclose: bool = False
 
     _contract: PolicyContract
     _profile: SafetyProfile
@@ -770,7 +771,7 @@ class Policy(Generic, EasyResource):
             dependencies, Camera, parsed.wrist_camera, "wrist camera"
         )
         next_policy_server = PolicyServerSupervisor(_model_data_root(parsed), self.name)
-        if self._policy_server is not None:
+        if parsed.policy_server_autoclose and self._policy_server is not None:
             self._policy_server.stop()
         self._config = parsed
         self._binary_gripper_state = parsed.binary_gripper_initial_state
@@ -1742,5 +1743,5 @@ class Policy(Generic, EasyResource):
             return
         self._closed = True
         await self._stop_command()
-        if self._policy_server is not None:
+        if self._config.policy_server_autoclose and self._policy_server is not None:
             await asyncio.to_thread(self._policy_server.stop)
