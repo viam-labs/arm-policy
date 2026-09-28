@@ -34,10 +34,16 @@ class PortableRobolabPolicyService:
         ]
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(add_help=False)
+def _parse_wrapper_args(
+    argv: list[str] | None = None,
+) -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--portable-contract", type=Path, required=True)
-    wrapper, remaining = parser.parse_known_args()
+    return parser.parse_known_args(argv)
+
+
+def main() -> None:
+    wrapper, remaining = _parse_wrapper_args()
     try:
         contract = json.loads(wrapper.portable_contract.read_text(encoding="utf-8"))
         action_dim = contract["action_schema"]["shape"][0]
