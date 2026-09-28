@@ -12,9 +12,18 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from service_adapter import PortableRobolabPolicyService
+try:
+    from .service_adapter import PortableRobolabPolicyService
+except ImportError:
+    from service_adapter import PortableRobolabPolicyService
 
 FRAMEWORK_COMMIT = "efba2076c80648663a89a7fdbc92eb262fae39ac"
+FRAMEWORK_REPOSITORY = "https://github.com/NVIDIA/cosmos-framework.git"
+FRAMEWORK_PYTHON = "3.13"
+FRAMEWORK_SYNC_GROUPS = ("cu130-torch213-train", "policy-server")
+FRAMEWORK_RUNTIME_MARKER = (
+    f"{FRAMEWORK_COMMIT}:{FRAMEWORK_PYTHON}:{','.join(FRAMEWORK_SYNC_GROUPS)}\n"
+)
 
 
 def _json(path: Path) -> dict:
@@ -75,17 +84,87 @@ def _model_view(model: Path) -> Path:
         os.replace(staging, root)
     return root
 
+def _framework_root() -> Path:
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache / "arm-policy" / f"cosmos-framework-{FRAMEWORK_COMMIT}"
+
+
+def _framework_revision(root: Path) -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _provision_framework() -> Path:
+    """Sync the pinned upstream policy-server environment using upstream groups."""
+    root = _framework_root()
+    marker = root / ".arm-policy-policy-server-runtime"
+    python = root / ".venv/bin/python"
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with (root.parent / f".{root.name}.lock").open("a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if (
+            marker.is_file()
+            and marker.read_text(encoding="utf-8") == FRAMEWORK_RUNTIME_MARKER
+            and python.is_file()
+            and _framework_revision(root) == FRAMEWORK_COMMIT
+        ):
+            return root
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir()
+        environment = os.environ.copy()
+        environment.pop("VIRTUAL_ENV", None)
+        environment["UV_PROJECT_ENVIRONMENT"] = str(root / ".venv")
+        try:
+            subprocess.run(["git", "init"], cwd=root, check=True, env=environment)
+            subprocess.run(
+                ["git", "remote", "add", "origin", FRAMEWORK_REPOSITORY],
+                cwd=root,
+                check=True,
+                env=environment,
+            )
+            subprocess.run(
+                ["git", "fetch", "--depth", "1", "origin", FRAMEWORK_COMMIT],
+                cwd=root,
+                check=True,
+                env=environment,
+            )
+            subprocess.run(
+                ["git", "checkout", "--detach", "FETCH_HEAD"],
+                cwd=root,
+                check=True,
+                env=environment,
+            )
+            sync = ["uv", "sync", "--frozen", "--all-extras"]
+            for group in FRAMEWORK_SYNC_GROUPS:
+                sync.extend(("--group", group))
+            sync.extend(("--python", FRAMEWORK_PYTHON))
+            subprocess.run(sync, cwd=root, check=True, env=environment)
+            if not python.is_file() or _framework_revision(root) != FRAMEWORK_COMMIT:
+                raise RuntimeError("pinned Cosmos environment did not provision completely")
+            marker.write_text(FRAMEWORK_RUNTIME_MARKER, encoding="utf-8")
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+            shutil.rmtree(root, ignore_errors=True)
+            raise SystemExit(f"cannot provision pinned Cosmos policy-server runtime: {exc}") from exc
+    return root
+
 def _overlay_root() -> Path:
     cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     return cache / "arm-policy" / f"policy-server-{FRAMEWORK_COMMIT}"
 
 
-def _prepare_overlay() -> Path:
-    """Copy and patch a cache overlay; never mutate uv's installed package."""
-    try:
-        import cosmos_framework
-    except ImportError as exc:
-        raise SystemExit("isolated Cosmos runtime is not provisioned; run through uv --frozen") from exc
+def _prepare_overlay(framework: Path) -> Path:
+    """Copy and patch a cache overlay; never mutate the pinned checkout."""
+    source_package = framework / "cosmos_framework"
+    if not source_package.is_dir() or _framework_revision(framework) != FRAMEWORK_COMMIT:
+        raise SystemExit("pinned Cosmos checkout is missing or has the wrong revision")
     root = _overlay_root()
     marker = root / ".joint-width-patch"
     target = root / "cosmos_framework/scripts/action_policy_server_robolab.py"
@@ -100,7 +179,6 @@ def _prepare_overlay() -> Path:
             shutil.rmtree(root, ignore_errors=True)
         staging = root.with_name(f".{root.name}.{os.getpid()}.tmp")
         shutil.rmtree(staging, ignore_errors=True)
-        source_package = Path(cosmos_framework.__file__).resolve().parent
         shutil.copytree(source_package, staging / "cosmos_framework")
         try:
             subprocess.run(
@@ -134,13 +212,26 @@ def main() -> int:
     model = args.model.expanduser().resolve()
     contract = _validate(model)
     view = _model_view(model)
-    command = PortableRobolabPolicyService.command(model_view=view, contract=contract, host=args.host, port=args.port)
+    framework = _framework_root() if args.print_command else _provision_framework()
+    python = framework / ".venv/bin/python"
+    command = PortableRobolabPolicyService.command(
+        model_view=view,
+        contract=contract,
+        host=args.host,
+        port=args.port,
+        python=python,
+    )
     overlay = _overlay_root()
     if args.print_command:
-        print(f"PYTHONPATH={shlex.quote(str(overlay))} {shlex.join(command)}")
+        print(
+            f"LD_LIBRARY_PATH='' PYTHONPATH={shlex.quote(str(overlay))} "
+            f"{shlex.join(command)}"
+        )
         return 0
-    overlay = _prepare_overlay()
+    overlay = _prepare_overlay(framework)
     env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
+    env["LD_LIBRARY_PATH"] = ""
     prior = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(overlay) + (os.pathsep + prior if prior else "")
     os.chdir(view)

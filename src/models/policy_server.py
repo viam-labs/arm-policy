@@ -7,6 +7,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -144,14 +145,9 @@ class PolicyServerSupervisor:
 
 
 def runtime_command(runtime_root: Path, model: Path, host: str, port: int) -> list[str]:
-    """Only server start enters the isolated frozen runtime environment."""
+    """Start the lightweight provisioner; it enters the pinned upstream environment."""
     return [
-        "uv",
-        "run",
-        "--frozen",
-        "--project",
-        str(runtime_root),
-        "python",
+        sys.executable,
         str(runtime_root / "launcher.py"),
         "--model",
         str(model),

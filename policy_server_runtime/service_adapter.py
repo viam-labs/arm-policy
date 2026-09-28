@@ -15,14 +15,21 @@ from typing import Any
 
 class PortableRobolabPolicyService:
     @staticmethod
-    def command(*, model_view: Path, contract: dict[str, Any], host: str, port: int) -> list[str]:
+    def command(
+        *,
+        model_view: Path,
+        contract: dict[str, Any],
+        host: str,
+        port: int,
+        python: str | Path = sys.executable,
+    ) -> list[str]:
         action = contract["action_schema"]
         framework = contract["framework"]
         transform = contract.get("transform", {})
         contract_path = model_view / "policy_contract.runtime.json"
         contract_path.write_text(json.dumps(contract, sort_keys=True) + "\n", encoding="utf-8")
         return [
-            sys.executable, str(Path(__file__).resolve()), "--portable-contract", str(contract_path),
+            str(python), str(Path(__file__).resolve()), "--portable-contract", str(contract_path),
             "--checkpoint-path", str(model_view), "--host", host, "--port", str(port),
             "--domain-name", str(contract["domain_name"]), "--action-space", str(framework["action_space"]),
             "--action-dim", str(action["shape"][0]), "--action-chunk-size", str(contract["action_chunk_size"]),

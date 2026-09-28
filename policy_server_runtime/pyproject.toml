@@ -1,8 +1,0 @@
-[project]
-name = "arm-policy-server-runtime"
-version = "0.1.0"
-description = "Isolated CUDA/Cosmos runtime for arm-policy"
-requires-python = ">=3.11"
-dependencies = [
-  "cosmos-framework @ git+https://github.com/NVIDIA/cosmos-framework.git@efba2076c80648663a89a7fdbc92eb262fae39ac",
-]

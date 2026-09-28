@@ -2,7 +2,7 @@
 
 A generic component that executes portable Cosmos/OpenPI arm-policy exports through normal Viam resources. It captures camera and joint observations, validates the export contract, conditions each 32-step trajectory, and executes only a validated receding-horizon prefix. Malformed output, unsafe kinematics, timeouts, cancellation, or missed dispatch deadlines fail closed and stop the arm and gripper.
 
-The inference server is an optional module-owned subprocess. Its isolated `policy_server_runtime` environment is provisioned only by a `policy_server` start command, so normal robot-control startup never imports or installs Cosmos, Torch, or CUDA dependencies.
+The inference server is an optional module-owned subprocess. On its first `policy_server start`, the module checks out the pinned Cosmos revision into its cache and uses that checkout's own `uv sync --all-extras --group=cu130-torch213-train --group=policy-server` dependency definitions. Normal robot-control startup never imports or installs Cosmos, Torch, or CUDA dependencies.
 
 ## Configuration
 
@@ -135,7 +135,7 @@ List only locally complete, hash-validated downloads. This command is offline an
 {"command": "models/list"}
 ```
 
-Start the isolated pinned-Cosmos server for a validated model. Start is idempotent and waits for the local TCP endpoint; readiness failures include its log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
+Start the isolated pinned-Cosmos server for a validated model. The first start requires network access and substantial disk space while the pinned upstream CUDA 13 policy-server environment is provisioned; later starts reuse it. Start is idempotent and waits for the local TCP endpoint, so its readiness timeout must cover first-time provisioning. Readiness failures include the log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
 
 ```json
 {"command": "policy_server", "action": "start"}
