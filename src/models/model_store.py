@@ -8,13 +8,14 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Mapping
+from pathlib import Path, PurePosixPath
+from typing import Any, Literal, Mapping
 
 _REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
@@ -43,6 +44,61 @@ def validate_revision(value: object) -> str:
     if not isinstance(value, str) or not _REVISION.fullmatch(value):
         raise ValueError("model_revision must be an immutable 40-character lowercase git commit")
     return value
+
+
+def _validate_bucket_path(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("bucket path must be a non-empty safe relative path")
+    if "\\" in value:
+        raise ValueError("bucket path must use POSIX separators")
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in ("", ".", "..") for part in value.split("/")):
+        raise ValueError("bucket path must be a non-empty safe relative path")
+    return value
+
+
+@dataclass(frozen=True)
+class ModelSource:
+    """An immutable Hugging Face model repository or storage bucket location."""
+
+    kind: Literal["model", "bucket"]
+    repository: str
+    bucket_path: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_repository(self.repository)
+        if self.kind == "model":
+            if self.bucket_path is not None:
+                raise ValueError("model sources cannot include a bucket path")
+        elif self.kind == "bucket":
+            _validate_bucket_path(self.bucket_path)
+        else:
+            raise ValueError("model source kind must be model or bucket")
+
+    @property
+    def canonical(self) -> str:
+        if self.kind == "model":
+            return f"model:{self.repository}"
+        return f"bucket:{self.repository}:{self.bucket_path}"
+
+    def __str__(self) -> str:
+        return self.canonical
+
+
+def parse_model_source(value: object) -> ModelSource:
+    """Parse the strict configuration syntax into a canonical source value."""
+    if not isinstance(value, str):
+        raise ValueError("model_source must be a string")
+    if value.startswith("model:"):
+        return ModelSource("model", validate_repository(value.removeprefix("model:")))
+    if value.startswith("bucket:"):
+        repository, separator, bucket_path = value.removeprefix("bucket:").partition(":")
+        if not separator:
+            raise ValueError("bucket model_source must be bucket:owner/name:path")
+        return ModelSource("bucket", validate_repository(repository), _validate_bucket_path(bucket_path))
+    if ":" not in value:
+        return ModelSource("model", validate_repository(value))
+    raise ValueError("model_source must be owner/name, model:owner/name, or bucket:owner/name:path")
 
 
 def validate_data_root(value: object) -> Path:
@@ -135,7 +191,7 @@ def validate_portable_export(root: Path) -> dict[str, str]:
         raise ValueError("portable export runtime and export framework revisions conflict")
     if checkpoint.get("runtime_manifest") != "runtime_manifest.json":
         raise ValueError("portable export checkpoint does not reference runtime_manifest.json")
-    if contract.get("schema_version") != 2:
+    if contract.get("schema_version") != 3:
         raise ValueError("portable export policy contract has an unsupported schema")
     for field in ("training_config", "policy_contract", "vae"):
         entry = runtime_manifest.get(field)
@@ -150,15 +206,15 @@ def validate_portable_export(root: Path) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class ModelRecord:
-    repository: str
-    requested_revision: str
-    resolved_revision: str
+    source: ModelSource
+    requested_revision: str | None
+    resolved_revision: str | None
     path: str
-    validation_state: str
+    validation_state: Literal["validated"]
 
-    def response(self) -> dict[str, str]:
+    def response(self) -> dict[str, str | None]:
         return {
-            "repository": self.repository,
+            "model_source": self.source.canonical,
             "requested_revision": self.requested_revision,
             "resolved_revision": self.resolved_revision,
             "path": self.path,
@@ -225,13 +281,18 @@ class HuggingFaceClient:
 
 
 class ModelStore:
-    """A lock-serialized immutable store; only completion manifests are discoverable."""
+    """A lock-serialized immutable store; only validated completions are discoverable."""
 
     def __init__(self, data_root: Path) -> None:
         self.root = data_root / "arm-policy-models"
 
-    def _target(self, repository: str, revision: str) -> Path:
-        return self.root / repository.replace("/", "--") / revision
+    def _target(self, source: ModelSource, requested_revision: str | None) -> Path:
+        repository = source.repository.replace("/", "--")
+        if source.kind == "model":
+            assert requested_revision is not None
+            return self.root / "model" / repository / requested_revision
+        source_id = hashlib.sha256(source.canonical.encode("utf-8")).hexdigest()
+        return self.root / "bucket" / repository / source_id
 
     @staticmethod
     def _completion(path: Path) -> Path:
@@ -243,29 +304,73 @@ class ModelStore:
             return None
         try:
             manifest = _read_json(marker)
-            repository = validate_repository(manifest.get("repository"))
-            requested_revision = validate_revision(manifest.get("requested_revision"))
-            resolved_revision = validate_revision(manifest.get("resolved_revision"))
-            validate_remote_completion_marker(
-                manifest.get("remote_completion_marker"), repository, resolved_revision
-            )
+            source = parse_model_source(manifest.get("model_source"))
+            requested_revision = manifest.get("requested_revision")
+            resolved_revision = manifest.get("resolved_revision")
+            if source.kind == "model":
+                requested_revision = validate_revision(requested_revision)
+                resolved_revision = validate_revision(resolved_revision)
+                validate_remote_completion_marker(
+                    manifest.get("remote_completion_marker"), source.repository, resolved_revision
+                )
+            elif requested_revision is not None or resolved_revision is not None:
+                raise ValueError("bucket completion manifests cannot have model revisions")
             hashes = validate_portable_export(target)
         except ValueError:
             return None
         if manifest.get("hashes") != hashes or manifest.get("validation_state") != "validated":
             return None
-        return ModelRecord(
-            repository=repository,
-            requested_revision=requested_revision,
-            resolved_revision=resolved_revision,
-            path=str(target),
-            validation_state="validated",
+        return ModelRecord(source, requested_revision, resolved_revision, str(target), "validated")
+
+    @staticmethod
+    def _bucket_sync(source: ModelSource, destination: Path, token: str | None) -> None:
+        assert source.kind == "bucket" and source.bucket_path is not None
+        environment = os.environ.copy()
+        if token:
+            environment["HF_TOKEN"] = token
+        subprocess.run(
+            ["uvx", "hf@latest", "buckets", "sync", f"hf://buckets/{source.repository}/{source.bucket_path}", str(destination)],
+            check=True,
+            env=environment,
         )
 
-    def download(self, repository: str, requested_revision: str, token: str | None = None) -> ModelRecord:
-        repository = validate_repository(repository)
-        requested_revision = validate_revision(requested_revision)
-        target = self._target(repository, requested_revision)
+    def _publish(
+        self,
+        staging: Path,
+        target: Path,
+        source: ModelSource,
+        requested_revision: str | None,
+        resolved_revision: str | None,
+        remote_marker: Mapping[str, Any] | None = None,
+    ) -> ModelRecord:
+        hashes = validate_portable_export(staging)
+        marker: dict[str, Any] = {
+            "model_source": source.canonical,
+            "requested_revision": requested_revision,
+            "resolved_revision": resolved_revision,
+            "validation_state": "validated",
+            "hashes": hashes,
+        }
+        if remote_marker is not None:
+            marker["remote_completion_marker"] = remote_marker
+        self._completion(staging).write_text(
+            json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+        )
+        if target.exists():
+            shutil.rmtree(target)
+        os.replace(staging, target)
+        return ModelRecord(source, requested_revision, resolved_revision, str(target), "validated")
+
+    def download(
+        self, source: ModelSource, requested_revision: str | None, token: str | None = None
+    ) -> ModelRecord:
+        if not isinstance(source, ModelSource):
+            raise ValueError("source must be a ModelSource")
+        if source.kind == "model":
+            requested_revision = validate_revision(requested_revision)
+        elif requested_revision is not None:
+            raise ValueError("bucket sources cannot specify model_revision")
+        target = self._target(source, requested_revision)
         lock_path = target.parent / f".{target.name}.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+", encoding="utf-8") as lock:
@@ -273,47 +378,32 @@ class ModelStore:
             cached = self._record_if_valid(target)
             if cached is not None:
                 return cached
-            client = HuggingFaceClient(repository, token)
-            resolved, files = client.resolve(requested_revision)
-            if REMOTE_COMPLETION_MARKER not in files:
-                raise ValueError(
-                    f"Hugging Face revision is not published: missing {REMOTE_COMPLETION_MARKER}"
-                )
-            staging = Path(tempfile.mkdtemp(prefix=f".{resolved}.", dir=target.parent))
+            staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
             try:
-                remote_marker_path = staging / REMOTE_COMPLETION_MARKER
-                client.download(resolved, REMOTE_COMPLETION_MARKER, remote_marker_path)
-                remote_marker = _read_json(remote_marker_path)
-                validate_remote_completion_marker(remote_marker, repository, resolved)
-                for name in files:
-                    if name != REMOTE_COMPLETION_MARKER:
-                        client.download(resolved, name, staging / _safe_relative(name))
-                hashes = validate_portable_export(staging)
-                marker = {
-                    "repository": repository,
-                    "requested_revision": requested_revision,
-                    "resolved_revision": resolved,
-                    "validation_state": "validated",
-                    "remote_completion_marker": remote_marker,
-                    "hashes": hashes,
-                }
-                (staging / ".complete.json").write_text(
-                    json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n",
-                    encoding="utf-8",
-                )
-                if target.exists():
-                    shutil.rmtree(target)
-                os.replace(staging, target)
+                if source.kind == "model":
+                    client = HuggingFaceClient(source.repository, token)
+                    resolved, files = client.resolve(requested_revision)
+                    if REMOTE_COMPLETION_MARKER not in files:
+                        raise ValueError(f"Hugging Face revision is not published: missing {REMOTE_COMPLETION_MARKER}")
+                    remote_marker_path = staging / REMOTE_COMPLETION_MARKER
+                    client.download(resolved, REMOTE_COMPLETION_MARKER, remote_marker_path)
+                    remote_marker = _read_json(remote_marker_path)
+                    validate_remote_completion_marker(remote_marker, source.repository, resolved)
+                    for name in files:
+                        if name != REMOTE_COMPLETION_MARKER:
+                            client.download(resolved, name, staging / _safe_relative(name))
+                    return self._publish(staging, target, source, requested_revision, resolved, remote_marker)
+                self._bucket_sync(source, staging, token)
+                return self._publish(staging, target, source, None, None)
             except Exception:
                 shutil.rmtree(staging, ignore_errors=True)
                 raise
-            return ModelRecord(repository, requested_revision, resolved, str(target), "validated")
 
     def list(self) -> list[ModelRecord]:
         if not self.root.is_dir():
             return []
         records: list[ModelRecord] = []
-        for marker in sorted(self.root.glob("*/*/.complete.json")):
+        for marker in sorted(self.root.rglob(".complete.json")):
             record = self._record_if_valid(marker.parent)
             if record is not None:
                 records.append(record)

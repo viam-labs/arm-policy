@@ -49,8 +49,8 @@ from viam.utils import ValueTypes, struct_to_dict
 from .model_store import (
     ModelStore,
     default_data_root,
+    parse_model_source,
     validate_data_root,
-    validate_repository,
     validate_revision,
 )
 from .policy_server import PolicyServerSupervisor, runtime_command
@@ -178,7 +178,7 @@ class Config(BaseModel):
     wrist_camera: NonEmptyStr
     server_uri: WebsocketUrl
     prompt: Prompt
-    policy_contract_path: NonEmptyStr
+    policy_contract_path: NonEmptyStr | None = None
 
     # Fixed by the checkpoint.
     action_chunk_size: Literal[32] = 32
@@ -213,7 +213,7 @@ class Config(BaseModel):
     action_prefix_duration_sec: PositiveFiniteFloat | None = None
 
     # The optional store is kept outside the normal module dependency set.
-    model_repository: str | None = None
+    model_source: str | None = None
     model_revision: str | None = None
     model_data_root: str | None = None
     hf_token: str | None = None
@@ -226,83 +226,50 @@ class Config(BaseModel):
     _profile: SafetyProfile
 
     @model_validator(mode="after")
-    def validate_contract(self) -> Self:
-        contract, profile = _read_policy_contract(self.policy_contract_path)
-        self._contract = contract
-        self._profile = profile
-
-        pinned_scalars = {
-            "max_reach_m": profile.max_reach_m,
-            "workspace_floor_m": profile.workspace_floor_m,
-            "tcp_offset_m": profile.tcp_offset_m,
-        }
-        for key, expected in pinned_scalars.items():
-            value = getattr(self, key)
-            if value is not None and value != expected:
-                raise ValueError(f"{key} is fixed by safety profile {profile.name}")
-
-        pinned_vectors = {
-            "joint_min_radians": profile.joint_min,
-            "joint_max_radians": profile.joint_max,
-            "velocity_limits_rad_s": profile.velocity_limits,
-            "acceleration_limits_rad_s2": profile.acceleration_limits,
-        }
-        for key, expected in pinned_vectors.items():
-            value = getattr(self, key)
-            if value is not None and value != expected:
-                raise ValueError(f"{key} is fixed by safety profile {profile.name}")
-
-        if (self.workspace_task_min_m is None) != (self.workspace_task_max_m is None):
-            raise ValueError(
-                "workspace_task_min_m and workspace_task_max_m must be set together"
-            )
-        if (
-            self.workspace_task_min_m is not None
-            and self.workspace_task_max_m is not None
-        ):
-            if any(
-                low >= high
-                for low, high in zip(
-                    self.workspace_task_min_m, self.workspace_task_max_m
-                )
-            ):
-                raise ValueError("workspace task minimums must be below maximums")
-        expected_gripper_units = (
-            "binary"
-            if self.contract.embodiment.gripper_mode == "binary"
-            else "normalized"
-        )
-        if self.contract.observation_schema.gripper_units != expected_gripper_units:
-            raise ValueError(
-                "observation gripper_units must match embodiment gripper_mode"
-            )
-        if not (
-            self.binary_gripper_open_threshold < self.binary_gripper_close_threshold
-        ):
-            raise ValueError(
-                "binary gripper thresholds must satisfy 0 <= open < close <= 1"
-            )
-        if (
-            self.action_prefix_steps is not None
-            and self.action_prefix_duration_sec is not None
-        ):
-            raise ValueError(
-                "set only one of action_prefix_steps and action_prefix_duration_sec"
-            )
-        if self.action_prefix_duration_sec is not None:
-            _prefix_steps_from_duration(self.action_prefix_duration_sec)
-        if (self.model_repository is None) != (self.model_revision is None):
-            raise ValueError("configure model_repository and model_revision together")
-        if self.model_repository is not None:
-            validate_repository(self.model_repository)
-            validate_revision(self.model_revision)
+    def validate_static(self) -> Self:
+        if self.policy_contract_path is None and self.model_source is None:
+            raise ValueError("configure policy_contract_path or model_source")
+        if self.model_source is not None:
+            source = parse_model_source(self.model_source)
+            if source.kind == "model":
+                validate_revision(self.model_revision)
+            elif self.model_revision is not None:
+                raise ValueError("model_revision is forbidden for bucket model_source")
+        elif self.model_revision is not None:
+            raise ValueError("model_revision requires model_source")
         if self.model_data_root is not None:
             validate_data_root(self.model_data_root)
         if self.hf_token is not None and not self.hf_token.strip():
             raise ValueError("hf_token must not be empty")
         if not self.policy_server_host or any(char.isspace() for char in self.policy_server_host):
             raise ValueError("policy_server_host must be a non-empty hostname or IP address")
+        if (self.workspace_task_min_m is None) != (self.workspace_task_max_m is None):
+            raise ValueError("workspace_task_min_m and workspace_task_max_m must be set together")
+        if self.workspace_task_min_m is not None and self.workspace_task_max_m is not None:
+            if any(low >= high for low, high in zip(self.workspace_task_min_m, self.workspace_task_max_m)):
+                raise ValueError("workspace task minimums must be below maximums")
+        if not self.binary_gripper_open_threshold < self.binary_gripper_close_threshold:
+            raise ValueError("binary gripper thresholds must satisfy 0 <= open < close <= 1")
+        if self.action_prefix_steps is not None and self.action_prefix_duration_sec is not None:
+            raise ValueError("set only one of action_prefix_steps and action_prefix_duration_sec")
+        if self.action_prefix_duration_sec is not None:
+            _prefix_steps_from_duration(self.action_prefix_duration_sec)
         return self
+
+    def validate_contract(self, contract: PolicyContract, profile: SafetyProfile) -> None:
+        pinned_scalars = {"max_reach_m": profile.max_reach_m, "workspace_floor_m": profile.workspace_floor_m, "tcp_offset_m": profile.tcp_offset_m}
+        for key, expected in pinned_scalars.items():
+            if (value := getattr(self, key)) is not None and value != expected:
+                raise ValueError(f"{key} is fixed by safety profile {profile.name}")
+        pinned_vectors = {"joint_min_radians": profile.joint_min, "joint_max_radians": profile.joint_max, "velocity_limits_rad_s": profile.velocity_limits, "acceleration_limits_rad_s2": profile.acceleration_limits}
+        for key, expected in pinned_vectors.items():
+            if (value := getattr(self, key)) is not None and value != expected:
+                raise ValueError(f"{key} is fixed by safety profile {profile.name}")
+        expected_gripper_units = "binary" if contract.embodiment.gripper_mode == "binary" else "normalized"
+        if contract.observation_schema.gripper_units != expected_gripper_units:
+            raise ValueError("observation gripper_units must match embodiment gripper_mode")
+        self._contract = contract
+        self._profile = profile
 
     @property
     def contract(self) -> PolicyContract:
@@ -711,9 +678,52 @@ class Policy(Generic, EasyResource):
         self._socket: Any = None
         self._generation = 0
         self._closed = False
+        self._ready = False
+        self._readiness_error = ""
         self._status: RunStatus = self._idle_status()
         self._last_result: Optional[dict[str, Any]] = None
         self._policy_server = PolicyServerSupervisor(default_data_root(), name)
+
+    def _matching_model_record(self) -> Path | None:
+        if self._config.model_source is None:
+            return None
+        source = parse_model_source(self._config.model_source)
+        for record in self._require_model_store().list():
+            if record.source.canonical != source.canonical:
+                continue
+            if source.kind == "bucket" or self._config.model_revision in (record.requested_revision, record.resolved_revision):
+                return Path(record.path)
+        return None
+
+    def _contract_path(self) -> Path:
+        if self._config.policy_contract_path is not None:
+            return Path(self._config.policy_contract_path).expanduser()
+        record_path = self._matching_model_record()
+        if record_path is None:
+            raise ValueError("configured model_source has not been downloaded and validated")
+        return record_path / "policy_contract.json"
+
+    def _advance_readiness(self) -> bool:
+        if self._ready:
+            return True
+        try:
+            contract, profile = _read_policy_contract(str(self._contract_path()))
+            self._config.validate_contract(contract, profile)
+        except (OSError, ValueError) as exc:
+            self._readiness_error = str(exc)
+            self._status = self._idle_status()
+            self._status.state = "wait_contract"
+            self._status.last_error = self._readiness_error
+            return False
+        self._ready = True
+        self._readiness_error = ""
+        self._status = self._idle_status()
+        self._status.state = "ready"
+        return True
+
+    def _require_ready(self) -> None:
+        if not self._advance_readiness():
+            raise RuntimeError("policy contract is not ready: " f"{self._readiness_error}; configure a valid policy_contract_path or download the configured model_source")
 
     def _idle_status(self) -> RunStatus:
         return RunStatus(
@@ -773,10 +783,14 @@ class Policy(Generic, EasyResource):
         next_policy_server = PolicyServerSupervisor(_model_data_root(parsed), self.name)
         if parsed.policy_server_autoclose and self._policy_server is not None:
             self._policy_server.stop()
+        parsed._contract = self._config.contract
+        parsed._profile = self._config.profile
         self._config = parsed
         self._binary_gripper_state = parsed.binary_gripper_initial_state
-        self._status = self._idle_status()
+        self._ready = False
+        self._readiness_error = ""
         self._policy_server = next_policy_server
+        self._advance_readiness()
 
     @staticmethod
     def _decode_image(image: Any, expected: tuple[int, int], label: str) -> np.ndarray:
@@ -1576,6 +1590,7 @@ class Policy(Generic, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         if self._closed:
             raise RuntimeError(f"policy {self.name} is closed")
+        self._require_ready()
         defaults: dict[str, Any] = {
             "command": "execute",
             "prompt": self._config.prompt,
@@ -1657,14 +1672,15 @@ class Policy(Generic, EasyResource):
         return ModelStore(_model_data_root(self._config))
 
     async def _models_download_command(self) -> Mapping[str, ValueTypes]:
-        if self._config.model_repository is None or self._config.model_revision is None:
-            raise ValueError("models/download requires configured model_repository and model_revision")
+        if self._config.model_source is None:
+            raise ValueError("models/download requires configured model_source")
         record = await asyncio.to_thread(
             self._require_model_store().download,
-            self._config.model_repository,
+            parse_model_source(self._config.model_source),
             self._config.model_revision,
             self._config.hf_token,
         )
+        self._advance_readiness()
         return record.response()
 
     async def _models_list_command(self) -> Mapping[str, ValueTypes]:
@@ -1684,12 +1700,14 @@ class Policy(Generic, EasyResource):
         records = await asyncio.to_thread(self._require_model_store().list)
         model_path = command.get("model_path")
         if model_path is None:
-            if self._config.model_repository is None or self._config.model_revision is None:
-                raise ValueError("policy_server start requires model_path or configured model_repository and model_revision")
+            if self._config.model_source is None:
+                raise ValueError("policy_server start requires model_path or configured model_source")
+            source = parse_model_source(self._config.model_source)
             records = [
-                record for record in records
-                if record.repository == self._config.model_repository
-                and record.resolved_revision == self._config.model_revision
+                record
+                for record in records
+                if record.source.canonical == source.canonical
+                and (source.kind == "bucket" or self._config.model_revision in (record.requested_revision, record.resolved_revision))
             ]
             if len(records) != 1:
                 raise ValueError("configured model has not been downloaded and validated")
@@ -1727,6 +1745,7 @@ class Policy(Generic, EasyResource):
         if cmd == "stop":
             return await self._stop_command()
         if cmd == "status":
+            self._advance_readiness()
             return self._status.to_dict()
         if cmd == "models/download":
             return await self._models_download_command()

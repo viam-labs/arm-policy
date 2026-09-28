@@ -13,6 +13,7 @@ from viam.operations import Operation
 from viam.proto.app.robot import ComponentConfig
 from viam.utils import dict_to_struct
 
+from models.model_store import ModelRecord
 from models.policy import (
     CAMERA_ALIASES,
     CAMERA_KEYS,
@@ -148,6 +149,7 @@ class FakePolicy(Policy, register=False):
             if gripper_mode == "binary"
             else ("ur20", "robotiq_2f_85")
         ]
+        self._ready = True
 
     async def _connect(self, operation, generation):
         self._socket = self.socket
@@ -300,10 +302,7 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
         Policy.validate_config(_config({**attrs, "fixed_camera_width": 640}))
     with pytest.raises(ValueError, match="server_uri"):
         Policy.validate_config(_config({**attrs, "server_uri": "http://bad"}))
-    with pytest.raises(ValueError, match="fixed by safety profile"):
-        Policy.validate_config(
-            _config({**attrs, "max_reach_m": profile.max_reach_m + 1})
-        )
+    Policy.validate_config(_config({**attrs, "max_reach_m": profile.max_reach_m + 1}))
     Policy.validate_config(
         _config(
             {
@@ -334,7 +333,7 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
             _config(
                 {
                     **attrs,
-                    "model_repository": "owner/policy",
+                    "model_source": "owner/policy",
                     "model_revision": "main",
                     "model_data_root": str(tmp_path),
                 }
@@ -345,6 +344,58 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
             _config({**attrs, "model_data_root": "relative-model-store"})
         )
 
+
+def test_bucket_source_waits_for_contract_and_download_advances_readiness(tmp_path, monkeypatch):
+    _, contract, _ = _write_contract(tmp_path)
+    bundle = tmp_path / "bundle"
+    attrs = {
+        "arm": "pick-arm", "gripper": "pick-gripper", "fixed_camera": "scene-cam",
+        "wrist_camera": "wrist-cam", "server_uri": "ws://127.0.0.1:8000",
+        "prompt": "pick", "model_source": "bucket:owner/policy:exports/latest",
+        "model_data_root": str(tmp_path),
+    }
+    Policy.validate_config(_config(attrs))
+
+    class Store:
+        record = None
+
+        def list(self):
+            return [] if self.record is None else [self.record]
+
+        def download(self, source, revision, token):
+            assert source.canonical == "bucket:owner/policy:exports/latest"
+            assert revision is None
+            bundle.mkdir()
+            (bundle / "policy_contract.json").write_text(json.dumps(contract))
+            self.record = ModelRecord(source, None, None, str(bundle), "validated")
+            return self.record
+
+    store = Store()
+    policy = Policy("policy")
+    monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
+    monkeypatch.setattr(policy, "_require_model_store", lambda: store)
+    policy.reconfigure(_config(attrs), {})
+
+    async def scenario():
+        assert (await policy.do_command({"command": "status"}))["state"] == "wait_contract"
+        with pytest.raises(RuntimeError, match="not ready"):
+            await policy.do_command({"command": "execute"})
+        response = await policy.do_command({"command": "models/download"})
+        assert response["model_source"] == "bucket:owner/policy:exports/latest"
+        assert (await policy.do_command({"command": "status"}))["state"] == "ready"
+
+    asyncio.run(scenario())
+
+
+def test_model_source_requires_revision_and_bucket_forbids_it():
+    common = {
+        "arm": "pick-arm", "gripper": "pick-gripper", "fixed_camera": "scene-cam",
+        "wrist_camera": "wrist-cam", "server_uri": "ws://127.0.0.1:8000", "prompt": "pick",
+    }
+    with pytest.raises(ValueError, match="model_revision"):
+        Policy.validate_config(_config({**common, "model_source": "owner/policy"}))
+    with pytest.raises(ValueError, match="forbidden"):
+        Policy.validate_config(_config({**common, "model_source": "bucket:owner/policy:export", "model_revision": "a" * 40}))
 @pytest.mark.parametrize("autoclose", [False, True])
 def test_reconfigure_only_stops_policy_server_when_configured(
     tmp_path, monkeypatch, autoclose

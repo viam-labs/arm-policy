@@ -32,7 +32,7 @@ The inference server is an optional module-owned subprocess. Its isolated `polic
 | `wrist_camera` | string | Camera returning exactly one 640x480 image. |
 | `server_uri` | string | `ws://` or `wss://` OpenPI policy-server endpoint. |
 | `prompt` | string | Non-empty default task prompt. |
-| `policy_contract_path` | string | Local path to a schema-version-3 `policy_contract.json`. |
+| `policy_contract_path` | string | Optional local path to a schema-version-3 `policy_contract.json`. Required unless `model_source` is set. When omitted, the component uses `policy_contract.json` from the matching validated download. |
 
 ### Optional attributes
 
@@ -55,11 +55,20 @@ The inference server is an optional module-owned subprocess. Its isolated `polic
 
 ### Downloaded model and server attributes
 
-Set `model_repository` to an HF `owner/name` and `model_revision` to its immutable lowercase 40-character commit. `model_data_root` is optional: when omitted the module uses `$VIAM_MODULE_DATA/arm-policy`, then `$XDG_DATA_HOME/arm-policy`, then `~/.local/share/viam/arm-policy`; set it to an absolute persistent directory to override that convention. `hf_token` is optional; `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN` are also supported. The token is never returned in command responses. `policy_server_host`, `policy_server_port`, and `policy_server_readiness_timeout_sec` select the module-owned server endpoint.
+Set `model_source` to either an HF model source (`owner/name` or `model:owner/name`) or a bucket source (`bucket:owner/name:path/to/export`). Model sources require `model_revision`, an immutable lowercase 40-character commit; bucket sources forbid `model_revision`. `model_data_root` is optional: when omitted the module uses `$VIAM_MODULE_DATA/arm-policy`, then `$XDG_DATA_HOME/arm-policy`, then `~/.local/share/viam/arm-policy`; set it to an absolute persistent directory to override that convention. `hf_token` is optional; `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN` are also supported. The token is never returned in command responses. `policy_server_host`, `policy_server_port`, and `policy_server_readiness_timeout_sec` select the module-owned server endpoint.
 
-Before a revision is downloadable, its Hub root must publish `.cosmos-policy-complete.json`: `{"schema_version":1,"repository":"owner/model","resolved_revision":"<40-char commit>","provenance":{"repository":"owner/training","revision":"<40-char commit>"}}`. The consumer rejects missing, redirected, mismatched, or provenance-free markers. This remote publication marker is copied and hash-covered in the export; it is distinct from the local atomic `.complete.json` publication record.
+For example, a bucket-backed component that discovers its contract from the downloaded export is configured as:
 
-The persistent store is `<data-root>/arm-policy-models/<owner--name>/<commit>/`. A directory is discoverable only after validation and atomic publication of its local `.complete.json`; interrupted or invalid staging directories are never listed.
+```json
+{
+  "model_source": "bucket:owner/policy:exports/production",
+  "model_data_root": "/var/lib/viam/arm-policy"
+}
+```
+
+When an explicit contract path is absent, startup and reconfiguration do not read a contract file. The component reports `wait_contract` until a matching validated download supplies its contract, or until a configured explicit contract becomes valid. `models/download`, `models/list`, and `policy_server` lifecycle commands remain available while waiting. `execute` (including observation, inference, safety validation, and motion) fails closed with the missing or invalid contract reason. A successful download automatically rechecks readiness and changes status to `ready` only after contract and safety-profile validation succeeds.
+
+The persistent store is `<data-root>/arm-policy-models/...`. A directory is discoverable only after validation and atomic publication of its local `.complete.json`; interrupted or invalid staging directories are never listed.
 
 Arm joint observations always come from `GetJointPositions`, and validated arm
 prefixes always use `MoveThroughJointPositionsStreamed`. Gripper behavior comes
