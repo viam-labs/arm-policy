@@ -27,6 +27,21 @@ PICK_YAW_RANGE_DEG = (-180.0, 180.0)
 WORLD_FRAME = "world"
 DEFAULT_GRIPPER_SETTLE_SEC = 3.0
 
+def policy_arm_model(status: Mapping[str, Any]) -> str:
+    embodiment = status.get("embodiment")
+    arm_model = (
+        embodiment.get("arm_model") if isinstance(embodiment, Mapping) else None
+    )
+    if isinstance(arm_model, str) and arm_model:
+        return arm_model
+    state = status.get("state", "unknown")
+    detail = status.get("last_error")
+    reason = f": {detail}" if isinstance(detail, str) and detail else ""
+    raise RuntimeError(
+        f"policy contract is not ready (state={state!r}){reason}; "
+        "run models/download or correct model_source/model_data_root"
+    )
+
 
 async def _world_pick_region(machine: Any, arm_frame: str) -> dict[str, list[float]]:
     corners: list[tuple[float, float]] = []
@@ -146,10 +161,7 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
         print(json.dumps({"before": before}, indent=2, sort_keys=True))
         setup: Mapping[str, Any] = {"performed": False}
         if not args.no_setup:
-            embodiment = before.get("embodiment")
-            arm_model = (
-                embodiment.get("arm_model") if isinstance(embodiment, Mapping) else None
-            )
+            arm_model = policy_arm_model(before)
             if arm_model != "lite6":
                 raise RuntimeError(
                     "automatic scene setup only supports Lite6; pass --no-setup "

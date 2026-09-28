@@ -9,6 +9,7 @@ from examples.policy_workflow import (
     PICK_REGION_MIN_M,
     PICK_YAW_RANGE_DEG,
     parse_args,
+    policy_arm_model,
     prepare_lite6_setup,
 )
 
@@ -78,6 +79,23 @@ def test_world_is_optional_and_enables_scene_setup_explicitly():
 
     assert without_world.world is None
     assert with_world.world == "sim-world"
+
+def test_policy_arm_model_reports_contract_readiness_error():
+    with pytest.raises(
+        RuntimeError,
+        match="configured model_source has not been downloaded and validated",
+    ):
+        policy_arm_model(
+            {
+                "state": "wait_contract",
+                "embodiment": {"arm_model": ""},
+                "last_error": "configured model_source has not been downloaded and validated",
+            }
+        )
+
+    assert policy_arm_model(
+        {"state": "ready", "embodiment": {"arm_model": "lite6"}}
+    ) == "lite6"
 
 
 def test_lite6_setup_matches_episode_capture_initialization():
