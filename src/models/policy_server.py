@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
 def _process_start_ticks(pid: int) -> str | None:
@@ -79,7 +79,14 @@ class PolicyServerSupervisor:
         except OSError:
             return "no server log was created"
 
-    def start(self, command: Sequence[str], host: str, port: int, readiness_timeout: float = 30.0) -> dict[str, Any]:
+    def start(
+        self,
+        command: Sequence[str],
+        host: str,
+        port: int,
+        readiness_timeout: float = 30.0,
+        environment: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
         current = self.status()
         if current["state"] in ("starting", "healthy"):
             return {**current, "idempotent": True}
@@ -88,6 +95,9 @@ class PolicyServerSupervisor:
         if not command:
             raise ValueError("policy server launch command is empty")
         self.root.mkdir(parents=True, exist_ok=True)
+        process_environment = os.environ.copy()
+        if environment is not None:
+            process_environment.update(environment)
         with self.log_path.open("a", encoding="utf-8") as log:
             process = subprocess.Popen(
                 list(command),
@@ -96,6 +106,7 @@ class PolicyServerSupervisor:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 close_fds=True,
+                env=process_environment,
             )
         ticks = _process_start_ticks(process.pid)
         if ticks is None:

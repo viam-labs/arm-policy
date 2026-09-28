@@ -1730,6 +1730,9 @@ class Policy(Generic, EasyResource):
             self._config.policy_server_host,
             self._config.policy_server_port,
             self._config.policy_server_readiness_timeout_sec,
+            {"HF_TOKEN": self._config.hf_token}
+            if self._config.hf_token is not None
+            else None,
         )
 
     async def do_command(

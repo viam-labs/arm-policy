@@ -185,9 +185,15 @@ def test_model_configuration_validation_is_strict(tmp_path):
 
 def test_supervisor_start_status_stop_is_idempotent(tmp_path):
     port = 18191
-    program = "import socket, signal, time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', " + str(port) + ")); s.listen(); signal.signal(signal.SIGTERM, lambda *_: exit(0)); time.sleep(30)"
+    program = "import os, socket, signal, time; assert os.environ.get('HF_TOKEN') == 'server-secret'; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', " + str(port) + ")); s.listen(); signal.signal(signal.SIGTERM, lambda *_: exit(0)); time.sleep(30)"
     supervisor = PolicyServerSupervisor(tmp_path, "fixture")
-    started = supervisor.start([sys.executable, "-c", program], "127.0.0.1", port, 3)
+    started = supervisor.start(
+        [sys.executable, "-c", program],
+        "127.0.0.1",
+        port,
+        3,
+        {"HF_TOKEN": "server-secret"},
+    )
     assert started["state"] == "healthy"
     assert supervisor.start([sys.executable, "-c", program], "127.0.0.1", port, 3)["idempotent"]
     assert supervisor.status()["state"] == "healthy"
