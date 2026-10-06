@@ -323,11 +323,67 @@ class ModelStore:
         return ModelRecord(source, requested_revision, resolved_revision, str(target), "validated")
 
     @staticmethod
-    def _bucket_sync(source: ModelSource, destination: Path, token: str | None) -> None:
-        assert source.kind == "bucket" and source.bucket_path is not None
+    def _bucket_environment(token: str | None) -> dict[str, str]:
+        """Build the one credential environment shared by bucket operations."""
         environment = os.environ.copy()
-        if token:
+        if token is not None:
+            # HF_TOKEN is the documented CLI credential.  Do not let the
+            # legacy inherited variable select a different credential.
             environment["HF_TOKEN"] = token
+            environment.pop("HUGGINGFACE_HUB_TOKEN", None)
+        return environment
+
+    @staticmethod
+    def _bucket_preflight(source: ModelSource, environment: Mapping[str, str]) -> None:
+        """Confirm the configured prefix is listable before syncing its payload."""
+        assert source.kind == "bucket" and source.bucket_path is not None
+        uri = f"hf://buckets/{source.repository}/{source.bucket_path}"
+        try:
+            result = subprocess.run(
+                ["uvx", "hf@latest", "buckets", "list", uri, "--format", "json"],
+                check=False,
+                env=environment,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"cannot start Hugging Face bucket preflight for {source.canonical}: {exc}"
+            ) from exc
+        if result.returncode:
+            detail = f"{result.stdout}\n{result.stderr}".casefold()
+            credentials = "check configured hf_token or HF_TOKEN/HUGGINGFACE_HUB_TOKEN"
+            if any(marker in detail for marker in ("401", "403", "unauthorized", "forbidden", "access denied", "permission denied")):
+                raise ValueError(
+                    f"Hugging Face bucket preflight access denied for {source.canonical}; {credentials}"
+                )
+            if any(marker in detail for marker in ("timeout", "timed out", "connection", "network", "dns", "resolve", "proxy", "ssl")):
+                raise ValueError(
+                    f"cannot contact Hugging Face while checking bucket prefix {source.canonical}; check network connectivity"
+                )
+            raise ValueError(
+                f"Hugging Face bucket prefix is missing or inaccessible: {source.canonical}; check model_source and access"
+            )
+        listing = result.stdout.strip()
+        if listing == "(empty)":
+            entries: object = []
+        else:
+            try:
+                entries = json.loads(listing)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Hugging Face bucket preflight returned invalid JSON for {source.canonical}"
+                ) from exc
+        if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+            raise ValueError(f"Hugging Face bucket preflight returned an invalid listing for {source.canonical}")
+        if not entries:
+            raise ValueError(
+                f"Hugging Face bucket prefix is missing or empty: {source.canonical}; check model_source"
+            )
+
+    @staticmethod
+    def _bucket_sync(source: ModelSource, destination: Path, environment: Mapping[str, str]) -> None:
+        assert source.kind == "bucket" and source.bucket_path is not None
         subprocess.run(
             ["uvx", "hf@latest", "buckets", "sync", f"hf://buckets/{source.repository}/{source.bucket_path}", str(destination)],
             check=True,
@@ -378,6 +434,9 @@ class ModelStore:
             cached = self._record_if_valid(target)
             if cached is not None:
                 return cached
+            if source.kind == "bucket":
+                environment = self._bucket_environment(token)
+                self._bucket_preflight(source, environment)
             staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
             try:
                 if source.kind == "model":
@@ -393,7 +452,7 @@ class ModelStore:
                         if name != REMOTE_COMPLETION_MARKER:
                             client.download(resolved, name, staging / _safe_relative(name))
                     return self._publish(staging, target, source, requested_revision, resolved, remote_marker)
-                self._bucket_sync(source, staging, token)
+                self._bucket_sync(source, staging, environment)
                 return self._publish(staging, target, source, None, None)
             except Exception:
                 shutil.rmtree(staging, ignore_errors=True)

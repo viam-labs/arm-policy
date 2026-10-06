@@ -129,35 +129,86 @@ def test_model_download_rejects_unpublished_or_invalid_exports(tmp_path, monkeyp
     assert store.list() == []
 
 
-def test_bucket_download_syncs_with_token_then_publishes_validated_record(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("token", "expected_token", "expected_legacy"),
+    [("configured-secret", "configured-secret", None), (None, "inherited-secret", "legacy-secret")],
+)
+def test_bucket_preflight_uses_sync_credentials_then_publishes_and_caches_offline(
+    tmp_path, monkeypatch, token, expected_token, expected_legacy
+):
     source = tmp_path / "bucket-export"
     source.mkdir()
     _export(source, remote_marker=False)
     calls = []
+    monkeypatch.setenv("HF_TOKEN", "inherited-secret")
+    monkeypatch.setenv("HUGGINGFACE_HUB_TOKEN", "legacy-secret")
 
-    def fake_run(argv, *, check, env):
-        calls.append((argv, check, env["HF_TOKEN"]))
+    def fake_run(argv, **kwargs):
+        calls.append((argv[3], kwargs["env"].copy()))
+        if argv[3] == "list":
+            return model_store.subprocess.CompletedProcess(argv, 0, '[{"type":"file","path":"checkpoint.json"}]', "")
         shutil.copytree(source, argv[-1], dirs_exist_ok=True)
+        return model_store.subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(model_store.subprocess, "run", fake_run)
     store = ModelStore(tmp_path / "persistent")
     bucket = parse_model_source("bucket:owner/policy:models/run-1")
-    first = store.download(bucket, None, "bucket-secret")
+    first = store.download(bucket, None, token)
+
     assert first.response()["model_source"] == bucket.canonical
     assert first.requested_revision is first.resolved_revision is None
-    assert calls[0][0] == ["uvx", "hf@latest", "buckets", "sync", "hf://buckets/owner/policy/models/run-1", calls[0][0][-1]]
-    assert calls[0][1:] == (True, "bucket-secret")
-    assert store.download(bucket, None, "bucket-secret") == first
-    assert len(calls) == 1
+    assert [command for command, _ in calls] == ["list", "sync"]
+    assert [environment.get("HF_TOKEN") for _, environment in calls] == [expected_token, expected_token]
+    assert [environment.get("HUGGINGFACE_HUB_TOKEN") for _, environment in calls] == [expected_legacy, expected_legacy]
+
+    def offline_run(*args, **kwargs):
+        raise AssertionError("a valid cached bucket model must not access the network")
+
+    monkeypatch.setattr(model_store.subprocess, "run", offline_run)
+    assert store.download(bucket, None, token) == first
     assert [item.response() for item in store.list()] == [first.response()]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "error"),
+    [
+        (1, "", "HTTP 401 Unauthorized", "access denied"),
+        (1, "", "HTTP 404 Not Found", "missing or inaccessible"),
+        (0, "[]", "", "missing or empty"),
+        (0, "(empty)", "", "missing or empty"),
+        (1, "", "network connection timed out", "cannot contact"),
+    ],
+)
+def test_bucket_preflight_rejects_inaccessible_prefix_before_transfer(
+    tmp_path, monkeypatch, returncode, stdout, stderr, error
+):
+    transfers = []
+
+    def fake_run(argv, **kwargs):
+        if argv[3] == "list":
+            return model_store.subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+        transfers.append(argv)
+        raise AssertionError("bucket payload transfer must not start after preflight failure")
+
+    monkeypatch.setattr(model_store.subprocess, "run", fake_run)
+    store = ModelStore(tmp_path / "persistent")
+    bucket = parse_model_source("bucket:owner/policy:models/run-1")
+
+    with pytest.raises(ValueError, match=error):
+        store.download(bucket, None, "bucket-secret")
+    assert transfers == []
+    assert store.list() == []
 
 
 def test_bucket_invalid_download_is_not_discoverable_and_revisions_are_rejected(tmp_path, monkeypatch):
     calls = []
 
-    def fake_run(argv, *, check, env):
-        calls.append(argv)
+    def fake_run(argv, **kwargs):
+        calls.append(argv[3])
+        if argv[3] == "list":
+            return model_store.subprocess.CompletedProcess(argv, 0, '[{"type":"file","path":"checkpoint.json"}]', "")
         Path(argv[-1], "checkpoint.json").write_text("{}")
+        return model_store.subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(model_store.subprocess, "run", fake_run)
     store = ModelStore(tmp_path / "persistent")
@@ -169,7 +220,7 @@ def test_bucket_invalid_download_is_not_discoverable_and_revisions_are_rejected(
         store.download(bucket, COMMIT)
     with pytest.raises(ValueError, match="immutable"):
         store.download(parse_model_source("owner/policy"), None)
-    assert len(calls) == 1
+    assert calls == ["list", "sync"]
 
 
 def test_model_configuration_validation_is_strict(tmp_path):

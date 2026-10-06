@@ -129,6 +129,8 @@ Download the configured immutable portable export (the response is stable JSON c
 {"command": "models/download"}
 ```
 
+For an uncached bucket source, download first lists the exact configured bucket prefix using the same Hugging Face CLI credentials as the transfer. Access denial, a missing or empty prefix, or a connection failure is returned to the caller before staging or transferring the export. A configured `hf_token` takes precedence; otherwise the CLI retains its inherited environment and saved-login behavior. The preflight is a non-recursive listing; sync performs its own transfer enumeration. Already validated cached downloads remain offline and skip this check.
+
 List only locally complete, hash-validated downloads. This command is offline and makes no Hugging Face request:
 
 ```json
@@ -144,6 +146,8 @@ Start the isolated pinned-Cosmos server for a validated model. The first start r
 ```
 
 The supervisor is intentionally a module-owned subprocess rather than s6: it needs no host package, records Linux start ticks to avoid PID-reuse kills, and recovers the persistent process state when the component restarts with the same name and data root. By default, only an explicit `policy_server stop` terminates the server. Set `policy_server_autoclose` to `true` to stop it automatically during component reconfiguration or close.
+
+Startup failures also emit an error in the Viam module log before the start command fails. After startup, a background watcher checks for unexpected process exits and logs each failed process once, with its PID, exit status when available, child-log path, and a bounded, credential-redacted log tail. Recovered processes are monitored after component reconfiguration or restart; their exit status may be unavailable. Deliberate stops do not emit failure notifications, and closing or reconfiguring the component detaches its old watcher without changing the `policy_server_autoclose` behavior. The child log remains the full diagnostic record; these notifications do not replace it or constitute an inference health check.
 
 ## Workflow client
 

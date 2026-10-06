@@ -682,7 +682,78 @@ class Policy(Generic, EasyResource):
         self._readiness_error = ""
         self._status: RunStatus = self._idle_status()
         self._last_result: Optional[dict[str, Any]] = None
+        self._policy_server_watch_task: asyncio.Task[None] | None = None
+        self._policy_server_watch_generation = 0
+        self._reported_policy_server_failure: tuple[int, str] | None = None
+        self._policy_server_credential_values: set[str] = set()
         self._policy_server = PolicyServerSupervisor(default_data_root(), name)
+
+    def _detach_policy_server_watcher(self) -> None:
+        self._policy_server_watch_generation += 1
+        task = self._policy_server_watch_task
+        self._policy_server_watch_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _ensure_policy_server_watcher(self, *, replace: bool = False) -> None:
+        if self._closed:
+            return
+        task = self._policy_server_watch_task
+        if task is not None and not task.done():
+            if not replace:
+                return
+            self._detach_policy_server_watcher()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        generation = self._policy_server_watch_generation
+        supervisor = self._policy_server
+        self._policy_server_watch_task = loop.create_task(
+            self._watch_policy_server(supervisor, generation),
+            name=f"policy-server-watch:{self.name}",
+        )
+
+    async def _watch_policy_server(
+        self, supervisor: PolicyServerSupervisor, generation: int
+    ) -> None:
+        try:
+            while (
+                not self._closed
+                and self._policy_server is supervisor
+                and self._policy_server_watch_generation == generation
+            ):
+                failure = await asyncio.to_thread(supervisor.poll_failure)
+                if (
+                    self._closed
+                    or self._policy_server is not supervisor
+                    or self._policy_server_watch_generation != generation
+                ):
+                    return
+                if failure is not None:
+                    if failure.identity != self._reported_policy_server_failure:
+                        self._reported_policy_server_failure = failure.identity
+                        exit_status = (
+                            "unavailable"
+                            if failure.exit_status is None
+                            else failure.exit_status
+                        )
+                        self.logger.error(
+                            "managed policy-server exited unexpectedly; pid=%s; "
+                            "exit_status=%s; log_path=%s; tail=%s",
+                            failure.pid,
+                            exit_status,
+                            failure.log_path,
+                            failure.detail,
+                        )
+                    return
+                if not await asyncio.to_thread(supervisor._has_state):
+                    return
+
+                await asyncio.sleep(0.2)
+        finally:
+            if self._policy_server_watch_task is asyncio.current_task():
+                self._policy_server_watch_task = None
 
     def _matching_model_record(self) -> Path | None:
         if self._config.model_source is None:
@@ -780,7 +851,14 @@ class Policy(Generic, EasyResource):
         self._wrist_camera = self._dependency(
             dependencies, Camera, parsed.wrist_camera, "wrist camera"
         )
-        next_policy_server = PolicyServerSupervisor(_model_data_root(parsed), self.name)
+        if parsed.hf_token is not None:
+            self._policy_server_credential_values.add(parsed.hf_token)
+        next_policy_server = PolicyServerSupervisor(
+            _model_data_root(parsed),
+            self.name,
+            self._policy_server_credential_values,
+        )
+        self._detach_policy_server_watcher()
         if parsed.policy_server_autoclose and self._policy_server is not None:
             self._policy_server.stop()
         parsed._contract = self._config.contract
@@ -790,6 +868,7 @@ class Policy(Generic, EasyResource):
         self._ready = False
         self._readiness_error = ""
         self._policy_server = next_policy_server
+        self._ensure_policy_server_watcher()
         self._advance_readiness()
 
     @staticmethod
@@ -1692,9 +1771,14 @@ class Policy(Generic, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         action = command.get("action")
         if action == "status":
+            self._ensure_policy_server_watcher()
             return await asyncio.to_thread(self._policy_server.status)
         if action == "stop":
-            return await asyncio.to_thread(self._policy_server.stop)
+            self._detach_policy_server_watcher()
+            result = await asyncio.to_thread(self._policy_server.stop)
+            if not result.get("stopped", False):
+                self._ensure_policy_server_watcher()
+            return result
         if action != "start":
             raise ValueError("policy_server action must be start, status, or stop")
         records = await asyncio.to_thread(self._require_model_store().list)
@@ -1719,21 +1803,27 @@ class Policy(Generic, EasyResource):
             if str(model) not in {record.path for record in records}:
                 raise ValueError("policy_server model_path is not a validated local model")
         runtime_root = Path(__file__).resolve().parents[2] / "policy_server_runtime"
-        return await asyncio.to_thread(
-            self._policy_server.start,
-            runtime_command(
-                runtime_root,
-                model,
+        try:
+            result = await asyncio.to_thread(
+                self._policy_server.start,
+                runtime_command(
+                    runtime_root,
+                    model,
+                    self._config.policy_server_host,
+                    self._config.policy_server_port,
+                ),
                 self._config.policy_server_host,
                 self._config.policy_server_port,
-            ),
-            self._config.policy_server_host,
-            self._config.policy_server_port,
-            self._config.policy_server_readiness_timeout_sec,
-            {"HF_TOKEN": self._config.hf_token}
-            if self._config.hf_token is not None
-            else None,
-        )
+                self._config.policy_server_readiness_timeout_sec,
+                {"HF_TOKEN": self._config.hf_token}
+                if self._config.hf_token is not None
+                else None,
+            )
+        except (OSError, RuntimeError) as exc:
+            self.logger.error("managed policy-server failed during startup: %s", exc)
+            raise
+        self._ensure_policy_server_watcher(replace=True)
+        return result
 
     async def do_command(
         self,
@@ -1742,6 +1832,7 @@ class Policy(Generic, EasyResource):
         timeout: Optional[float] = None,
         **kwargs,
     ) -> Mapping[str, ValueTypes]:
+        self._ensure_policy_server_watcher()
         cmd = str(command.get("command", ""))
         if cmd == "execute":
             return await self._execute_command(command, kwargs)
@@ -1764,6 +1855,7 @@ class Policy(Generic, EasyResource):
         if self._closed:
             return
         self._closed = True
+        self._detach_policy_server_watcher()
         await self._stop_command()
         if self._config.policy_server_autoclose and self._policy_server is not None:
             await asyncio.to_thread(self._policy_server.stop)
