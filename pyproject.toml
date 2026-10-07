@@ -15,7 +15,7 @@ dependencies = [
     "toppra>=0.6.3,<0.7",
     "typing-extensions>=4.8.0",
     # switch to >= 0.81.0 when it lands. we need motion streaming
-    "viam-sdk>=0.83.0",
+    "viam-sdk>=0.84.0",
     "websockets>=12.0",
 ]
 
