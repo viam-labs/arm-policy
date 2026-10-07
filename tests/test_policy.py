@@ -387,6 +387,24 @@ def test_bucket_source_waits_for_contract_and_download_advances_readiness(tmp_pa
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        {},
+        {"command": "status", "unexpected": True},
+        {"command": "policy_server", "action": "restart"},
+        {"command": "policy_server", "action": "start", "model_path": 42},
+    ],
+)
+def test_do_command_rejects_invalid_payloads(command):
+    async def scenario():
+        policy = Policy("invalid-command")
+        with pytest.raises(ValueError):
+            await policy.do_command(command)
+
+    asyncio.run(scenario())
+
+
 def test_model_source_requires_revision_and_bucket_forbids_it():
     common = {
         "arm": "pick-arm", "gripper": "pick-gripper", "fixed_camera": "scene-cam",

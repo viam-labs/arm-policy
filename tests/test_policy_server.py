@@ -43,9 +43,13 @@ raise SystemExit(int(sys.argv[3]))
 class CapturingLogger:
     def __init__(self):
         self.errors = []
+        self.infos = []
 
     def error(self, message, *args):
         self.errors.append(message % args)
+
+    def info(self, message, *args):
+        self.infos.append(message % args)
 
 
 def _free_port():
@@ -207,13 +211,49 @@ def test_policy_logs_redacted_startup_failure(tmp_path, monkeypatch):
         )
 
         with pytest.raises(RuntimeError, match="exit_status=9"):
-            await policy._policy_server_command(
-                {"action": "start", "model_path": str(model)}
+            await policy.do_command(
+                {"command": "policy_server", "action": "start", "model_path": str(model)}
             )
 
         assert len(logger.errors) == 1
         assert "failed during startup" in logger.errors[0]
         assert "configured-secret" not in logger.errors[0]
+        assert len(logger.infos) == 1
+        assert "start requested" in logger.infos[0]
+
+    asyncio.run(scenario())
+
+
+def test_policy_logs_server_start_and_readiness(tmp_path, monkeypatch):
+    async def scenario():
+        port = _free_port()
+        model = tmp_path / "model"
+        model.mkdir()
+        policy = Policy("startup-ready-log")
+        policy._policy_server = PolicyServerSupervisor(tmp_path, "startup-ready-log")
+        policy._config.policy_server_port = port
+        policy._require_model_store = lambda: SimpleNamespace(
+            list=lambda: [SimpleNamespace(path=str(model))]
+        )
+        logger = CapturingLogger()
+        monkeypatch.setattr(policy, "logger", logger)
+        monkeypatch.setattr(
+            policy_module,
+            "runtime_command",
+            lambda *args: _server_command(port, 30, 0),
+        )
+
+        result = await policy.do_command(
+            {"command": "policy_server", "action": "start", "model_path": str(model)}
+        )
+
+        assert result["state"] == "healthy"
+        assert len(logger.infos) == 2
+        assert "start requested" in logger.infos[0]
+        assert "ready" in logger.infos[1]
+        assert f"pid={result['pid']}" in logger.infos[1]
+        assert logger.errors == []
+        await policy.do_command({"command": "policy_server", "action": "stop"})
 
     asyncio.run(scenario())
 
@@ -254,7 +294,7 @@ def test_expected_stop_is_silent_and_releases_watcher(tmp_path, monkeypatch):
         policy._ensure_policy_server_watcher()
 
         await asyncio.sleep(0.05)
-        await policy._policy_server_command({"action": "stop"})
+        await policy.do_command({"command": "policy_server", "action": "stop"})
         deadline = time.monotonic() + 2
         while policy._policy_server_watch_task is not None and time.monotonic() < deadline:
             await asyncio.sleep(0.02)

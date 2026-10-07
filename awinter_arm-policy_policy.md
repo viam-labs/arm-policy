@@ -121,6 +121,10 @@ Read active and previous-run diagnostics:
 
 Only one execution owns the robot. Status and results include raw and conditioned chunks, conditioning metrics, validation scope, timing, safety profile, progress records, and rejection reasons.
 
+Command payloads are validated as a Pydantic discriminated union keyed by
+`command`. Unknown commands, actions, fields, and invalid field types are
+rejected before dispatch.
+
 ### Model and server management
 
 Download the configured immutable portable export (the response is stable JSON containing repository, requested/resolved revisions, path, and validation state):
@@ -147,7 +151,7 @@ Start the isolated pinned-Cosmos server for a validated model. The first start r
 
 The supervisor is intentionally a module-owned subprocess rather than s6: it needs no host package, records Linux start ticks to avoid PID-reuse kills, and recovers the persistent process state when the component restarts with the same name and data root. By default, only an explicit `policy_server stop` terminates the server. Set `policy_server_autoclose` to `true` to stop it automatically during component reconfiguration or close.
 
-Startup failures also emit an error in the Viam module log before the start command fails. After startup, a background watcher checks for unexpected process exits and logs each failed process once, with its PID, exit status when available, child-log path, and a bounded, credential-redacted log tail. Recovered processes are monitored after component reconfiguration or restart; their exit status may be unavailable. Deliberate stops do not emit failure notifications, and closing or reconfiguring the component detaches its old watcher without changing the `policy_server_autoclose` behavior. The child log remains the full diagnostic record; these notifications do not replace it or constitute an inference health check.
+Each start request emits a Viam module info log with its host and port. A successful readiness check emits a second info log with the PID, host, port, child-log path, and whether the start was idempotent. Startup failures also emit an error in the Viam module log before the start command fails. After startup, a background watcher checks for unexpected process exits and logs each failed process once, with its PID, exit status when available, child-log path, and a bounded, credential-redacted log tail. Recovered processes are monitored after component reconfiguration or restart; their exit status may be unavailable. Deliberate stops do not emit failure notifications, and closing or reconfiguring the component detaches its old watcher without changing the `policy_server_autoclose` behavior. The child log remains the full diagnostic record; these notifications do not replace it or constitute an inference health check.
 
 At process startup, before importing Cosmos or downloading models, the runtime audits `trees/*.json` under every standard model, dataset, and space repository in its effective Hugging Face Hub cache. If format-version-1 metadata contains an asterisk in `xet_hash`, it renames the entire JSON to a unique `.json.poisoned.<timestamp>.<pid>.<uuid>` sibling and emits a warning in the policy-server log with both paths. Original bytes are preserved for diagnosis; model weights, healthy metadata, malformed or unknown-format metadata, and unrelated JSON files are untouched. Previously quarantined files are not scanned again. Cache selection follows `HF_HUB_CACHE`, legacy `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, and the default cache location. Subsequent downloads fetch fresh tree metadata normally; the audit does not bypass authentication or introduce automatic download retries.
 

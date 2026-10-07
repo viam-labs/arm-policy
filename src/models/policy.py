@@ -31,6 +31,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    TypeAdapter,
     WebsocketUrl,
     model_validator,
 )
@@ -326,7 +327,33 @@ def _model_data_root(config: Config) -> Path:
         else default_data_root()
     )
 
-class ExecuteCommand(BaseModel):
+class CommandModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class StopCommand(CommandModel):
+    command: Literal["stop"]
+
+
+class StatusCommand(CommandModel):
+    command: Literal["status"]
+
+
+class ModelsDownloadCommand(CommandModel):
+    command: Literal["models/download"]
+
+
+class ModelsListCommand(CommandModel):
+    command: Literal["models/list"]
+
+
+class PolicyServerCommand(CommandModel):
+    command: Literal["policy_server"]
+    action: Literal["start", "status", "stop"]
+    model_path: str | None = None
+
+
+class ExecuteCommand(CommandModel):
     command: Literal["execute"] = "execute"
     prompt: Prompt
     max_chunks: Annotated[int, Field(ge=1, le=100)]
@@ -359,6 +386,18 @@ class ExecuteCommand(BaseModel):
             return _prefix_steps_from_duration(self.action_prefix_duration_sec)
         assert self.action_prefix_steps is not None
         return self.action_prefix_steps
+
+
+DoCommand = Annotated[
+    ExecuteCommand
+    | StopCommand
+    | StatusCommand
+    | ModelsDownloadCommand
+    | ModelsListCommand
+    | PolicyServerCommand,
+    Field(discriminator="command"),
+]
+DO_COMMAND_ADAPTER = TypeAdapter(DoCommand)
 
 
 @dataclass(slots=True)
@@ -1665,30 +1704,17 @@ class Policy(Generic, EasyResource):
         return result
 
     async def _execute_command(
-        self, command: Mapping[str, ValueTypes], kwargs: Mapping[str, Any]
+        self, command: ExecuteCommand, kwargs: Mapping[str, Any]
     ) -> Mapping[str, ValueTypes]:
         if self._closed:
             raise RuntimeError(f"policy {self.name} is closed")
         self._require_ready()
-        defaults: dict[str, Any] = {
-            "command": "execute",
-            "prompt": self._config.prompt,
-            "max_chunks": self._config.max_chunks,
-            "conditioner_algorithm": self._config.conditioner_algorithm,
-            "deadline_tolerance_sec": self._config.deadline_tolerance_sec,
-        }
-        if (
-            "action_prefix_steps" not in command
-            and "action_prefix_duration_sec" not in command
-        ):
-            defaults["action_prefix_steps"] = self._config.default_prefix_steps
-        request = ExecuteCommand.model_validate({**defaults, **command})
-        prompt = request.prompt
-        max_chunks = request.max_chunks
-        prefix = request.prefix_steps
-        conditioner_algorithm = request.conditioner_algorithm
-        deadline_tolerance = request.deadline_tolerance_sec
-        progress_prop = request.progress_prop
+        prompt = command.prompt
+        max_chunks = command.max_chunks
+        prefix = command.prefix_steps
+        conditioner_algorithm = command.conditioner_algorithm
+        deadline_tolerance = command.deadline_tolerance_sec
+        progress_prop = command.progress_prop
         if progress_prop and self._world is None:
             raise ValueError("progress_prop requires a configured world dependency")
         async with self._owner_lock:
@@ -1767,22 +1793,24 @@ class Policy(Generic, EasyResource):
         return {"models": [record.response() for record in records]}
 
     async def _policy_server_command(
-        self, command: Mapping[str, ValueTypes]
+        self, command: PolicyServerCommand
     ) -> Mapping[str, ValueTypes]:
-        action = command.get("action")
-        if action == "status":
+        if command.action == "status":
             self._ensure_policy_server_watcher()
             return await asyncio.to_thread(self._policy_server.status)
-        if action == "stop":
+        if command.action == "stop":
             self._detach_policy_server_watcher()
             result = await asyncio.to_thread(self._policy_server.stop)
             if not result.get("stopped", False):
                 self._ensure_policy_server_watcher()
             return result
-        if action != "start":
-            raise ValueError("policy_server action must be start, status, or stop")
+        self.logger.info(
+            "managed policy-server start requested; host=%s; port=%s",
+            self._config.policy_server_host,
+            self._config.policy_server_port,
+        )
         records = await asyncio.to_thread(self._require_model_store().list)
-        model_path = command.get("model_path")
+        model_path = command.model_path
         if model_path is None:
             if self._config.model_source is None:
                 raise ValueError("policy_server start requires model_path or configured model_source")
@@ -1797,8 +1825,6 @@ class Policy(Generic, EasyResource):
                 raise ValueError("configured model has not been downloaded and validated")
             model = Path(records[0].path)
         else:
-            if not isinstance(model_path, str):
-                raise ValueError("policy_server model_path must be a string")
             model = Path(model_path).expanduser().resolve()
             if str(model) not in {record.path for record in records}:
                 raise ValueError("policy_server model_path is not a validated local model")
@@ -1822,6 +1848,15 @@ class Policy(Generic, EasyResource):
         except (OSError, RuntimeError) as exc:
             self.logger.error("managed policy-server failed during startup: %s", exc)
             raise
+        self.logger.info(
+            "managed policy-server ready; pid=%s; host=%s; port=%s; "
+            "log_path=%s; idempotent=%s",
+            result.get("pid", "unavailable"),
+            result.get("host", self._config.policy_server_host),
+            result.get("port", self._config.policy_server_port),
+            result.get("log_path", "unavailable"),
+            result.get("idempotent", False),
+        )
         self._ensure_policy_server_watcher(replace=True)
         return result
 
@@ -1833,23 +1868,34 @@ class Policy(Generic, EasyResource):
         **kwargs,
     ) -> Mapping[str, ValueTypes]:
         self._ensure_policy_server_watcher()
-        cmd = str(command.get("command", ""))
-        if cmd == "execute":
-            return await self._execute_command(command, kwargs)
-        if cmd == "stop":
+        payload: dict[str, Any] = dict(command)
+        if payload.get("command") == "execute":
+            defaults: dict[str, Any] = {
+                "command": "execute",
+                "prompt": self._config.prompt,
+                "max_chunks": self._config.max_chunks,
+                "conditioner_algorithm": self._config.conditioner_algorithm,
+                "deadline_tolerance_sec": self._config.deadline_tolerance_sec,
+            }
+            if (
+                "action_prefix_steps" not in payload
+                and "action_prefix_duration_sec" not in payload
+            ):
+                defaults["action_prefix_steps"] = self._config.default_prefix_steps
+            payload = {**defaults, **payload}
+        request = DO_COMMAND_ADAPTER.validate_python(payload)
+        if isinstance(request, ExecuteCommand):
+            return await self._execute_command(request, kwargs)
+        if isinstance(request, StopCommand):
             return await self._stop_command()
-        if cmd == "status":
+        if isinstance(request, StatusCommand):
             self._advance_readiness()
             return self._status.to_dict()
-        if cmd == "models/download":
+        if isinstance(request, ModelsDownloadCommand):
             return await self._models_download_command()
-        if cmd == "models/list":
+        if isinstance(request, ModelsListCommand):
             return await self._models_list_command()
-        if cmd == "policy_server":
-            return await self._policy_server_command(command)
-        raise ValueError(
-            "unknown command; supported: execute, stop, status, models/download, models/list, policy_server"
-        )
+        return await self._policy_server_command(request)
 
     async def close(self) -> None:
         if self._closed:
