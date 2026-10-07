@@ -65,7 +65,7 @@ from .trajectory_conditioner import (
     trajectory_metrics,
 )
 
-NAMESPACE = "awinter"
+NAMESPACE = "viam-labs"
 FAMILY = "arm-policy"
 
 

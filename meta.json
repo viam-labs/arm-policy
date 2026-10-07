@@ -1,12 +1,12 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
-  "module_id": "awinter:arm-policy",
+  "module_id": "viam-labs:arm-policy",
   "visibility": "public_unlisted",
   "url": "",
   "description": "Safely executes contract-validated arm policies through typed Viam resources",
   "models": [
     {
-      "model": "awinter:arm-policy:policy",
+      "model": "viam-labs:arm-policy:policy",
       "api": "rdk:component:generic",
       "short_description": "Bridges arms, grippers, cameras, and an OpenPI policy server with bounded execution"
     }

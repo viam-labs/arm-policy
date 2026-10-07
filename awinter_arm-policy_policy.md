@@ -1,4 +1,4 @@
-# Model `awinter:arm-policy:policy`
+# Model `viam-labs:arm-policy:policy`
 
 A generic component that executes portable Cosmos/OpenPI arm-policy exports through normal Viam resources. It captures camera and joint observations, validates the export contract, conditions each 32-step trajectory, and executes only a validated receding-horizon prefix. Malformed output, unsafe kinematics, timeouts, cancellation, or missed dispatch deadlines fail closed and stop the arm and gripper.
 
