@@ -8,9 +8,94 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import sys
+import time
+import uuid
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
+
+
+def _effective_hub_cache(environ: Mapping[str, str] | None = None) -> Path:
+    """Return the Hub cache selected by Hugging Face's environment precedence."""
+    env = os.environ if environ is None else environ
+    cache = env.get("HF_HUB_CACHE") or env.get("HUGGINGFACE_HUB_CACHE")
+    if cache is None:
+        hf_home = env.get("HF_HOME")
+        if hf_home:
+            cache = str(Path(hf_home) / "hub")
+        else:
+            xdg_cache_home = env.get("XDG_CACHE_HOME")
+            cache = str(Path(xdg_cache_home) / "huggingface" / "hub") if xdg_cache_home else "~/.cache/huggingface/hub"
+    return Path(os.path.expandvars(cache)).expanduser().resolve()
+
+
+def _hub_tree_metadata_paths(hub_cache: Path) -> Iterable[Path]:
+    for prefix in ("models--", "datasets--", "spaces--"):
+        yield from hub_cache.glob(f"{prefix}*/trees/*.json")
+
+
+def _has_poisoned_xet_hash(metadata: object) -> bool:
+    if not isinstance(metadata, dict) or metadata.get("format_version") != 1:
+        return False
+    files = metadata.get("files")
+    return isinstance(files, dict) and any(
+        isinstance(file_metadata, dict)
+        and isinstance(file_metadata.get("xet_hash"), str)
+        and "*" in file_metadata["xet_hash"]
+        for file_metadata in files.values()
+    )
+
+
+def _quarantine_poisoned_tree_metadata(metadata_path: Path, warning: Callable[[str], None]) -> Path | None:
+    try:
+        source_stat = metadata_path.stat()
+        payload = metadata_path.read_bytes()
+    except FileNotFoundError:
+        return None
+    try:
+        metadata = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not _has_poisoned_xet_hash(metadata):
+        return None
+
+    for _ in range(10):
+        quarantine_path = metadata_path.with_name(
+            f"{metadata_path.name}.poisoned.{time.time_ns()}.{os.getpid()}.{uuid.uuid4().hex}"
+        )
+        if quarantine_path.exists():
+            continue
+        try:
+            current_stat = metadata_path.stat()
+        except FileNotFoundError:
+            return None
+        if (current_stat.st_dev, current_stat.st_ino) != (source_stat.st_dev, source_stat.st_ino):
+            return None
+        try:
+            os.rename(metadata_path, quarantine_path)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot quarantine poisoned Hugging Face tree metadata at {metadata_path}: {exc}"
+            ) from exc
+        warning(
+            "[arm-policy] quarantined poisoned Hugging Face tree metadata: "
+            f"original={metadata_path} quarantine={quarantine_path}"
+        )
+        return quarantine_path
+    raise RuntimeError(f"cannot reserve a quarantine path for poisoned Hugging Face tree metadata at {metadata_path}")
+
+
+def _audit_hub_tree_metadata(warning: Callable[[str], None] = logging.warning) -> list[Path]:
+    quarantined: list[Path] = []
+    for metadata_path in _hub_tree_metadata_paths(_effective_hub_cache()):
+        if path := _quarantine_poisoned_tree_metadata(metadata_path, warning):
+            quarantined.append(path)
+    return quarantined
 
 
 class PortableRobolabPolicyService:
@@ -51,6 +136,7 @@ def _parse_wrapper_args(
 
 def main() -> None:
     wrapper, remaining = _parse_wrapper_args()
+    _audit_hub_tree_metadata()
     try:
         contract = json.loads(wrapper.portable_contract.read_text(encoding="utf-8"))
         action_dim = contract["action_schema"]["shape"][0]
