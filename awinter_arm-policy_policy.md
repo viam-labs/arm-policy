@@ -137,7 +137,7 @@ List only locally complete, hash-validated downloads. This command is offline an
 {"command": "models/list"}
 ```
 
-Start the isolated pinned-Cosmos server for a validated model. The first start requires network access and substantial disk space while the pinned upstream CUDA 13 policy-server environment is provisioned; later starts reuse it. Start is idempotent and waits for the local TCP endpoint, so its readiness timeout must cover first-time provisioning. Readiness failures include the log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
+Start the isolated pinned-Cosmos server for a validated model. The first start requires network access and substantial disk space while the pinned upstream CUDA 13 policy-server environment is provisioned; later starts reuse it. Start is idempotent and waits for HTTP `GET /healthz` on the configured host and port to return status 200 with body `OK\n`, so its readiness timeout must cover first-time provisioning. The bounded health request checks server responsiveness without opening a WebSocket or running inference. Readiness failures include the log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
 
 ```json
 {"command": "policy_server", "action": "start"}

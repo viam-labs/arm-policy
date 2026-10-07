@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
 import signal
-import socket
 import subprocess
 import sys
 import threading
 import time
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-
+_HEALTH_CHECK_TIMEOUT = 0.2
+_HEALTH_RESPONSE = b"OK\n"
 _TAIL_BYTES = 4096
 _TOKEN_ENVIRONMENT_NAMES = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN")
 _TOKEN_ASSIGNMENT_RE = re.compile(
@@ -81,12 +83,21 @@ def _send_pidfd_signal(pidfd: int, signum: int) -> bool:
     return True
 
 
-def _tcp_ready(host: str, port: int) -> bool:
+def _health_ready(host: str, port: int) -> bool:
+    connection: http.client.HTTPConnection | None = None
     try:
-        with socket.create_connection((host, port), timeout=0.2):
-            return True
-    except OSError:
+        connection = http.client.HTTPConnection(host, port, timeout=_HEALTH_CHECK_TIMEOUT)
+        connection.request("GET", "/healthz")
+        response = connection.getresponse()
+        return (
+            response.status == HTTPStatus.OK
+            and response.read(len(_HEALTH_RESPONSE) + 1) == _HEALTH_RESPONSE
+        )
+    except (OSError, ValueError, http.client.HTTPException):
         return False
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 class PolicyServerSupervisor:
@@ -219,7 +230,7 @@ class PolicyServerSupervisor:
                 "detail": "malformed process state removed",
                 "log_path": str(self.log_path),
             }
-        if _tcp_ready(host, port):
+        if _health_ready(host, port):
             return {
                 "state": "healthy",
                 "pid": identity[0],

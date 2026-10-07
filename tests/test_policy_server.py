@@ -14,17 +14,28 @@ import models.policy_server as policy_server_module
 from models.policy import Policy
 from models.policy_server import PolicyServerSupervisor
 
-
 _SERVER_PROGRAM = """
-import socket
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import sys
+import threading
 import time
 
-listener = socket.socket()
-listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind(("127.0.0.1", int(sys.argv[1])))
-listener.listen()
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/healthz":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK\\n")
+        else:
+            self.send_error(404)
+
+    def log_message(self, format, *args):
+        pass
+
+server = HTTPServer(("127.0.0.1", int(sys.argv[1])), HealthHandler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
 time.sleep(float(sys.argv[2]))
+server.server_close()
 raise SystemExit(int(sys.argv[3]))
 """
 
@@ -46,6 +57,67 @@ def _free_port():
 def _server_command(port, lifetime, exit_status):
     return [sys.executable, "-c", _SERVER_PROGRAM, str(port), str(lifetime), str(exit_status)]
 
+
+def test_health_ready_requires_expected_response(monkeypatch):
+    class Response:
+        def __init__(self, status, body):
+            self.status = status
+            self.body = body
+
+        def read(self, size):
+            assert size == len(b"OK\n") + 1
+            return self.body
+
+    class Connection:
+        def __init__(self, host, port, timeout):
+            assert (host, port, timeout) == (
+                "127.0.0.1",
+                8000,
+                policy_server_module._HEALTH_CHECK_TIMEOUT,
+            )
+            self.closed = False
+
+        def request(self, method, path):
+            assert (method, path) == ("GET", "/healthz")
+
+        def getresponse(self):
+            return Response(self.status, self.body)
+
+        def close(self):
+            self.closed = True
+            closed.append(self)
+
+    closed = []
+    monkeypatch.setattr(policy_server_module.http.client, "HTTPConnection", Connection)
+    for status, body, expected in [
+        (200, b"OK\n", True),
+        (200, b"<html>", False),
+        (503, b"OK\n", False),
+    ]:
+        Connection.status = status
+        Connection.body = body
+        assert policy_server_module._health_ready("127.0.0.1", 8000) is expected
+    assert all(connection.closed for connection in closed)
+
+
+@pytest.mark.parametrize("failure", [OSError, policy_server_module.http.client.BadStatusLine])
+def test_health_ready_rejects_unavailable_or_malformed_connections(monkeypatch, failure):
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+
+        def request(self, method, path):
+            raise failure("unavailable")
+
+        def close(self):
+            self.closed = True
+            closed.append(self)
+
+    closed = []
+    monkeypatch.setattr(policy_server_module.http.client, "HTTPConnection", Connection)
+
+    assert not policy_server_module._health_ready("127.0.0.1", 8000)
+    assert closed[0].closed
 
 def test_startup_exit_includes_status_and_redacts_credentials(tmp_path, monkeypatch):
     monkeypatch.setenv("HUGGINGFACE_HUB_TOKEN", "inherited-secret")
@@ -118,6 +190,7 @@ def test_policy_logs_redacted_startup_failure(tmp_path, monkeypatch):
         logger = CapturingLogger()
         monkeypatch.setattr(policy, "logger", logger)
         policy._config.hf_token = "configured-secret"
+        policy._config.policy_server_port = _free_port()
         model = tmp_path / "model"
         model.mkdir()
         policy._require_model_store = lambda: SimpleNamespace(
