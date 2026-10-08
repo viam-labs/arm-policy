@@ -1,5 +1,6 @@
 # see https://github.com/viamrobotics/build-action for help
 on:
+  workflow_dispatch:
   push:
     tags:
       # we support 0.0.1, v0.0.1, 0.0.1-rc1, v0.0.1-rc1
@@ -12,12 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: viamrobotics/build-action@v1
+      - run: make module.tar.gz
+      - uses: viamrobotics/upload-module@v1
         with:
-          # note: you can replace this line with 'version: ""' if
-          # you want to test the build process without deploying
+          module-path: module.tar.gz
+          platform: any
           version: ${{ github.ref_name }}
-          ref: ${{ github.sha }}
+          do-upload: ${{ github.event_name != "workflow_dispatch" }}
           key-id: ${{ secrets.viam_key_id }}
           key-value: ${{ secrets.viam_key_value }}
-          token: ${{ github.token }} # only required for private git repos
