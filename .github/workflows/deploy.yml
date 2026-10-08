@@ -7,7 +7,6 @@ on:
       - "v?[0-9]+.[0-9]+.[0-9]+"
       - "v?[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
 
-
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -19,6 +18,6 @@ jobs:
           module-path: module.tar.gz
           platform: any
           version: ${{ github.ref_name }}
-          do-upload: ${{ github.event_name != "workflow_dispatch" }}
+          do-upload: ${{ github.event_name != 'workflow_dispatch' }}
           key-id: ${{ secrets.viam_key_id }}
           key-value: ${{ secrets.viam_key_value }}
