@@ -66,9 +66,13 @@ For example, a bucket-backed component that discovers its contract from the down
 }
 ```
 
-When an explicit contract path is absent, startup and reconfiguration do not read a contract file. The component reports `wait_contract` until a matching validated download supplies its contract, or until a configured explicit contract becomes valid. `models/download`, `models/list`, and `policy_server` lifecycle commands remain available while waiting. `execute` (including observation, inference, safety validation, and motion) fails closed with the missing or invalid contract reason. A successful download automatically rechecks readiness and changes status to `ready` only after contract and safety-profile validation succeeds.
+When an explicit contract path is absent, startup and reconfiguration look up only the configured source/revision at its deterministic local store path. They validate the completion metadata's canonical source, revisions, publication state, and hash entries (including the remote publication marker for model sources), then SHA-256-check `policy_contract.json` before parsing it and applying safety-profile validation. This reads only the selected completion metadata and contract: it does not enumerate other exports or read model shards. Each reconfiguration rechecks these files; no discovery result is cached across reconfigurations.
+
+The component reports `wait_contract` until a matching published download supplies a valid contract, or until a configured explicit contract becomes valid. `models/download`, `models/list`, and `policy_server` lifecycle commands remain available while waiting. `execute` (including observation, inference, safety validation, and motion) fails closed with the missing or invalid contract reason. A successful download automatically rechecks readiness and changes status to `ready` only after contract and safety-profile validation succeeds.
 
 The persistent store is `<data-root>/arm-policy-models/...`. A directory is discoverable only after validation and atomic publication of its local `.complete.json`; interrupted or invalid staging directories are never listed.
+
+Readiness verifies the selected safety contract, not the current integrity of model weights or other payload files; it trusts their validation at publication. Full offline bundle hashing remains in `models/list`, download cache/publication validation, and managed `policy_server` startup. Use `models/list` to audit local payload integrity. An explicit `policy_contract_path` still bypasses store discovery and is parsed and safety-validated directly.
 
 Arm joint observations always come from `GetJointPositions`, and validated arm
 prefixes always use `MoveThroughJointPositionsStreamed`. Gripper behavior comes

@@ -3,17 +3,20 @@ import json
 import time
 from dataclasses import replace
 from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
+from test_model_store import _export
 from viam.components.arm import Arm, JointPositions
 from viam.media.video import CameraMimeType, ViamImage
 from viam.operations import Operation
 from viam.proto.app.robot import ComponentConfig
 from viam.utils import dict_to_struct
 
-from models.model_store import ModelRecord
+from models import model_store
+from models.model_store import ModelRecord, ModelStore, parse_model_source
 from models.policy import (
     CAMERA_ALIASES,
     CAMERA_KEYS,
@@ -359,8 +362,8 @@ def test_bucket_source_waits_for_contract_and_download_advances_readiness(tmp_pa
     class Store:
         record = None
 
-        def list(self):
-            return [] if self.record is None else [self.record]
+        def get(self, source, revision=None):
+            return self.record
 
         def download(self, source, revision, token):
             assert source.canonical == "bucket:owner/policy:exports/latest"
@@ -385,6 +388,72 @@ def test_bucket_source_waits_for_contract_and_download_advances_readiness(tmp_pa
         assert (await policy.do_command({"command": "status"}))["state"] == "ready"
 
     asyncio.run(scenario())
+
+
+def test_reconfigure_reads_only_selected_completion_and_contract(tmp_path, monkeypatch):
+    store = ModelStore(tmp_path)
+    source = parse_model_source("bucket:owner/policy:exports/selected")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    _export(staging, remote_marker=False)
+    contract_path, _, _ = _write_contract(staging)
+    contract_path.replace(staging / "policy_contract.json")
+    runtime_path = staging / "runtime_manifest.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["policy_contract"]["sha256"] = model_store._sha256(staging / "policy_contract.json")
+    runtime_path.write_text(json.dumps(runtime))
+    shard = staging / "model.safetensors"
+    shard.write_bytes(b"weights")
+    target = store._target(source, None)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    store._publish(staging, target, source, None, None)
+    # A large payload must not be opened, even if changed since publication.
+    with (target / shard.name).open("wb") as payload:
+        payload.truncate(8 * 1024 ** 3)
+    unrelated = store.root / "unrelated"
+    unrelated.mkdir()
+    (unrelated / ".complete.json").write_text("malformed unrelated completion")
+
+    attrs = {
+        "arm": "arm", "gripper": "gripper", "fixed_camera": "fixed",
+        "wrist_camera": "wrist", "server_uri": "ws://127.0.0.1:8000",
+        "prompt": "pick", "model_source": source.canonical,
+        "model_data_root": str(tmp_path),
+    }
+    policy = Policy("policy")
+    monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
+    allowed = {target / ".complete.json", target / "policy_contract.json"}
+    opened = set()
+    original_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        assert path in allowed, f"readiness opened unrelated file or payload: {path}"
+        opened.add(path)
+        return original_open(path, *args, **kwargs)
+
+    def no_scan(*args, **kwargs):
+        raise AssertionError("readiness traversed the model store")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(Path, "open", guarded_open)
+        guard.setattr(Path, "rglob", no_scan)
+        for _ in range(2):
+            opened.clear()
+            policy.reconfigure(_config(attrs), {})
+            assert policy._status.state == "ready"
+            assert opened == allowed
+
+    # Still valid JSON, but no longer the contract validated at publication.
+    with (target / "policy_contract.json").open("a") as contract_file:
+        contract_file.write("\n")
+
+    def no_parse(*args, **kwargs):
+        raise AssertionError("an unverified contract reached safety parsing")
+
+    monkeypatch.setattr("models.policy._read_policy_contract", no_parse)
+    policy.reconfigure(_config(attrs), {})
+    assert policy._status.state == "wait_contract"
+    assert not policy._ready
 
 
 @pytest.mark.parametrize(

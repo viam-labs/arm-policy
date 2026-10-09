@@ -798,12 +798,8 @@ class Policy(Generic, EasyResource):
         if self._config.model_source is None:
             return None
         source = parse_model_source(self._config.model_source)
-        for record in self._require_model_store().list():
-            if record.source.canonical != source.canonical:
-                continue
-            if source.kind == "bucket" or self._config.model_revision in (record.requested_revision, record.resolved_revision):
-                return Path(record.path)
-        return None
+        record = self._require_model_store().get(source, self._config.model_revision)
+        return Path(record.path) if record is not None else None
 
     def _contract_path(self) -> Path:
         if self._config.policy_contract_path is not None:

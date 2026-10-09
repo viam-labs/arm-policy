@@ -50,6 +50,247 @@ def _export(root: Path, *, remote_marker: bool) -> None:
         )
 
 
+def _published_export(tmp_path: Path, source_value: str = "model:owner/policy"):
+    store = ModelStore(tmp_path / "persistent")
+    source = parse_model_source(source_value)
+    revision = COMMIT if source.kind == "model" else None
+    staging = tmp_path / "staging"
+    _export(staging, remote_marker=source.kind == "model")
+    (staging / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+    remote_marker = None
+    if source.kind == "model":
+        remote_path = staging / ".cosmos-policy-complete.json"
+        remote_marker = json.loads(remote_path.read_text())
+        remote_marker["repository"] = source.repository
+        remote_path.write_text(json.dumps(remote_marker))
+    target = store._target(source, revision)
+    target.parent.mkdir(parents=True)
+    record = store._publish(staging, target, source, revision, revision, remote_marker)
+    return store, source, record
+
+
+@pytest.mark.parametrize("source_value", ["model:owner/policy", "bucket:owner/policy:models/run-1"])
+def test_get_reads_only_completion_and_contract_offline(tmp_path, monkeypatch, source_value):
+    store, source, published = _published_export(tmp_path, source_value)
+    target = Path(published.path)
+    allowed = {target / ".complete.json", target / "policy_contract.json"}
+    opened = []
+    original_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        assert path in allowed, f"direct readiness lookup must not read {path}"
+        opened.append(path)
+        return original_open(path, *args, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("direct readiness lookup must not traverse directories or access the network")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(Path, "open", guarded_open)
+        guard.setattr(Path, "glob", forbidden)
+        guard.setattr(Path, "rglob", forbidden)
+        guard.setattr(Path, "iterdir", forbidden)
+        guard.setattr(model_store.os, "scandir", forbidden)
+        guard.setattr(model_store, "HuggingFaceClient", forbidden)
+        guard.setattr(model_store.subprocess, "run", forbidden)
+        assert store.get(source, published.requested_revision) == published
+
+    assert set(opened) == allowed
+
+
+@pytest.mark.parametrize(
+    ("source", "revision"),
+    [
+        ("model:owner/policy", COMMIT),
+        (None, COMMIT),
+        (parse_model_source("owner/policy"), None),
+        (parse_model_source("owner/policy"), "main"),
+        (parse_model_source("owner/policy"), "A" * 40),
+        (parse_model_source("bucket:owner/policy:models/run-1"), COMMIT),
+    ],
+)
+def test_get_rejects_invalid_arguments(tmp_path, source, revision):
+    with pytest.raises(ValueError):
+        ModelStore(tmp_path).get(source, revision)
+
+
+@pytest.mark.parametrize("source_value", ["model:owner/policy", "bucket:owner/policy:models/run-1"])
+def test_get_returns_none_for_absent_export(tmp_path, source_value):
+    source = parse_model_source(source_value)
+    revision = COMMIT if source.kind == "model" else None
+    assert ModelStore(tmp_path).get(source, revision) is None
+
+
+@pytest.mark.parametrize("completion", [None, "{", "[]", "null", '"not an object"', "{}"])
+def test_get_rejects_missing_or_malformed_completion(tmp_path, completion):
+    store, source, published = _published_export(tmp_path)
+    marker = Path(published.path) / ".complete.json"
+    if completion is None:
+        marker.unlink()
+    else:
+        marker.write_text(completion)
+    assert store.get(source, COMMIT) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model_source", "model:other/policy"),
+        ("model_source", "owner/policy"),
+        ("model_source", "bucket:owner/policy:models/run-1"),
+        ("requested_revision", "b" * 40),
+        ("requested_revision", None),
+        ("resolved_revision", "b" * 40),
+        ("resolved_revision", None),
+        ("validation_state", "failed"),
+        ("validation_state", None),
+    ],
+)
+def test_get_requires_exact_model_identity_and_validated_state(tmp_path, field, value):
+    store, source, published = _published_export(tmp_path)
+    marker = Path(published.path) / ".complete.json"
+    completion = json.loads(marker.read_text())
+    completion[field] = value
+    if field == "resolved_revision":
+        completion["remote_completion_marker"]["resolved_revision"] = value
+    marker.write_text(json.dumps(completion))
+    assert store.get(source, COMMIT) is None
+
+
+def test_get_does_not_accept_a_colliding_repository_directory(tmp_path):
+    store, source, published = _published_export(tmp_path, "model:owner--extra/policy")
+    collision = parse_model_source("model:owner/extra--policy")
+    assert store._target(source, COMMIT) == store._target(collision, COMMIT)
+    assert store.get(source, COMMIT) == published
+    assert store.get(collision, COMMIT) is None
+    assert store.get(source, "b" * 40) is None
+
+
+@pytest.mark.parametrize("field", ["requested_revision", "resolved_revision"])
+@pytest.mark.parametrize("mutation", ["missing", "revision"])
+def test_get_requires_explicit_null_bucket_revisions(tmp_path, field, mutation):
+    store, source, published = _published_export(tmp_path, "bucket:owner/policy:models/run-1")
+    marker = Path(published.path) / ".complete.json"
+    completion = json.loads(marker.read_text())
+    if mutation == "missing":
+        del completion[field]
+    else:
+        completion[field] = COMMIT
+    marker.write_text(json.dumps(completion))
+    assert store.get(source) is None
+
+
+@pytest.mark.parametrize("other_source", ["bucket:owner/policy:models/run-2", "bucket:other/policy:models/run-1"])
+def test_get_requires_exact_bucket_source(tmp_path, other_source):
+    store, source, published = _published_export(tmp_path, "bucket:owner/policy:models/run-1")
+    marker = Path(published.path) / ".complete.json"
+    completion = json.loads(marker.read_text())
+    completion["model_source"] = other_source
+    marker.write_text(json.dumps(completion))
+    assert store.get(source) is None
+
+
+@pytest.mark.parametrize("hashes", [None, [], "invalid", {}])
+def test_get_rejects_invalid_completion_hash_mapping(tmp_path, hashes):
+    store, source, published = _published_export(tmp_path)
+    marker = Path(published.path) / ".complete.json"
+    completion = json.loads(marker.read_text())
+    completion["hashes"] = hashes
+    marker.write_text(json.dumps(completion))
+    assert store.get(source, COMMIT) is None
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["checkpoint.json", "config.json", "export_manifest.json", "runtime_manifest.json", "policy_contract.json", "model.safetensors.index.json"],
+)
+def test_get_requires_all_export_hash_entries(tmp_path, name):
+    store, source, published = _published_export(tmp_path)
+    marker = Path(published.path) / ".complete.json"
+    completion = json.loads(marker.read_text())
+    del completion["hashes"][name]
+    marker.write_text(json.dumps(completion))
+    assert store.get(source, COMMIT) is None
+
+
+@pytest.mark.parametrize("name", ["policy_contract.json", "config.json", "model-00001-of-00001.safetensors"])
+@pytest.mark.parametrize("digest", [None, 7, [], "", "a" * 63, "A" * 64, "g" * 64])
+def test_get_requires_lowercase_sha256_digests(tmp_path, name, digest):
+    store, source, published = _published_export(tmp_path)
+    marker = Path(published.path) / ".complete.json"
+    completion = json.loads(marker.read_text())
+    completion["hashes"][name] = digest
+    marker.write_text(json.dumps(completion))
+    assert store.get(source, COMMIT) is None
+
+
+@pytest.mark.parametrize("field", ["model_source", "requested_revision", "resolved_revision", "validation_state", "hashes", "remote_completion_marker"])
+def test_get_rejects_missing_model_completion_fields(tmp_path, field):
+    store, source, published = _published_export(tmp_path)
+    marker = Path(published.path) / ".complete.json"
+    completion = json.loads(marker.read_text())
+    del completion[field]
+    marker.write_text(json.dumps(completion))
+    assert store.get(source, COMMIT) is None
+
+
+@pytest.mark.parametrize("remote_marker", [None, [], {}, {"schema_version": 2}])
+def test_get_rejects_malformed_nested_remote_marker(tmp_path, remote_marker):
+    store, source, published = _published_export(tmp_path)
+    marker = Path(published.path) / ".complete.json"
+    completion = json.loads(marker.read_text())
+    completion["remote_completion_marker"] = remote_marker
+    marker.write_text(json.dumps(completion))
+    assert store.get(source, COMMIT) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema_version", 2),
+        ("repository", "other/policy"),
+        ("resolved_revision", "b" * 40),
+        ("provenance", None),
+        ("provenance", {"repository": "", "revision": "b" * 40}),
+        ("provenance", {"repository": "owner/training", "revision": "main"}),
+    ],
+)
+def test_get_validates_nested_remote_marker(tmp_path, field, value):
+    store, source, published = _published_export(tmp_path)
+    marker = Path(published.path) / ".complete.json"
+    completion = json.loads(marker.read_text())
+    completion["remote_completion_marker"][field] = value
+    marker.write_text(json.dumps(completion))
+    assert store.get(source, COMMIT) is None
+
+
+@pytest.mark.parametrize("source_value", ["model:owner/policy", "bucket:owner/policy:models/run-1"])
+@pytest.mark.parametrize("mutation", ["missing", "tampered", "wrong_hash"])
+def test_get_rechecks_contract_after_successful_lookup(tmp_path, source_value, mutation):
+    store, source, published = _published_export(tmp_path, source_value)
+    assert store.get(source, published.requested_revision) == published
+    contract = Path(published.path) / "policy_contract.json"
+    if mutation == "missing":
+        contract.unlink()
+    elif mutation == "tampered":
+        contract.write_text(json.dumps({"schema_version": 3, "changed": True}))
+    else:
+        marker = Path(published.path) / ".complete.json"
+        completion = json.loads(marker.read_text())
+        completion["hashes"]["policy_contract.json"] = "0" * 64
+        marker.write_text(json.dumps(completion))
+    assert store.get(source, published.requested_revision) is None
+
+
+@pytest.mark.parametrize("payload", ["model-00001-of-00001.safetensors", "runtime/vae/fixture.bin", "checkpoint.json"])
+def test_get_uses_publication_receipt_but_list_still_validates_all_payloads(tmp_path, payload):
+    store, source, published = _published_export(tmp_path)
+    assert store.list() == [published]
+    assert store.get(source, COMMIT) == published
+    (Path(published.path) / payload).write_bytes(b"tampered")
+    assert store.get(source, COMMIT) == published
+    assert store.list() == []
+
 @pytest.mark.parametrize(
     ("value", "canonical"),
     [

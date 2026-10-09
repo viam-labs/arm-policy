@@ -298,6 +298,50 @@ class ModelStore:
     def _completion(path: Path) -> Path:
         return path / ".complete.json"
 
+    def get(self, source: ModelSource, requested_revision: str | None = None) -> ModelRecord | None:
+        """Find a published source and verify its contract, not its model payload.
+
+        Readiness needs only the completion metadata and safety contract. Full
+        bundle integrity remains the responsibility of list/download validation.
+        """
+        if not isinstance(source, ModelSource):
+            raise ValueError("source must be a ModelSource")
+        if source.kind == "model":
+            requested_revision = validate_revision(requested_revision)
+        elif requested_revision is not None:
+            raise ValueError("bucket sources cannot specify model_revision")
+        target = self._target(source, requested_revision)
+        try:
+            manifest = _read_json(self._completion(target))
+            if (
+                manifest.get("model_source") != source.canonical
+                or "requested_revision" not in manifest
+                or "resolved_revision" not in manifest
+                or manifest["requested_revision"] != requested_revision
+                or manifest["resolved_revision"] != requested_revision
+                or manifest.get("validation_state") != "validated"
+            ):
+                return None
+            if source.kind == "model":
+                validate_remote_completion_marker(
+                    manifest.get("remote_completion_marker"), source.repository, requested_revision
+                )
+            hashes = manifest.get("hashes")
+            if (
+                not isinstance(hashes, dict)
+                or not _REQUIRED_EXPORT_FILES.issubset(hashes)
+                or any(
+                    not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                    for digest in hashes.values()
+                )
+            ):
+                return None
+            if hashes["policy_contract.json"] != _sha256(target / "policy_contract.json"):
+                return None
+        except (OSError, ValueError):
+            return None
+        return ModelRecord(source, requested_revision, requested_revision, str(target), "validated")
+
     def _record_if_valid(self, target: Path) -> ModelRecord | None:
         marker = self._completion(target)
         if not marker.is_file():
