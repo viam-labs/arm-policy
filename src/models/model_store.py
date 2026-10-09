@@ -168,12 +168,14 @@ def _safe_relative(name: object) -> Path:
     return path
 
 
-def _export_hashes(root: Path) -> dict[str, str]:
-    return {
-        path.relative_to(root).as_posix(): _sha256(path)
-        for path in sorted(root.rglob("*"))
-        if path.is_file() and path.name != ".complete.json"
-    }
+def _export_hashes(root: Path, hashes: dict[str, str] | None = None) -> dict[str, str]:
+    hashes = {} if hashes is None else hashes
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.name != ".complete.json":
+            relative = path.relative_to(root).as_posix()
+            if relative not in hashes:
+                hashes[relative] = _sha256(path)
+    return hashes
 
 
 def validate_portable_export(root: Path) -> dict[str, str]:
@@ -193,15 +195,21 @@ def validate_portable_export(root: Path) -> dict[str, str]:
         raise ValueError("portable export checkpoint does not reference runtime_manifest.json")
     if contract.get("schema_version") != 3:
         raise ValueError("portable export policy contract has an unsupported schema")
+    hashes: dict[str, str] = {}
     for field in ("training_config", "policy_contract", "vae"):
         entry = runtime_manifest.get(field)
         if not isinstance(entry, dict):
             raise ValueError(f"portable export runtime manifest has no {field} entry")
         relative = _safe_relative(entry.get("path"))
         actual = root / relative
-        if not actual.is_file() or entry.get("sha256") != _sha256(actual):
+        name = relative.as_posix()
+        if not actual.is_file():
             raise ValueError(f"portable export runtime checksum failed for {field}")
-    return _export_hashes(root)
+        if name not in hashes:
+            hashes[name] = _sha256(actual)
+        if entry.get("sha256") != hashes[name]:
+            raise ValueError(f"portable export runtime checksum failed for {field}")
+    return _export_hashes(root, hashes)
 
 
 @dataclass(frozen=True)
