@@ -462,7 +462,7 @@ def test_reconfigure_reads_only_selected_completion_and_contract(tmp_path, monke
         {},
         {"command": "status", "unexpected": True},
         {"command": "policy_server", "action": "restart"},
-        {"command": "policy_server", "action": "start", "model_path": 42},
+        {"command": "policy_server", "action": "start", "model_path": "/tmp/model"},
     ],
 )
 def test_do_command_rejects_invalid_payloads(command):

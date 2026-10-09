@@ -215,8 +215,9 @@ def test_policy_logs_redacted_startup_failure(tmp_path, monkeypatch):
         policy._config.policy_server_port = _free_port()
         model = tmp_path / "model"
         model.mkdir()
+        policy._config.model_source = "bucket:owner/policy:models/startup-log"
         policy._require_model_store = lambda: SimpleNamespace(
-            list=lambda: [SimpleNamespace(path=str(model))]
+            get=lambda source, revision, *, full: SimpleNamespace(path=str(model))
         )
         program = (
             "import os, sys; print('HF_TOKEN=' + os.environ['HF_TOKEN']); "
@@ -229,9 +230,7 @@ def test_policy_logs_redacted_startup_failure(tmp_path, monkeypatch):
         )
 
         with pytest.raises(RuntimeError, match="exit_status=9"):
-            await policy.do_command(
-                {"command": "policy_server", "action": "start", "model_path": str(model)}
-            )
+            await policy.do_command({"command": "policy_server", "action": "start"})
 
         assert len(logger.errors) == 1
         assert "failed during startup" in logger.errors[0]
@@ -250,8 +249,9 @@ def test_policy_logs_server_start_and_readiness(tmp_path, monkeypatch):
         policy = Policy("startup-ready-log")
         policy._policy_server = PolicyServerSupervisor(tmp_path, "startup-ready-log")
         policy._config.policy_server_port = port
+        policy._config.model_source = "bucket:owner/policy:models/startup-ready-log"
         policy._require_model_store = lambda: SimpleNamespace(
-            list=lambda: [SimpleNamespace(path=str(model))]
+            get=lambda source, revision, *, full: SimpleNamespace(path=str(model))
         )
         logger = CapturingLogger()
         monkeypatch.setattr(policy, "logger", logger)
@@ -262,7 +262,7 @@ def test_policy_logs_server_start_and_readiness(tmp_path, monkeypatch):
         )
 
         result = await policy.do_command(
-            {"command": "policy_server", "action": "start", "model_path": str(model)}
+            {"command": "policy_server", "action": "start"}
         )
 
         assert result["state"] == "healthy"

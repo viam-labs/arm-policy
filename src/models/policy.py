@@ -350,7 +350,6 @@ class ModelsListCommand(CommandModel):
 class PolicyServerCommand(CommandModel):
     command: Literal["policy_server"]
     action: Literal["start", "status", "stop"]
-    model_path: str | None = None
 
 
 class ExecuteCommand(CommandModel):
@@ -1805,25 +1804,18 @@ class Policy(Generic, EasyResource):
             self._config.policy_server_host,
             self._config.policy_server_port,
         )
-        model_path = command.model_path
-        if model_path is None:
-            if self._config.model_source is None:
-                raise ValueError("policy_server start requires model_path or configured model_source")
-            source = parse_model_source(self._config.model_source)
-            record = await asyncio.to_thread(
-                self._require_model_store().get,
-                source,
-                self._config.model_revision,
-                full=True,
-            )
-            if record is None:
-                raise ValueError("configured model has not been downloaded and validated")
-            model = Path(record.path)
-        else:
-            records = await asyncio.to_thread(self._require_model_store().list)
-            model = Path(model_path).expanduser().resolve()
-            if str(model) not in {record.path for record in records}:
-                raise ValueError("policy_server model_path is not a validated local model")
+        if self._config.model_source is None:
+            raise NotImplementedError("policy_server start requires configured model_source")
+        source = parse_model_source(self._config.model_source)
+        record = await asyncio.to_thread(
+            self._require_model_store().get,
+            source,
+            self._config.model_revision,
+            full=True,
+        )
+        if record is None:
+            raise ValueError("configured model has not been downloaded and validated")
+        model = Path(record.path)
         runtime_root = Path(__file__).resolve().parents[2] / "policy_server_runtime"
         try:
             result = await asyncio.to_thread(
