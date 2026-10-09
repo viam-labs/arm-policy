@@ -1811,7 +1811,6 @@ class Policy(Generic, EasyResource):
             self._require_model_store().get,
             source,
             self._config.model_revision,
-            full=True,
         )
         if record is None:
             raise ValueError("configured model has not been downloaded and validated")

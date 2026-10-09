@@ -217,7 +217,7 @@ def test_policy_logs_redacted_startup_failure(tmp_path, monkeypatch):
         model.mkdir()
         policy._config.model_source = "bucket:owner/policy:models/startup-log"
         policy._require_model_store = lambda: SimpleNamespace(
-            get=lambda source, revision, *, full: SimpleNamespace(path=str(model))
+            get=lambda source, revision: SimpleNamespace(path=str(model))
         )
         program = (
             "import os, sys; print('HF_TOKEN=' + os.environ['HF_TOKEN']); "
@@ -251,7 +251,7 @@ def test_policy_logs_server_start_and_readiness(tmp_path, monkeypatch):
         policy._config.policy_server_port = port
         policy._config.model_source = "bucket:owner/policy:models/startup-ready-log"
         policy._require_model_store = lambda: SimpleNamespace(
-            get=lambda source, revision, *, full: SimpleNamespace(path=str(model))
+            get=lambda source, revision: SimpleNamespace(path=str(model))
         )
         logger = CapturingLogger()
         monkeypatch.setattr(policy, "logger", logger)
@@ -277,11 +277,11 @@ def test_policy_logs_server_start_and_readiness(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("source_value", ["model:owner/policy", "bucket:owner/policy:models/run-1"])
-def test_configured_start_validates_only_selected_export(tmp_path, monkeypatch, source_value):
+def test_configured_start_reads_only_selected_receipt_and_contract(tmp_path, monkeypatch, source_value):
     store, source, selected = _published_export(tmp_path, source_value)
     other_source = source_value if source.kind == "model" else "bucket:owner/policy:models/run-2"
     _, unrelated_source, unrelated = _published_export(tmp_path, other_source, revision="b" * 40)
-    assert store.get(unrelated_source, unrelated.requested_revision, full=True) == unrelated
+    assert store.get(unrelated_source, unrelated.requested_revision) == unrelated
     target = Path(selected.path)
     policy = Policy("targeted-start")
     policy._config.model_data_root = str(tmp_path / "persistent")
@@ -325,30 +325,51 @@ def test_configured_start_validates_only_selected_export(tmp_path, monkeypatch, 
     assert len(supervisor.commands) == 1
     command = supervisor.commands[0]
     assert command[command.index("--model") + 1] == selected.path
-    assert {
+    assert opened == {
         target / ".complete.json",
         target / "policy_contract.json",
-        target / "model-00001-of-00001.safetensors",
-        target / "runtime" / "vae" / "fixture.bin",
-    } <= opened
+    }
 
 
 @pytest.mark.parametrize("source_value", ["model:owner/policy", "bucket:owner/policy:models/run-1"])
-@pytest.mark.parametrize(
-    "payload",
-    ["model-00001-of-00001.safetensors", "runtime/vae/fixture.bin", "checkpoint.json", ".complete.json", "policy_contract.json"],
-)
+@pytest.mark.parametrize("payload", ["model-00001-of-00001.safetensors", "runtime/vae/fixture.bin", "checkpoint.json"])
 @pytest.mark.parametrize("mutation", ["tampered", "missing"])
-def test_configured_start_rejects_invalid_selected_export(tmp_path, source_value, payload, mutation):
+def test_configured_start_trusts_receipt_for_payloads(tmp_path, source_value, payload, mutation):
     store, source, selected = _published_export(tmp_path, source_value)
     path = Path(selected.path) / payload
     if mutation == "missing":
         path.unlink()
     else:
         path.write_bytes(b"tampered")
-    expected = None if payload in {".complete.json", "policy_contract.json"} else selected
-    assert store.get(source, selected.requested_revision) == expected
-    policy = Policy("invalid-targeted-start")
+    policy = Policy("receipt-start")
+    policy._config.model_data_root = str(tmp_path / "persistent")
+    policy._config.model_source = source.canonical
+    policy._config.model_revision = selected.requested_revision
+    supervisor = CapturingSupervisor()
+    policy._policy_server = supervisor
+
+    async def scenario():
+        try:
+            return await policy.do_command({"command": "policy_server", "action": "start"})
+        finally:
+            policy._detach_policy_server_watcher()
+
+    assert asyncio.run(scenario())["state"] == "healthy"
+    assert len(supervisor.commands) == 1
+
+
+@pytest.mark.parametrize("source_value", ["model:owner/policy", "bucket:owner/policy:models/run-1"])
+@pytest.mark.parametrize("payload", [".complete.json", "policy_contract.json"])
+@pytest.mark.parametrize("mutation", ["tampered", "missing"])
+def test_configured_start_rejects_invalid_receipt_or_contract(tmp_path, source_value, payload, mutation):
+    store, source, selected = _published_export(tmp_path, source_value)
+    path = Path(selected.path) / payload
+    if mutation == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"tampered")
+    assert store.get(source, selected.requested_revision) is None
+    policy = Policy("invalid-receipt-start")
     policy._config.model_data_root = str(tmp_path / "persistent")
     policy._config.model_source = source.canonical
     policy._config.model_revision = selected.requested_revision
