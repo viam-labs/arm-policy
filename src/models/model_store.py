@@ -298,11 +298,13 @@ class ModelStore:
     def _completion(path: Path) -> Path:
         return path / ".complete.json"
 
-    def get(self, source: ModelSource, requested_revision: str | None = None) -> ModelRecord | None:
-        """Find a published source and verify its contract, not its model payload.
+    def get(
+        self, source: ModelSource, requested_revision: str | None = None, *, full: bool = False
+    ) -> ModelRecord | None:
+        """Find an exact published source and verify its contract or full payload.
 
-        Readiness needs only the completion metadata and safety contract. Full
-        bundle integrity remains the responsibility of list/download validation.
+        Readiness needs only completion metadata and the safety contract. Server
+        startup uses full=True to verify every file in only the selected export.
         """
         if not isinstance(source, ModelSource):
             raise ValueError("source must be a ModelSource")
@@ -336,7 +338,10 @@ class ModelStore:
                 )
             ):
                 return None
-            if hashes["policy_contract.json"] != _sha256(target / "policy_contract.json"):
+            if full:
+                if hashes != validate_portable_export(target):
+                    return None
+            elif hashes["policy_contract.json"] != _sha256(target / "policy_contract.json"):
                 return None
         except (OSError, ValueError):
             return None

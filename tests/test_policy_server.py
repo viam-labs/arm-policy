@@ -3,14 +3,17 @@ import json
 import socket
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_model_store import _published_export
 from viam.proto.app.robot import ComponentConfig
 from viam.utils import dict_to_struct
 
 import models.policy as policy_module
 import models.policy_server as policy_server_module
+from models import model_store
 from models.policy import Policy
 from models.policy_server import PolicyServerSupervisor
 
@@ -50,6 +53,21 @@ class CapturingLogger:
 
     def info(self, message, *args):
         self.infos.append(message % args)
+
+
+class CapturingSupervisor:
+    def __init__(self):
+        self.commands = []
+
+    def start(self, command, host, port, readiness_timeout, environment):
+        self.commands.append(command)
+        return {"state": "healthy", "pid": 123}
+
+    def poll_failure(self):
+        return None
+
+    def _has_state(self):
+        return False
 
 
 def _free_port():
@@ -256,6 +274,97 @@ def test_policy_logs_server_start_and_readiness(tmp_path, monkeypatch):
         await policy.do_command({"command": "policy_server", "action": "stop"})
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("source_value", ["model:owner/policy", "bucket:owner/policy:models/run-1"])
+def test_configured_start_validates_only_selected_export(tmp_path, monkeypatch, source_value):
+    store, source, selected = _published_export(tmp_path, source_value)
+    other_source = source_value if source.kind == "model" else "bucket:owner/policy:models/run-2"
+    _, unrelated_source, unrelated = _published_export(tmp_path, other_source, revision="b" * 40)
+    assert store.get(unrelated_source, unrelated.requested_revision, full=True) == unrelated
+    target = Path(selected.path)
+    policy = Policy("targeted-start")
+    policy._config.model_data_root = str(tmp_path / "persistent")
+    policy._config.model_source = source.canonical
+    policy._config.model_revision = selected.requested_revision
+    supervisor = CapturingSupervisor()
+    policy._policy_server = supervisor
+    opened = set()
+    original_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        assert path.is_relative_to(target), f"startup must not read outside selected export: {path}"
+        opened.add(path)
+        return original_open(path, *args, **kwargs)
+
+    def confined_traversal(function):
+        def guarded(path, *args, **kwargs):
+            assert Path(path).is_relative_to(target), f"startup must not traverse outside selected export: {path}"
+            return function(path, *args, **kwargs)
+
+        return guarded
+
+    def forbidden_list(*args, **kwargs):
+        raise AssertionError("configured startup must not list exports")
+
+    async def scenario():
+        try:
+            return await policy.do_command({"command": "policy_server", "action": "start"})
+        finally:
+            policy._detach_policy_server_watcher()
+
+    with monkeypatch.context() as guard:
+        guard.setattr(model_store.ModelStore, "list", forbidden_list)
+        guard.setattr(Path, "open", guarded_open)
+        for method in ("glob", "rglob", "iterdir"):
+            guard.setattr(Path, method, confined_traversal(getattr(Path, method)))
+        guard.setattr(model_store.os, "scandir", confined_traversal(model_store.os.scandir))
+        result = asyncio.run(scenario())
+
+    assert result["state"] == "healthy"
+    assert len(supervisor.commands) == 1
+    command = supervisor.commands[0]
+    assert command[command.index("--model") + 1] == selected.path
+    assert {
+        target / ".complete.json",
+        target / "policy_contract.json",
+        target / "model-00001-of-00001.safetensors",
+        target / "runtime" / "vae" / "fixture.bin",
+    } <= opened
+
+
+@pytest.mark.parametrize("source_value", ["model:owner/policy", "bucket:owner/policy:models/run-1"])
+@pytest.mark.parametrize(
+    "payload",
+    ["model-00001-of-00001.safetensors", "runtime/vae/fixture.bin", "checkpoint.json", ".complete.json", "policy_contract.json"],
+)
+@pytest.mark.parametrize("mutation", ["tampered", "missing"])
+def test_configured_start_rejects_invalid_selected_export(tmp_path, source_value, payload, mutation):
+    store, source, selected = _published_export(tmp_path, source_value)
+    path = Path(selected.path) / payload
+    if mutation == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"tampered")
+    expected = None if payload in {".complete.json", "policy_contract.json"} else selected
+    assert store.get(source, selected.requested_revision) == expected
+    policy = Policy("invalid-targeted-start")
+    policy._config.model_data_root = str(tmp_path / "persistent")
+    policy._config.model_source = source.canonical
+    policy._config.model_revision = selected.requested_revision
+    supervisor = CapturingSupervisor()
+    policy._policy_server = supervisor
+
+    async def scenario():
+        try:
+            with pytest.raises(ValueError, match="configured model has not been downloaded and validated"):
+                await policy.do_command({"command": "policy_server", "action": "start"})
+        finally:
+            policy._detach_policy_server_watcher()
+
+    asyncio.run(scenario())
+    assert supervisor.commands == []
+
 
 def test_watcher_logs_owned_exit_once_with_exit_status(tmp_path, monkeypatch):
     async def scenario():

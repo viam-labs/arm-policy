@@ -1805,22 +1805,22 @@ class Policy(Generic, EasyResource):
             self._config.policy_server_host,
             self._config.policy_server_port,
         )
-        records = await asyncio.to_thread(self._require_model_store().list)
         model_path = command.model_path
         if model_path is None:
             if self._config.model_source is None:
                 raise ValueError("policy_server start requires model_path or configured model_source")
             source = parse_model_source(self._config.model_source)
-            records = [
-                record
-                for record in records
-                if record.source.canonical == source.canonical
-                and (source.kind == "bucket" or self._config.model_revision in (record.requested_revision, record.resolved_revision))
-            ]
-            if len(records) != 1:
+            record = await asyncio.to_thread(
+                self._require_model_store().get,
+                source,
+                self._config.model_revision,
+                full=True,
+            )
+            if record is None:
                 raise ValueError("configured model has not been downloaded and validated")
-            model = Path(records[0].path)
+            model = Path(record.path)
         else:
+            records = await asyncio.to_thread(self._require_model_store().list)
             model = Path(model_path).expanduser().resolve()
             if str(model) not in {record.path for record in records}:
                 raise ValueError("policy_server model_path is not a validated local model")
