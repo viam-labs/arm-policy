@@ -1036,3 +1036,31 @@ def test_full_validator_uses_measured_history_for_dynamic_limits():
     actions[:, :6] = 0.10
     with pytest.raises(ValueError, match="acceleration"):
         policy._validate_actions(actions, history, dynamics=True)
+
+
+def test_undo_server_gripper_flip_inverts_sent_state_and_returned_gripper():
+    policy = FakePolicy(b"")
+    policy._config.undo_server_gripper_flip = True
+    observation = {
+        "observation/joint_position": np.zeros(6, dtype=np.float32),
+        "observation/gripper_position": np.array([0.0], dtype=np.float32),
+    }
+    wire = policy._wire_observation(observation)
+    assert wire["observation/gripper_position"].tolist() == [1.0]
+    assert wire["observation/gripper_position"].dtype == np.float32
+    assert observation["observation/gripper_position"].tolist() == [0.0]
+
+    actions = _actions()
+    actions[:, :6] = 0.1
+    parsed, _timing = policy._parse_chunk({"action": actions})
+    assert parsed[:, 6] == pytest.approx(0.75)
+    assert parsed[:, :6] == pytest.approx(0.1)
+    assert actions[0, 6] == pytest.approx(0.25)
+
+
+def test_gripper_passes_through_unchanged_by_default():
+    policy = FakePolicy(b"")
+    observation = {"observation/gripper_position": np.array([0.0], dtype=np.float32)}
+    assert policy._wire_observation(observation)["observation/gripper_position"].tolist() == [0.0]
+    parsed, _timing = policy._parse_chunk({"action": _actions()})
+    assert parsed[:, 6] == pytest.approx(0.25)
