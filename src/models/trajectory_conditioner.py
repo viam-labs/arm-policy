@@ -1,4 +1,4 @@
-"""Deterministic 20 Hz joint-trajectory time parameterization."""
+"""Deterministic rate-aware joint-trajectory time parameterization."""
 
 from __future__ import annotations
 
@@ -339,7 +339,7 @@ def condition_trajectory_toppra(
     if not _dynamics_valid(
         result, measured, velocity_limits, acceleration_limits, period_s
     ):
-        raise ValueError("TOPPRA output exceeds discrete 20 Hz dynamic limits")
+        raise ValueError("TOPPRA output exceeds discrete dynamic limits")
 
     path_deltas: list[np.ndarray] = []
     source_indices: list[int] = []

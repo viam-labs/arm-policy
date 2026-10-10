@@ -3,11 +3,13 @@ import math
 import numpy as np
 import pytest
 
-from models.policy import PERIOD_S, SAFETY_PROFILES
+from models.policy import SAFETY_PROFILES
 from models.trajectory_conditioner import (
     condition_trajectory,
     condition_trajectory_toppra,
 )
+
+PERIOD_S = 0.05
 
 
 def _actions(value=0.0):

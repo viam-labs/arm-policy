@@ -134,7 +134,14 @@ class FakeWorld:
 
 class FakePolicy(Policy, register=False):
     def __init__(
-        self, response, *, arm=None, gripper=None, block=False, gripper_mode="position"
+        self,
+        response,
+        *,
+        arm=None,
+        gripper=None,
+        block=False,
+        gripper_mode="position",
+        fps=20.0,
     ):
         super().__init__("policy")
         self._world = FakeWorld()
@@ -147,6 +154,7 @@ class FakePolicy(Policy, register=False):
         self._config.server_uri = "ws://policy.test"
         self._config.prompt = "pick"
         self._config.contract.embodiment.gripper_mode = gripper_mode
+        self._config.contract.conditioning_fps = fps
         self._config.binary_gripper_settle_sec = 0.0
         self._config._profile = SAFETY_PROFILES[
             ("lite6", "lite6_gripper")
@@ -223,7 +231,7 @@ def _config(attrs):
     return ComponentConfig(name="policy", attributes=dict_to_struct(attrs))
 
 
-def _write_contract(tmp_path, arm_model="ur20"):
+def _write_contract(tmp_path, arm_model="ur20", fps: float = 20.0):
     profile = next(
         profile
         for profile in SAFETY_PROFILES.values()
@@ -245,7 +253,7 @@ def _write_contract(tmp_path, arm_model="ur20"):
             "shape": [7],
             "names": [*profile.joint_names, "gripper"],
             "units": [*(["rad"] * 6), gripper_units],
-            "fps": 20,
+            "fps": fps,
             "gripper_convention": "0=open, 1=closed",
         },
         "observation_schema": {
@@ -262,7 +270,7 @@ def _write_contract(tmp_path, arm_model="ur20"):
             "camera_aliases": CAMERA_ALIASES,
         },
         "action_chunk_size": 32,
-        "conditioning_fps": 20.0,
+        "conditioning_fps": fps,
         "domain_name": "droid_lerobot",
     }
     path = tmp_path / f"{arm_model}-policy-contract.json"
@@ -349,13 +357,19 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
         )
 
 
-def test_bucket_source_waits_for_contract_and_download_advances_readiness(tmp_path, monkeypatch):
+def test_bucket_source_waits_for_contract_and_download_advances_readiness(
+    tmp_path, monkeypatch
+):
     _, contract, _ = _write_contract(tmp_path)
     bundle = tmp_path / "bundle"
     attrs = {
-        "arm": "pick-arm", "gripper": "pick-gripper", "fixed_camera": "scene-cam",
-        "wrist_camera": "wrist-cam", "server_uri": "ws://127.0.0.1:8000",
-        "prompt": "pick", "model_source": "bucket:owner/policy:exports/latest",
+        "arm": "pick-arm",
+        "gripper": "pick-gripper",
+        "fixed_camera": "scene-cam",
+        "wrist_camera": "wrist-cam",
+        "server_uri": "ws://127.0.0.1:8000",
+        "prompt": "pick",
+        "model_source": "bucket:owner/policy:exports/latest",
         "model_data_root": str(tmp_path),
     }
     Policy.validate_config(_config(attrs))
@@ -381,7 +395,9 @@ def test_bucket_source_waits_for_contract_and_download_advances_readiness(tmp_pa
     policy.reconfigure(_config(attrs), {})
 
     async def scenario():
-        assert (await policy.do_command({"command": "status"}))["state"] == "wait_contract"
+        assert (await policy.do_command({"command": "status"}))[
+            "state"
+        ] == "wait_contract"
         with pytest.raises(RuntimeError, match="not ready"):
             await policy.do_command({"command": "execute"})
         response = await policy.do_command({"command": "models/download"})
@@ -401,7 +417,9 @@ def test_reconfigure_reads_only_selected_completion_and_contract(tmp_path, monke
     contract_path.replace(staging / "policy_contract.json")
     runtime_path = staging / "runtime_manifest.json"
     runtime = json.loads(runtime_path.read_text())
-    runtime["policy_contract"]["sha256"] = model_store._sha256(staging / "policy_contract.json")
+    runtime["policy_contract"]["sha256"] = model_store._sha256(
+        staging / "policy_contract.json"
+    )
     runtime_path.write_text(json.dumps(runtime))
     shard = staging / "model.safetensors"
     shard.write_bytes(b"weights")
@@ -410,15 +428,19 @@ def test_reconfigure_reads_only_selected_completion_and_contract(tmp_path, monke
     store._publish(staging, target, source, None, None)
     # A large payload must not be opened, even if changed since publication.
     with (target / shard.name).open("wb") as payload:
-        payload.truncate(8 * 1024 ** 3)
+        payload.truncate(8 * 1024**3)
     unrelated = store.root / "unrelated"
     unrelated.mkdir()
     (unrelated / ".complete.json").write_text("malformed unrelated completion")
 
     attrs = {
-        "arm": "arm", "gripper": "gripper", "fixed_camera": "fixed",
-        "wrist_camera": "wrist", "server_uri": "ws://127.0.0.1:8000",
-        "prompt": "pick", "model_source": source.canonical,
+        "arm": "arm",
+        "gripper": "gripper",
+        "fixed_camera": "fixed",
+        "wrist_camera": "wrist",
+        "server_uri": "ws://127.0.0.1:8000",
+        "prompt": "pick",
+        "model_source": source.canonical,
         "model_data_root": str(tmp_path),
     }
     policy = Policy("policy")
@@ -477,13 +499,27 @@ def test_do_command_rejects_invalid_payloads(command):
 
 def test_model_source_requires_revision_and_bucket_forbids_it():
     common = {
-        "arm": "pick-arm", "gripper": "pick-gripper", "fixed_camera": "scene-cam",
-        "wrist_camera": "wrist-cam", "server_uri": "ws://127.0.0.1:8000", "prompt": "pick",
+        "arm": "pick-arm",
+        "gripper": "pick-gripper",
+        "fixed_camera": "scene-cam",
+        "wrist_camera": "wrist-cam",
+        "server_uri": "ws://127.0.0.1:8000",
+        "prompt": "pick",
     }
     with pytest.raises(ValueError, match="model_revision"):
         Policy.validate_config(_config({**common, "model_source": "owner/policy"}))
     with pytest.raises(ValueError, match="forbidden"):
-        Policy.validate_config(_config({**common, "model_source": "bucket:owner/policy:export", "model_revision": "a" * 40}))
+        Policy.validate_config(
+            _config(
+                {
+                    **common,
+                    "model_source": "bucket:owner/policy:export",
+                    "model_revision": "a" * 40,
+                }
+            )
+        )
+
+
 @pytest.mark.parametrize("autoclose", [False, True])
 def test_reconfigure_only_stops_policy_server_when_configured(
     tmp_path, monkeypatch, autoclose
@@ -538,7 +574,6 @@ def test_close_only_stops_policy_server_when_configured(autoclose):
     asyncio.run(scenario())
 
 
-
 def test_contract_selects_matching_profile_and_rejects_wrong_joint_order(tmp_path):
     path, contract, profile = _write_contract(tmp_path, "lite6")
     loaded, selected = _read_policy_contract(str(path))
@@ -552,6 +587,22 @@ def test_contract_selects_matching_profile_and_rejects_wrong_joint_order(tmp_pat
     )
     path.write_text(json.dumps(contract))
     with pytest.raises(ValueError, match="action schema"):
+        _read_policy_contract(str(path))
+
+
+def test_contract_accepts_dynamic_rate_and_rejects_rate_disagreement(tmp_path):
+    path, contract, _ = _write_contract(tmp_path, "lite6", fps=15.0)
+    loaded, _ = _read_policy_contract(str(path))
+    assert loaded.action_schema.fps == 15.0
+    assert loaded.conditioning_fps == 15.0
+
+    policy = Policy("rate")
+    policy._config._contract = loaded
+    assert policy._period_s == pytest.approx(1.0 / 15.0)
+
+    contract["conditioning_fps"] = 20.0
+    path.write_text(json.dumps(contract))
+    with pytest.raises(ValueError, match="action_schema.fps"):
         _read_policy_contract(str(path))
 
 
@@ -588,6 +639,7 @@ def test_arm_observation_uses_standard_degree_api():
         assert observation["observation/joint_position"] == pytest.approx(expected)
 
     asyncio.run(scenario())
+
 
 def test_observation_uses_configured_second_fixed_camera():
     async def scenario():

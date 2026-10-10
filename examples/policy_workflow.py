@@ -320,14 +320,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--max-chunks must be in [1, 100]")
     if args.action_prefix_steps is not None and not 1 <= args.action_prefix_steps <= 32:
         parser.error("--action-prefix-steps must be in [1, 32]")
-    if args.action_prefix_duration_sec is not None:
-        steps = args.action_prefix_duration_sec * 20.0
-        if not 0.05 <= args.action_prefix_duration_sec <= 1.6 or not math.isclose(
-            steps, round(steps), abs_tol=1e-9
-        ):
-            parser.error(
-                "--action-prefix-duration-sec must be a 20 Hz duration in [0.05, 1.6]"
-            )
+    if (
+        args.action_prefix_duration_sec is not None
+        and args.action_prefix_duration_sec <= 0
+    ):
+        parser.error("--action-prefix-duration-sec must be positive")
     if args.deadline_tolerance_sec is not None and args.deadline_tolerance_sec <= 0:
         parser.error("--deadline-tolerance-sec must be positive")
     if args.gripper_settle_sec < 0:

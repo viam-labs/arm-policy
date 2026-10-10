@@ -74,8 +74,6 @@ def get_attrs(config: ComponentConfig) -> dict[str, Any]:
 
 
 ACTION_SHAPE = (32, 7)
-CONTROL_HZ = 20.0
-PERIOD_S = 1.0 / CONTROL_HZ
 CAMERA_KEYS = (
     "observation.images.wrist_image_left",
     "observation.images.exterior_image_1_left",
@@ -90,7 +88,6 @@ FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 PositiveFiniteFloat = Annotated[float, Field(gt=0, allow_inf_nan=False)]
 UnitFloat = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 NonEmptyStr = Annotated[str, StringConstraints(min_length=1)]
-PinnedControlHz = Annotated[float, Field(ge=20.0, le=20.0, allow_inf_nan=False)]
 BinaryFloat = Annotated[
     float, Field(ge=0.0, le=1.0, multiple_of=1.0, allow_inf_nan=False)
 ]
@@ -123,7 +120,7 @@ class ContractActionSchema(BaseModel):
     shape: tuple[Literal[7]]
     names: tuple[str, ...]
     units: tuple[str, ...]
-    fps: Literal[20]
+    fps: PositiveFiniteFloat
     gripper_convention: Literal["0=open, 1=closed"]
 
 
@@ -163,8 +160,14 @@ class PolicyContract(BaseModel):
     framework: ContractFramework
     transform: ContractTransform
     action_chunk_size: Literal[32]
-    conditioning_fps: PinnedControlHz
+    conditioning_fps: PositiveFiniteFloat
     domain_name: NonEmptyStr
+
+    @model_validator(mode="after")
+    def validate_rate(self) -> Self:
+        if self.action_schema.fps != self.conditioning_fps:
+            raise ValueError("action_schema.fps must equal conditioning_fps")
+        return self
 
 
 class Config(BaseModel):
@@ -184,7 +187,6 @@ class Config(BaseModel):
 
     # Fixed by the checkpoint.
     action_chunk_size: Literal[32] = 32
-    control_hz: PinnedControlHz = 20.0
     fixed_camera_width: Literal[1280] = 1280
     fixed_camera_height: Literal[720] = 720
     wrist_camera_width: Literal[640] = 640
@@ -243,33 +245,67 @@ class Config(BaseModel):
             validate_data_root(self.model_data_root)
         if self.hf_token is not None and not self.hf_token.strip():
             raise ValueError("hf_token must not be empty")
-        if not self.policy_server_host or any(char.isspace() for char in self.policy_server_host):
-            raise ValueError("policy_server_host must be a non-empty hostname or IP address")
+        if not self.policy_server_host or any(
+            char.isspace() for char in self.policy_server_host
+        ):
+            raise ValueError(
+                "policy_server_host must be a non-empty hostname or IP address"
+            )
         if (self.workspace_task_min_m is None) != (self.workspace_task_max_m is None):
-            raise ValueError("workspace_task_min_m and workspace_task_max_m must be set together")
-        if self.workspace_task_min_m is not None and self.workspace_task_max_m is not None:
-            if any(low >= high for low, high in zip(self.workspace_task_min_m, self.workspace_task_max_m)):
+            raise ValueError(
+                "workspace_task_min_m and workspace_task_max_m must be set together"
+            )
+        if (
+            self.workspace_task_min_m is not None
+            and self.workspace_task_max_m is not None
+        ):
+            if any(
+                low >= high
+                for low, high in zip(
+                    self.workspace_task_min_m, self.workspace_task_max_m
+                )
+            ):
                 raise ValueError("workspace task minimums must be below maximums")
         if not self.binary_gripper_open_threshold < self.binary_gripper_close_threshold:
-            raise ValueError("binary gripper thresholds must satisfy 0 <= open < close <= 1")
-        if self.action_prefix_steps is not None and self.action_prefix_duration_sec is not None:
-            raise ValueError("set only one of action_prefix_steps and action_prefix_duration_sec")
-        if self.action_prefix_duration_sec is not None:
-            _prefix_steps_from_duration(self.action_prefix_duration_sec)
+            raise ValueError(
+                "binary gripper thresholds must satisfy 0 <= open < close <= 1"
+            )
+        if (
+            self.action_prefix_steps is not None
+            and self.action_prefix_duration_sec is not None
+        ):
+            raise ValueError(
+                "set only one of action_prefix_steps and action_prefix_duration_sec"
+            )
         return self
 
-    def validate_contract(self, contract: PolicyContract, profile: SafetyProfile) -> None:
-        pinned_scalars = {"max_reach_m": profile.max_reach_m, "workspace_floor_m": profile.workspace_floor_m, "tcp_offset_m": profile.tcp_offset_m}
+    def validate_contract(
+        self, contract: PolicyContract, profile: SafetyProfile
+    ) -> None:
+        pinned_scalars = {
+            "max_reach_m": profile.max_reach_m,
+            "workspace_floor_m": profile.workspace_floor_m,
+            "tcp_offset_m": profile.tcp_offset_m,
+        }
         for key, expected in pinned_scalars.items():
             if (value := getattr(self, key)) is not None and value != expected:
                 raise ValueError(f"{key} is fixed by safety profile {profile.name}")
-        pinned_vectors = {"joint_min_radians": profile.joint_min, "joint_max_radians": profile.joint_max, "velocity_limits_rad_s": profile.velocity_limits, "acceleration_limits_rad_s2": profile.acceleration_limits}
+        pinned_vectors = {
+            "joint_min_radians": profile.joint_min,
+            "joint_max_radians": profile.joint_max,
+            "velocity_limits_rad_s": profile.velocity_limits,
+            "acceleration_limits_rad_s2": profile.acceleration_limits,
+        }
         for key, expected in pinned_vectors.items():
             if (value := getattr(self, key)) is not None and value != expected:
                 raise ValueError(f"{key} is fixed by safety profile {profile.name}")
-        expected_gripper_units = "binary" if contract.embodiment.gripper_mode == "binary" else "normalized"
+        expected_gripper_units = (
+            "binary" if contract.embodiment.gripper_mode == "binary" else "normalized"
+        )
         if contract.observation_schema.gripper_units != expected_gripper_units:
-            raise ValueError("observation gripper_units must match embodiment gripper_mode")
+            raise ValueError(
+                "observation gripper_units must match embodiment gripper_mode"
+            )
         self._contract = contract
         self._profile = profile
 
@@ -299,7 +335,10 @@ class Config(BaseModel):
     @property
     def default_prefix_steps(self) -> int:
         if self.action_prefix_duration_sec is not None:
-            return _prefix_steps_from_duration(self.action_prefix_duration_sec)
+            return _prefix_steps_from_duration(
+                self.action_prefix_duration_sec,
+                1.0 / self.contract.conditioning_fps,
+            )
         return self.action_prefix_steps if self.action_prefix_steps is not None else 8
 
     @classmethod
@@ -330,6 +369,7 @@ def _model_data_root(config: Config) -> Path:
         if config.model_data_root is not None
         else default_data_root()
     )
+
 
 class CommandModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -379,14 +419,13 @@ class ExecuteCommand(CommandModel):
             raise ValueError(
                 "set one of action_prefix_steps and action_prefix_duration_sec"
             )
-        if self.action_prefix_duration_sec is not None:
-            _prefix_steps_from_duration(self.action_prefix_duration_sec)
         return self
 
-    @property
-    def prefix_steps(self) -> int:
+    def prefix_steps(self, period_s: float) -> int:
         if self.action_prefix_duration_sec is not None:
-            return _prefix_steps_from_duration(self.action_prefix_duration_sec)
+            return _prefix_steps_from_duration(
+                self.action_prefix_duration_sec, period_s
+            )
         assert self.action_prefix_steps is not None
         return self.action_prefix_steps
 
@@ -669,17 +708,19 @@ def unpack_message(value: bytes) -> Any:
     return msgpack.unpackb(value, object_hook=_unpack_array, raw=False)
 
 
-def _prefix_steps_from_duration(value: Any) -> int:
+def _prefix_steps_from_duration(value: Any, period_s: float) -> int:
     duration = float(value)
-    steps_float = duration / PERIOD_S
+    steps_float = duration / period_s
     steps = round(steps_float)
     if (
         not math.isfinite(duration)
         or not math.isclose(steps_float, steps, abs_tol=1e-9)
         or not 1 <= steps <= ACTION_SHAPE[0]
     ):
+        maximum = ACTION_SHAPE[0] * period_s
         raise ValueError(
-            "action_prefix_duration_sec must be a 20 Hz duration in [0.05, 1.6]"
+            "action_prefix_duration_sec must align with the policy rate and be "
+            f"in [{period_s:g}, {maximum:g}]"
         )
     return steps
 
@@ -730,6 +771,10 @@ class Policy(Generic, EasyResource):
         self._reported_policy_server_failure: tuple[int, str] | None = None
         self._policy_server_credential_values: set[str] = set()
         self._policy_server = PolicyServerSupervisor(default_data_root(), name)
+
+    @property
+    def _period_s(self) -> float:
+        return 1.0 / self._config.contract.conditioning_fps
 
     def _detach_policy_server_watcher(self) -> None:
         self._policy_server_watch_generation += 1
@@ -810,7 +855,9 @@ class Policy(Generic, EasyResource):
             return Path(self._config.policy_contract_path).expanduser()
         record_path = self._matching_model_record()
         if record_path is None:
-            raise ValueError("configured model_source has not been downloaded and validated")
+            raise ValueError(
+                "configured model_source has not been downloaded and validated"
+            )
         return record_path / "policy_contract.json"
 
     def _advance_readiness(self) -> bool:
@@ -833,7 +880,10 @@ class Policy(Generic, EasyResource):
 
     def _require_ready(self) -> None:
         if not self._advance_readiness():
-            raise RuntimeError("policy contract is not ready: " f"{self._readiness_error}; configure a valid policy_contract_path or download the configured model_source")
+            raise RuntimeError(
+                "policy contract is not ready: "
+                f"{self._readiness_error}; configure a valid policy_contract_path or download the configured model_source"
+            )
 
     def _idle_status(self) -> RunStatus:
         return RunStatus(
@@ -960,8 +1010,7 @@ class Policy(Generic, EasyResource):
         joint_values = results[-2]
         gripper_inputs = results[-1]
         if any(
-            len(images) != 1
-            for images in (fixed_images, wrist_images, fixed_2_images)
+            len(images) != 1 for images in (fixed_images, wrist_images, fixed_2_images)
         ):
             raise ValueError("policy cameras must each return exactly one image")
         joints = np.asarray(joint_values, dtype=np.float32)
@@ -1014,7 +1063,9 @@ class Policy(Generic, EasyResource):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"{label} timed out")
-                done, _ = await asyncio.wait((task,), timeout=min(PERIOD_S, remaining))
+                done, _ = await asyncio.wait(
+                    (task,), timeout=min(self._period_s, remaining)
+                )
                 if done:
                     return task.result()
                 if await self._cancelled(operation, generation):
@@ -1035,7 +1086,7 @@ class Policy(Generic, EasyResource):
                 if remaining <= 0:
                     raise TimeoutError("policy server receive timed out")
                 done, _ = await asyncio.wait(
-                    (receive,), timeout=min(PERIOD_S, remaining)
+                    (receive,), timeout=min(self._period_s, remaining)
                 )
                 if done:
                     return receive.result()
@@ -1128,13 +1179,13 @@ class Policy(Generic, EasyResource):
         for index, action in enumerate(actions):
             joints = action[:6]
             if dynamics:
-                velocity = np.abs(joints - previous) / PERIOD_S
+                velocity = np.abs(joints - previous) / self._period_s
                 if np.any(velocity > velocity_limits + 1e-9):
                     raise ValueError(
                         f"action {index} exceeds {profile.arm_model} joint velocity limits"
                     )
                 acceleration = np.abs(joints - 2.0 * previous + previous_previous) / (
-                    PERIOD_S * PERIOD_S
+                    self._period_s * self._period_s
                 )
                 if np.any(acceleration > acceleration_limits + 1e-9):
                     raise ValueError(
@@ -1236,10 +1287,10 @@ class Policy(Generic, EasyResource):
         diagnostics: dict[str, Any] = {
             "algorithm": algorithm,
             "version": version,
-            "control_hz": CONTROL_HZ,
+            "control_hz": self._config.contract.conditioning_fps,
             "raw_steps": int(raw_actions.shape[0]),
             "raw_metrics": {
-                **trajectory_metrics(raw_actions, history, PERIOD_S),
+                **trajectory_metrics(raw_actions, history, self._period_s),
                 "workspace": self._workspace_metrics(raw_actions),
             },
             "selected_profile": self._config.profile.name,
@@ -1252,8 +1303,8 @@ class Policy(Generic, EasyResource):
                 self._config.profile.acceleration_limits
             ),
             "selected_prefix_steps": prefix,
-            "selected_prefix_duration_s": prefix * PERIOD_S,
-            "observation_age_at_prefix_end_s": prefix * PERIOD_S,
+            "selected_prefix_duration_s": prefix * self._period_s,
+            "observation_age_at_prefix_end_s": prefix * self._period_s,
             "rejection_reason": "",
         }
         self._status.conditioning[-1] = _value_types(diagnostics)
@@ -1265,13 +1316,13 @@ class Policy(Generic, EasyResource):
                 else condition_trajectory
             )
             actions, raw_diagnostics = conditioner(
-                raw_actions, history, self._config.profile, period_s=PERIOD_S
+                raw_actions, history, self._config.profile, period_s=self._period_s
             )
         except ValueError as exc:
             if conditioner_algorithm != "toppra":
                 raise
             actions, raw_diagnostics = condition_trajectory(
-                raw_actions, history, self._config.profile, period_s=PERIOD_S
+                raw_actions, history, self._config.profile, period_s=self._period_s
             )
             raw_diagnostics = {
                 **dict(raw_diagnostics),
@@ -1297,7 +1348,7 @@ class Policy(Generic, EasyResource):
             "workspace": self._workspace_metrics(actions),
         }
         diagnostics["selected_prefix_steps"] = prefix
-        diagnostics["selected_prefix_duration_s"] = prefix * PERIOD_S
+        diagnostics["selected_prefix_duration_s"] = prefix * self._period_s
         diagnostics["validation_scope"] = "selected_conditioned_prefix"
         try:
             self._validate_actions(actions, history, dynamics=True)
@@ -1324,8 +1375,10 @@ class Policy(Generic, EasyResource):
         else:
             diagnostics["prefix_truncation_reason"] = ""
         diagnostics["validated_prefix_steps"] = validated_prefix
-        diagnostics["validated_prefix_duration_s"] = validated_prefix * PERIOD_S
-        diagnostics["observation_age_at_prefix_end_s"] = validated_prefix * PERIOD_S
+        diagnostics["validated_prefix_duration_s"] = validated_prefix * self._period_s
+        diagnostics["observation_age_at_prefix_end_s"] = (
+            validated_prefix * self._period_s
+        )
         diagnostics["rejection_reason"] = ""
         self._status.conditioned_action_chunks.append(actions.tolist())
         self._status.conditioning[-1] = _value_types(diagnostics)
@@ -1344,7 +1397,7 @@ class Policy(Generic, EasyResource):
             ]
             points.extend(
                 trajectory_point(
-                    time=timedelta(seconds=(index + 1) * PERIOD_S),
+                    time=timedelta(seconds=(index + 1) * self._period_s),
                     positions=[math.degrees(float(value)) for value in action[:6]],
                 )
                 for index, action in enumerate(actions)
@@ -1365,7 +1418,7 @@ class Policy(Generic, EasyResource):
     ) -> list[float]:
         lateness_samples: list[float] = []
         for action_index, action in enumerate(actions):
-            deadline = prefix_started + action_index * PERIOD_S
+            deadline = prefix_started + action_index * self._period_s
             delay = deadline - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
@@ -1381,7 +1434,7 @@ class Policy(Generic, EasyResource):
                 self._gripper.do_command(
                     {"command": "set_input", "value": float(action[6])}
                 ),
-                PERIOD_S + deadline_tolerance,
+                self._period_s + deadline_tolerance,
                 operation,
                 generation,
                 "gripper target dispatch",
@@ -1413,7 +1466,7 @@ class Policy(Generic, EasyResource):
         selected, desired = self._binary_prefix(actions)
         await self._wait_cancellable(
             self._stream_arm_prefix(selected, current_joints),
-            len(selected) * PERIOD_S + self._config.connect_timeout_sec,
+            len(selected) * self._period_s + self._config.connect_timeout_sec,
             operation,
             generation,
             "binary gripper approach trajectory",
@@ -1481,7 +1534,7 @@ class Policy(Generic, EasyResource):
                     deadline_tolerance,
                 ),
             ),
-            len(actions) * PERIOD_S + self._config.connect_timeout_sec,
+            len(actions) * self._period_s + self._config.connect_timeout_sec,
             operation,
             generation,
             "trajectory dispatch",
@@ -1550,8 +1603,8 @@ class Policy(Generic, EasyResource):
                 if older.shape != (6,) or not np.isfinite(older).all():
                     raise ValueError("arm returned invalid first measured joint sample")
                 await self._wait_cancellable(
-                    asyncio.sleep(PERIOD_S),
-                    PERIOD_S + deadline_tolerance,
+                    asyncio.sleep(self._period_s),
+                    self._period_s + deadline_tolerance,
                     operation,
                     generation,
                     "joint history sampling",
@@ -1734,7 +1787,7 @@ class Policy(Generic, EasyResource):
         self._require_ready()
         prompt = command.prompt
         max_chunks = command.max_chunks
-        prefix = command.prefix_steps
+        prefix = command.prefix_steps(self._period_s)
         conditioner_algorithm = command.conditioner_algorithm
         deadline_tolerance = command.deadline_tolerance_sec
         progress_prop = command.progress_prop
@@ -1833,7 +1886,9 @@ class Policy(Generic, EasyResource):
             self._config.policy_server_port,
         )
         if self._config.model_source is None:
-            raise NotImplementedError("policy_server start requires configured model_source")
+            raise NotImplementedError(
+                "policy_server start requires configured model_source"
+            )
         source = parse_model_source(self._config.model_source)
         record = await asyncio.to_thread(
             self._require_model_store().get,

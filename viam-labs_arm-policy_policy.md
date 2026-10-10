@@ -77,9 +77,11 @@ The persistent store is `<data-root>/arm-policy-models/...`. A directory is disc
 Readiness verifies the selected safety contract, not the current integrity of model weights or other payload files; it trusts their validation at publication. Full offline bundle hashing remains in `models/list`, download cache/publication validation, and managed `policy_server` startup. Use `models/list` to audit local payload integrity. An explicit `policy_contract_path` still bypasses store discovery and is parsed and safety-validated directly.
 
 Arm joint observations always come from `GetJointPositions`, and validated arm
-prefixes always use `MoveThroughJointPositionsStreamed`. Gripper behavior comes
-from `embodiment.gripper_mode` in the policy contract, not from the execution
-environment. `position` grippers receive normalized targets at 20 Hz.
+prefixes always use `MoveThroughJointPositionsStreamed`. The command path
+selects binary or continuous gripper behavior exclusively from
+`embodiment.gripper_mode` in the policy contract, not from the execution
+environment. `position` grippers receive normalized targets at the contract's
+`action_schema.fps` cadence.
 
 `binary` grippers expose last-commanded `0`/`1` state. The runner applies
 hysteresis to policy output and truncates the current arm prefix at the first
@@ -92,7 +94,13 @@ dispatch, with the maximum projection recorded in conditioning diagnostics.
 Trajectory conditioning interpolates the gripper signal over retimed samples;
 TOPPRA constraints apply only to the six arm joints.
 
-The current contracts require a 32x7 action chunk at 20 Hz. Supported embodiments are Lite6 with `lite6_gripper` and UR20 with `robotiq_2f_85`. Safety profiles pin joint order, units, limits, FK, reach, floor, and TCP offset; configuration cannot weaken them.
+Current contracts require a 32x7 action chunk. `action_schema.fps` must equal
+`conditioning_fps`; the runner derives trajectory conditioning, safety
+derivatives, prefix durations, dispatch deadlines, and policy-server
+conditioning from that rate. Supported embodiments are Lite6 with
+`lite6_gripper` and UR20 with `robotiq_2f_85`. Safety profiles pin joint order,
+units, limits, FK, reach, floor, and TCP offset; configuration cannot weaken
+them.
 
 ## Commands
 
