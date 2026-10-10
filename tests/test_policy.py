@@ -141,6 +141,7 @@ class FakePolicy(Policy, register=False):
         self._arm = arm or FakeArm()
         self._gripper = gripper or FakeGripper()
         self._fixed_camera = FakeCamera(_image(1280, 720, (1, 2, 3)))
+        self._fixed_camera_2 = None
         self._wrist_camera = FakeCamera(_image(640, 480, (4, 5, 6)))
         self.socket = FakeSocket(response, block)
         self._config.server_uri = "ws://policy.test"
@@ -585,6 +586,26 @@ def test_arm_observation_uses_standard_degree_api():
         observation = await policy._observation("pick")
 
         assert observation["observation/joint_position"] == pytest.approx(expected)
+
+    asyncio.run(scenario())
+
+def test_observation_uses_configured_second_fixed_camera():
+    async def scenario():
+        policy = FakePolicy(b"")
+        policy._fixed_camera_2 = FakeCamera(_image(1280, 720, (7, 8, 9)))
+
+        observation = await policy._observation("pick")
+
+        assert tuple(observation["observation/exterior_image_1_left"][0, 0]) == (
+            1,
+            2,
+            3,
+        )
+        assert tuple(observation["observation/exterior_image_2_left"][0, 0]) == (
+            7,
+            8,
+            9,
+        )
 
     asyncio.run(scenario())
 

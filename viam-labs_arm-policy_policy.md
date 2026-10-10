@@ -12,6 +12,7 @@ The inference server is an optional module-owned subprocess. On its first `polic
   "arm": "pick-arm",
   "gripper": "pick-gripper",
   "fixed_camera": "scene-cam",
+  "fixed_camera_2": "third-cam",
   "wrist_camera": "wrist-cam",
   "server_uri": "ws://127.0.0.1:8000",
   "prompt": "Pick up the block",
@@ -39,6 +40,7 @@ The inference server is an optional module-owned subprocess. On its first `polic
 | Name | Default | Description |
 |---|---:|---|
 | `world` | — | Optional Generic world resource. Required only when an execute command sets `progress_prop`. |
+| `fixed_camera_2` | `""` | Optional second 1280x720 fixed camera. When set, it supplies `exterior_image_2_left`; when empty, `fixed_camera` supplies both exterior views for compatibility with two-camera policies. |
 | `conditioner_algorithm` | `quintic` | `quintic` or `toppra`. |
 | `max_chunks` | `1` | Receding-horizon chunks per execution, from 1 through 100. |
 | `action_prefix_steps` | `8` | Steps executed from each conditioned chunk, from 1 through 32. Mutually exclusive with duration. |

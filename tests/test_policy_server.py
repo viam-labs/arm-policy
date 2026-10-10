@@ -497,6 +497,7 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
             arm="arm",
             gripper="gripper",
             fixed_camera="fixed",
+            fixed_camera_2="",
             wrist_camera="wrist",
             hf_token=None,
             model_data_root=str(tmp_path),

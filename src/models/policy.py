@@ -176,6 +176,7 @@ class Config(BaseModel):
     arm: NonEmptyStr
     gripper: NonEmptyStr
     fixed_camera: NonEmptyStr
+    fixed_camera_2: str = ""
     wrist_camera: NonEmptyStr
     server_uri: WebsocketUrl
     prompt: Prompt
@@ -283,6 +284,8 @@ class Config(BaseModel):
     @property
     def dependencies(self) -> tuple[str, ...]:
         required = (self.arm, self.gripper, self.fixed_camera, self.wrist_camera)
+        if self.fixed_camera_2:
+            required = (*required, self.fixed_camera_2)
         return (self.world, *required) if self.world is not None else required
 
     @property
@@ -306,6 +309,7 @@ class Config(BaseModel):
             arm="",
             gripper="",
             fixed_camera="",
+            fixed_camera_2="",
             wrist_camera="",
             server_uri="",
             prompt="",
@@ -707,6 +711,7 @@ class Policy(Generic, EasyResource):
         self._arm: Arm
         self._gripper: Gripper
         self._fixed_camera: Camera
+        self._fixed_camera_2: Camera | None = None
         self._wrist_camera: Camera
         self._config = Config._unconfigured()
         self._binary_gripper_state = 0.0
@@ -882,6 +887,13 @@ class Policy(Generic, EasyResource):
         self._fixed_camera = self._dependency(
             dependencies, Camera, parsed.fixed_camera, "fixed camera"
         )
+        self._fixed_camera_2 = (
+            self._dependency(
+                dependencies, Camera, parsed.fixed_camera_2, "second fixed camera"
+            )
+            if parsed.fixed_camera_2
+            else None
+        )
         self._wrist_camera = self._dependency(
             dependencies, Camera, parsed.wrist_camera, "wrist camera"
         )
@@ -929,15 +941,28 @@ class Policy(Generic, EasyResource):
         return [float(value) for value in await self._gripper.get_current_inputs()]
 
     async def _observation(self, prompt: str) -> dict[str, Any]:
-        fixed_result, wrist_result, joint_values, gripper_inputs = await asyncio.gather(
+        camera_requests = [
             self._fixed_camera.get_images(),
             self._wrist_camera.get_images(),
+        ]
+        if self._fixed_camera_2 is not None:
+            camera_requests.append(self._fixed_camera_2.get_images())
+        results = await asyncio.gather(
+            *camera_requests,
             self._joint_radians(),
             self._gripper_input(),
         )
-        fixed_images, _ = fixed_result
-        wrist_images, _ = wrist_result
-        if len(fixed_images) != 1 or len(wrist_images) != 1:
+        fixed_images, _ = results[0]
+        wrist_images, _ = results[1]
+        fixed_2_images = (
+            results[2][0] if self._fixed_camera_2 is not None else fixed_images
+        )
+        joint_values = results[-2]
+        gripper_inputs = results[-1]
+        if any(
+            len(images) != 1
+            for images in (fixed_images, wrist_images, fixed_2_images)
+        ):
             raise ValueError("policy cameras must each return exactly one image")
         joints = np.asarray(joint_values, dtype=np.float32)
         if joints.shape != (6,) or not np.isfinite(joints).all():
@@ -952,6 +977,9 @@ class Policy(Generic, EasyResource):
         fixed = self._decode_image(
             fixed_images[0], self._config.fixed_camera_size, "fixed camera"
         )
+        fixed_2 = self._decode_image(
+            fixed_2_images[0], self._config.fixed_camera_size, "second fixed camera"
+        )
         wrist = self._decode_image(
             wrist_images[0], self._config.wrist_camera_size, "wrist camera"
         )
@@ -959,7 +987,7 @@ class Policy(Generic, EasyResource):
             "prompt": prompt,
             "observation/wrist_image_left": wrist,
             "observation/exterior_image_1_left": fixed,
-            "observation/exterior_image_2_left": fixed,
+            "observation/exterior_image_2_left": fixed_2,
             "observation/joint_position": joints,
             "observation/gripper_position": gripper,
         }
