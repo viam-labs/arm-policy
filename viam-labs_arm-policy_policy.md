@@ -176,6 +176,7 @@ python3 examples/policy_workflow.py <machine-address> \
 
 The workflow homes the Lite6 to `[0, 0, 90, 0, 90, 0]` degrees and opens the
 gripper unless `--no-setup` is set. Pass `--world sim-world` to additionally
-reset the simulated prop; omit it for physical execution or an already-prepared
+sample a deterministic block pose from `--seed` and apply it with the world's
+`set_prop_pose` command; omit it for physical execution or an already-prepared
 scene. `--progress-prop` independently enables world-backed prop pose diagnostics
 and therefore requires the policy component to configure a world.

@@ -10,6 +10,7 @@ import asyncio
 import json
 import math
 import os
+import random
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
@@ -26,12 +27,14 @@ PICK_REGION_MAX_M = (0.38, 0.12, 0.0)
 PICK_YAW_RANGE_DEG = (-180.0, 180.0)
 WORLD_FRAME = "world"
 DEFAULT_GRIPPER_SETTLE_SEC = 3.0
+PICK_BLOCK_WIDTH_M = 0.075
+PICK_BLOCK_DEPTH_M = 0.015
+PICK_BLOCK_HEIGHT_M = 0.025
+
 
 def policy_arm_model(status: Mapping[str, Any]) -> str:
     embodiment = status.get("embodiment")
-    arm_model = (
-        embodiment.get("arm_model") if isinstance(embodiment, Mapping) else None
-    )
+    arm_model = embodiment.get("arm_model") if isinstance(embodiment, Mapping) else None
     if isinstance(arm_model, str) and arm_model:
         return arm_model
     state = status.get("state", "unknown")
@@ -75,6 +78,40 @@ async def _arm_base_pose(machine: Any, arm_frame: str) -> Pose:
     return pose
 
 
+def sample_prop_pose(
+    seed: int, region: Mapping[str, Sequence[float]]
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """Sample a deterministic block pose contained within a support region."""
+    region_min = tuple(float(value) for value in region["min"])
+    region_max = tuple(float(value) for value in region["max"])
+    if len(region_min) != 3 or len(region_max) != 3:
+        raise ValueError("pick region bounds must each contain three values")
+    rng = random.Random(seed)
+    yaw_deg = rng.uniform(*PICK_YAW_RANGE_DEG)
+    yaw_rad = math.radians(yaw_deg)
+    half_x = (
+        abs(math.cos(yaw_rad)) * PICK_BLOCK_WIDTH_M
+        + abs(math.sin(yaw_rad)) * PICK_BLOCK_DEPTH_M
+    ) / 2.0
+    half_y = (
+        abs(math.sin(yaw_rad)) * PICK_BLOCK_WIDTH_M
+        + abs(math.cos(yaw_rad)) * PICK_BLOCK_DEPTH_M
+    ) / 2.0
+    x_min, x_max = region_min[0] + half_x, region_max[0] - half_x
+    y_min, y_max = region_min[1] + half_y, region_max[1] - half_y
+    if x_min > x_max or y_min > y_max:
+        raise ValueError(f"pick region cannot contain the block at yaw {yaw_deg}")
+    half_yaw = yaw_rad / 2.0
+    return (
+        (
+            rng.uniform(x_min, x_max),
+            rng.uniform(y_min, y_max),
+            region_min[2] + PICK_BLOCK_HEIGHT_M / 2.0,
+        ),
+        (math.cos(half_yaw), 0.0, 0.0, math.sin(half_yaw)),
+    )
+
+
 async def prepare_lite6_setup(
     machine: Any,
     world: Any | None,
@@ -101,24 +138,25 @@ async def prepare_lite6_setup(
         _arm_base_pose(machine, arm_frame),
         _world_pick_region(machine, arm_frame),
     )
-    reset = await world.do_command(
+    position, orientation = sample_prop_pose(seed, world_region)
+    pose = await world.do_command(
         {
-            "command": "reset_props",
-            "seed": seed,
-            "props": [prop],
-            "region": world_region,
-            "yaw_range_deg": list(PICK_YAW_RANGE_DEG),
+            "command": "set_prop_pose",
+            "prop": prop,
+            "position": list(position),
+            "orientation_wxyz": list(orientation),
         }
     )
-    poses = reset.get("poses")
-    if not isinstance(poses, Mapping) or prop not in poses:
-        raise RuntimeError(f"scene reset did not return pose for {prop!r}")
+    if not isinstance(pose, Mapping) or not all(
+        key in pose for key in ("position", "orientation_wxyz")
+    ):
+        raise RuntimeError(f"scene placement returned no pose for {prop!r}")
     return {
         **robot_setup,
         "scene_reset": True,
-        "seed": int(cast(Any, reset.get("seed", seed))),
+        "seed": seed,
         "prop": prop,
-        "pose": poses[prop],
+        "pose": dict(pose),
         "region": world_region,
         "region_in_arm_frame": {
             "min": list(PICK_REGION_MIN_M),
