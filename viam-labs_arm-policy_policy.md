@@ -128,6 +128,10 @@ Finite policy gripper outputs are saturated to `[0, 1]` before validation and
 dispatch, with the maximum projection recorded in conditioning diagnostics.
 Trajectory conditioning interpolates the gripper signal over retimed samples;
 TOPPRA constraints apply only to the six arm joints.
+Measured joint-history velocity uses monotonic timestamps from the two completed
+`GetJointPositions` calls; camera capture latency is not treated as a fixed-rate
+joint displacement.
+
 
 Current contracts require a 32x7 action chunk. `action_schema.fps` must equal
 `conditioning_fps`; the runner derives trajectory conditioning, safety

@@ -985,6 +985,10 @@ class Policy(Generic, EasyResource):
         positions = await self._arm.get_joint_positions()
         return [math.radians(float(value)) for value in positions.values]
 
+    async def _timed_joint_radians(self) -> tuple[list[float], float]:
+        joints = await self._joint_radians()
+        return joints, time.monotonic()
+
     async def _gripper_input(self) -> list[float]:
         if self._config.contract.embodiment.gripper_mode == "binary":
             return [self._binary_gripper_state]
@@ -999,7 +1003,7 @@ class Policy(Generic, EasyResource):
             camera_requests.append(self._fixed_camera_2.get_images())
         results = await asyncio.gather(
             *camera_requests,
-            self._joint_radians(),
+            self._timed_joint_radians(),
             self._gripper_input(),
         )
         fixed_images, _ = results[0]
@@ -1007,7 +1011,7 @@ class Policy(Generic, EasyResource):
         fixed_2_images = (
             results[2][0] if self._fixed_camera_2 is not None else fixed_images
         )
-        joint_values = results[-2]
+        joint_values, joint_sampled_at = results[-2]
         gripper_inputs = results[-1]
         if any(
             len(images) != 1 for images in (fixed_images, wrist_images, fixed_2_images)
@@ -1039,6 +1043,7 @@ class Policy(Generic, EasyResource):
             "observation/exterior_image_2_left": fixed_2,
             "observation/joint_position": joints,
             "observation/gripper_position": gripper,
+            "_joint_sampled_at_monotonic": joint_sampled_at,
         }
 
     async def _cancelled(self, operation: Any, generation: int) -> bool:
@@ -1592,14 +1597,14 @@ class Policy(Generic, EasyResource):
                 self._status.state = "inferring"
                 self._status.chunk_index = chunk_index
                 self._status.action_index = 0
-                older_values = await self._wait_cancellable(
-                    self._joint_radians(),
+                older_sample, older_sampled_at = await self._wait_cancellable(
+                    self._timed_joint_radians(),
                     self._config.connect_timeout_sec,
                     operation,
                     generation,
                     "first measured joint sample",
                 )
-                older = np.asarray(older_values, dtype=np.float64)
+                older = np.asarray(older_sample, dtype=np.float64)
                 if older.shape != (6,) or not np.isfinite(older).all():
                     raise ValueError("arm returned invalid first measured joint sample")
                 await self._wait_cancellable(
@@ -1616,10 +1621,17 @@ class Policy(Generic, EasyResource):
                     generation,
                     "observation capture",
                 )
+                current_sampled_at = float(
+                    observation.pop("_joint_sampled_at_monotonic")
+                )
                 current = np.asarray(
                     observation["observation/joint_position"], dtype=np.float64
                 )
-                history = [older, current]
+                history_interval = current_sampled_at - older_sampled_at
+                if not math.isfinite(history_interval) or history_interval <= 0:
+                    raise ValueError("joint history sample interval must be positive")
+                measured_velocity = (current - older) / history_interval
+                history = [current - measured_velocity * self._period_s, current]
                 prop_before = None
                 if progress_prop:
                     prop_before = await self._wait_cancellable(
