@@ -27,7 +27,7 @@ def _hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _export(root: Path, *, remote_marker: bool) -> None:
+def _export(root: Path) -> None:
     (root / "runtime" / "vae").mkdir(parents=True)
     (root / "runtime" / "training_config.yaml").write_text("training: fixture\n")
     (root / "runtime" / "vae" / "fixture.bin").write_bytes(b"vae")
@@ -44,29 +44,27 @@ def _export(root: Path, *, remote_marker: bool) -> None:
         "vae": {"path": "runtime/vae/fixture.bin", "sha256": _hash(root / "runtime" / "vae" / "fixture.bin")},
     }
     (root / "runtime_manifest.json").write_text(json.dumps(runtime))
-    if remote_marker:
-        (root / ".cosmos-policy-complete.json").write_text(
-            json.dumps({"schema_version": 1, "repository": "owner/policy", "resolved_revision": COMMIT, "provenance": {"repository": "owner/training", "revision": "b" * 40}})
-        )
 
 
-def _published_export(tmp_path: Path, source_value: str = "model:owner/policy", *, revision: str = COMMIT):
+def _published_export(
+    tmp_path: Path,
+    source_value: str = "model:owner/policy",
+    *,
+    revision: str = COMMIT,
+    resolved_revision: str | None = None,
+):
     store = ModelStore(tmp_path / "persistent")
     source = parse_model_source(source_value)
-    revision = revision if source.kind == "model" else None
-    staging = tmp_path / "staging"
-    _export(staging, remote_marker=source.kind == "model")
-    (staging / "model-00001-of-00001.safetensors").write_bytes(b"weights")
-    remote_marker = None
     if source.kind == "model":
-        remote_path = staging / ".cosmos-policy-complete.json"
-        remote_marker = json.loads(remote_path.read_text())
-        remote_marker["repository"] = source.repository
-        remote_marker["resolved_revision"] = revision
-        remote_path.write_text(json.dumps(remote_marker))
+        resolved_revision = revision if resolved_revision is None else resolved_revision
+    else:
+        revision = resolved_revision = None
+    staging = tmp_path / "staging"
+    _export(staging)
+    (staging / "model-00001-of-00001.safetensors").write_bytes(b"weights")
     target = store._target(source, revision)
     target.parent.mkdir(parents=True, exist_ok=True)
-    record = store._publish(staging, target, source, revision, revision, remote_marker)
+    record = store._publish(staging, target, source, revision, resolved_revision)
     return store, source, record
 
 
@@ -152,8 +150,6 @@ def test_get_requires_exact_model_identity_and_validated_state(tmp_path, field, 
     marker = Path(published.path) / ".complete.json"
     completion = json.loads(marker.read_text())
     completion[field] = value
-    if field == "resolved_revision":
-        completion["remote_completion_marker"]["resolved_revision"] = value
     marker.write_text(json.dumps(completion))
     assert store.get(source, COMMIT) is None
 
@@ -225,7 +221,7 @@ def test_get_requires_lowercase_sha256_digests(tmp_path, name, digest):
     assert store.get(source, COMMIT) is None
 
 
-@pytest.mark.parametrize("field", ["model_source", "requested_revision", "resolved_revision", "validation_state", "hashes", "remote_completion_marker"])
+@pytest.mark.parametrize("field", ["model_source", "requested_revision", "resolved_revision", "validation_state", "hashes"])
 def test_get_rejects_missing_model_completion_fields(tmp_path, field):
     store, source, published = _published_export(tmp_path)
     marker = Path(published.path) / ".complete.json"
@@ -235,34 +231,6 @@ def test_get_rejects_missing_model_completion_fields(tmp_path, field):
     assert store.get(source, COMMIT) is None
 
 
-@pytest.mark.parametrize("remote_marker", [None, [], {}, {"schema_version": 2}])
-def test_get_rejects_malformed_nested_remote_marker(tmp_path, remote_marker):
-    store, source, published = _published_export(tmp_path)
-    marker = Path(published.path) / ".complete.json"
-    completion = json.loads(marker.read_text())
-    completion["remote_completion_marker"] = remote_marker
-    marker.write_text(json.dumps(completion))
-    assert store.get(source, COMMIT) is None
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("schema_version", 2),
-        ("repository", "other/policy"),
-        ("resolved_revision", "b" * 40),
-        ("provenance", None),
-        ("provenance", {"repository": "", "revision": "b" * 40}),
-        ("provenance", {"repository": "owner/training", "revision": "main"}),
-    ],
-)
-def test_get_validates_nested_remote_marker(tmp_path, field, value):
-    store, source, published = _published_export(tmp_path)
-    marker = Path(published.path) / ".complete.json"
-    completion = json.loads(marker.read_text())
-    completion["remote_completion_marker"][field] = value
-    marker.write_text(json.dumps(completion))
-    assert store.get(source, COMMIT) is None
 
 
 @pytest.mark.parametrize("source_value", ["model:owner/policy", "bucket:owner/policy:models/run-1"])
@@ -357,10 +325,78 @@ def test_parse_model_source_rejects_invalid_values(value):
         ModelSource("bucket", "owner/policy", None)
 
 
-def test_model_download_is_atomic_idempotent_and_list_is_offline(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("revision", "uses_refs"), [(COMMIT, False), ("release-1", True)])
+def test_hugging_face_client_resolves_tags_to_commits(monkeypatch, revision, uses_refs):
+    client = model_store.HuggingFaceClient("owner/policy", "secret")
+    requests = []
+    listed = []
+
+    def request(url):
+        requests.append(url)
+        return json.dumps({"tags": [{"name": "release-1", "targetCommit": COMMIT}]}).encode()
+
+    def list_files(commit):
+        listed.append(commit)
+        return ["checkpoint.json"]
+
+    monkeypatch.setattr(client, "_request", request)
+    monkeypatch.setattr(client, "_list_files", list_files)
+    assert client.resolve(revision) == (COMMIT, ["checkpoint.json"])
+    assert any(url.endswith("/refs") for url in requests) is uses_refs
+    assert listed == [COMMIT]
+
+
+def test_hugging_face_client_rejects_missing_tag(monkeypatch):
+    client = model_store.HuggingFaceClient("owner/policy")
+    monkeypatch.setattr(
+        client,
+        "_request",
+        lambda url: json.dumps({"tags": [{"name": "other", "targetCommit": COMMIT}]}).encode(),
+    )
+    with pytest.raises(ValueError, match="existing immutable model tag"):
+        client.resolve("release-1")
+
+
+def test_hugging_face_client_lists_exact_commit_files_with_pagination(monkeypatch):
+    client = model_store.HuggingFaceClient("owner/policy")
+    pages = iter([
+        ([{"type": "directory", "path": "runtime"}, {"type": "file", "path": "checkpoint.json"}], '<https://huggingface.co/next>; rel="next"'),
+        ([{"type": "file", "path": "runtime/vae/model.bin"}], ""),
+    ])
+
+    class Response:
+        def __init__(self, value, link):
+            self.value = value
+            self.headers = {"Link": link}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return json.dumps(self.value).encode()
+
+    monkeypatch.setattr(client, "_open", lambda url: Response(*next(pages)))
+    assert client._list_files(COMMIT) == ["checkpoint.json", "runtime/vae/model.bin"]
+
+
+def test_tagged_model_receipt_records_resolved_commit(tmp_path):
+    store, source, published = _published_export(
+        tmp_path, revision="release-1", resolved_revision=COMMIT
+    )
+    assert published.requested_revision == "release-1"
+    assert published.resolved_revision == COMMIT
+    assert store.get(source, "release-1") == published
+    assert store.list() == [published]
+
+
+@pytest.mark.parametrize("revision", [COMMIT, "release-1"])
+def test_model_download_is_atomic_idempotent_and_list_is_offline(tmp_path, monkeypatch, revision):
     source = tmp_path / "published"
     source.mkdir()
-    _export(source, remote_marker=True)
+    _export(source)
     calls = []
 
     class FakeHub:
@@ -380,20 +416,22 @@ def test_model_download_is_atomic_idempotent_and_list_is_offline(tmp_path, monke
     monkeypatch.setattr(model_store, "HuggingFaceClient", FakeHub)
     store = ModelStore(tmp_path / "persistent")
     model = parse_model_source("owner/policy")
-    first = store.download(model, COMMIT, "secret")
+    first = store.download(model, revision, "secret")
     assert first.response()["model_source"] == "model:owner/policy"
-    assert first.requested_revision == first.resolved_revision == COMMIT
+    assert first.requested_revision == revision
+    assert first.resolved_revision == COMMIT
     assert Path(first.path, ".complete.json").is_file()
-    assert store.download(model, COMMIT, "secret") == first
-    assert calls.count(("resolve", COMMIT)) == 1
+    assert store.download(model, revision, "secret") == first
+    assert calls.count(("resolve", revision)) == 1
     assert [item.response() for item in store.list()] == [first.response()]
-    assert calls.count(("resolve", COMMIT)) == 1
+    assert calls.count(("resolve", revision)) == 1
 
 
-def test_model_download_rejects_unpublished_or_invalid_exports(tmp_path, monkeypatch):
+def test_model_download_rejects_invalid_exports(tmp_path, monkeypatch):
     source = tmp_path / "published"
     source.mkdir()
-    _export(source, remote_marker=False)
+    _export(source)
+    (source / "checkpoint.json").unlink()
 
     class FakeHub:
         def __init__(self, repository, token=None):
@@ -408,7 +446,7 @@ def test_model_download_rejects_unpublished_or_invalid_exports(tmp_path, monkeyp
 
     monkeypatch.setattr(model_store, "HuggingFaceClient", FakeHub)
     store = ModelStore(tmp_path / "persistent")
-    with pytest.raises(ValueError, match="not published"):
+    with pytest.raises(ValueError, match="missing required files"):
         store.download(parse_model_source("model:owner/policy"), COMMIT)
     assert store.list() == []
 
@@ -422,7 +460,7 @@ def test_bucket_preflight_uses_sync_credentials_then_publishes_and_caches_offlin
 ):
     source = tmp_path / "bucket-export"
     source.mkdir()
-    _export(source, remote_marker=False)
+    _export(source)
     calls = []
     monkeypatch.setenv("HF_TOKEN", "inherited-secret")
     monkeypatch.setenv("HUGGINGFACE_HUB_TOKEN", "legacy-secret")
@@ -510,6 +548,7 @@ def test_bucket_invalid_download_is_not_discoverable_and_revisions_are_rejected(
 def test_model_configuration_validation_is_strict(tmp_path):
     assert validate_repository("owner/policy") == "owner/policy"
     assert validate_revision(COMMIT) == COMMIT
+    assert validate_revision("release-1") == "release-1"
     assert validate_data_root(str(tmp_path)) == tmp_path
     with pytest.raises(ValueError):
         validate_repository("owner/policy/extra")

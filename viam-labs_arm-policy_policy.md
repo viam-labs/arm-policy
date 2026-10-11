@@ -57,9 +57,37 @@ The inference server is an optional module-owned subprocess. On its first `polic
 
 ### Downloaded model and server attributes
 
-Set `model_source` to either an HF model source (`owner/name` or `model:owner/name`) or a bucket source (`bucket:owner/name:path/to/export`). Model sources require `model_revision`, an immutable lowercase 40-character commit; bucket sources forbid `model_revision`. `model_data_root` is optional: when omitted the module uses `$VIAM_MODULE_DATA/arm-policy`, then `$XDG_DATA_HOME/arm-policy`, then `~/.local/share/viam/arm-policy`; set it to an absolute persistent directory to override that convention. `hf_token` is optional; `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN` are also supported. A configured `hf_token` is exported as `HF_TOKEN` to the policy-server process for its gated upstream downloads, and is never returned in command responses. `policy_server_host`, `policy_server_port`, and `policy_server_readiness_timeout_sec` select the module-owned server endpoint.
+Set `model_source` to either an HF model repository (`owner/name` or
+`model:owner/name`) or a bucket location
+(`bucket:owner/name:path/to/export`). Model repositories require
+`model_revision`: use a release tag such as the training job name, or the
+lowercase 40-character commit SHA for an untagged revision. Branches such as
+`main` and `master` are rejected. The downloader verifies that a named revision
+is a model tag, resolves it to one commit, and records both the requested tag
+and resolved SHA. Bucket sources forbid `model_revision`.
 
-For example, a bucket-backed component that discovers its contract from the downloaded export is configured as:
+`model_data_root` is optional. When omitted, the module uses
+`$VIAM_MODULE_DATA/arm-policy`, then `$XDG_DATA_HOME/arm-policy`, then
+`~/.local/share/viam/arm-policy`; set it to an absolute persistent directory to
+override that convention. `hf_token` is optional; `HF_TOKEN` and
+`HUGGINGFACE_HUB_TOKEN` are also supported. A configured `hf_token` is exported
+as `HF_TOKEN` to the policy-server process for its gated upstream downloads and
+is never returned in command responses. `policy_server_host`,
+`policy_server_port`, and `policy_server_readiness_timeout_sec` configure the
+module-owned inference process.
+
+For example, download the tagged model produced by the training workflow with:
+
+```json
+{
+  "model_source": "viamrobotics/cosmos-xarm-pick",
+  "model_revision": "1009-new-prompts-20e-10it-m2",
+  "model_data_root": "/var/lib/viam/arm-policy"
+}
+```
+
+For an untagged model commit, set `model_revision` to its exact Hub commit SHA.
+A bucket-backed component remains supported:
 
 ```json
 {
@@ -68,7 +96,14 @@ For example, a bucket-backed component that discovers its contract from the down
 }
 ```
 
-When an explicit contract path is absent, startup and reconfiguration look up only the configured source/revision at its deterministic local store path. They validate the completion metadata's canonical source, revisions, publication state, and hash entries (including the remote publication marker for model sources), then SHA-256-check `policy_contract.json` before parsing it and applying safety-profile validation. This reads only the selected completion metadata and contract: it does not enumerate other exports or read model shards. Each reconfiguration rechecks these files; no discovery result is cached across reconfigurations.
+When an explicit contract path is absent, startup and reconfiguration look up
+only the configured source/revision at its deterministic local store path. They
+validate the local completion receipt's canonical source, requested and resolved
+revisions, and hash entries, then SHA-256-check `policy_contract.json` before
+parsing it and applying safety-profile validation. This reads only the selected
+completion metadata and contract: it does not enumerate other exports or read
+model shards. Each reconfiguration rechecks these files; no discovery result is
+cached across reconfigurations.
 
 The component reports `wait_contract` until a matching published download supplies a valid contract, or until a configured explicit contract becomes valid. `models/download`, `models/list`, and `policy_server` lifecycle commands remain available while waiting. `execute` (including observation, inference, safety validation, and motion) fails closed with the missing or invalid contract reason. A successful download automatically rechecks readiness and changes status to `ready` only after contract and safety-profile validation succeeds.
 
@@ -141,7 +176,9 @@ rejected before dispatch.
 
 ### Model and server management
 
-Download the configured immutable portable export (the response is stable JSON containing repository, requested/resolved revisions, path, and validation state):
+Download the configured portable export. For model repositories, the response
+contains both the requested tag or SHA and its resolved immutable commit, along
+with the validated local path and state:
 
 ```json
 {"command": "models/download"}

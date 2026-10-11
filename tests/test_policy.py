@@ -412,7 +412,7 @@ def test_reconfigure_reads_only_selected_completion_and_contract(tmp_path, monke
     source = parse_model_source("bucket:owner/policy:exports/selected")
     staging = tmp_path / "staging"
     staging.mkdir()
-    _export(staging, remote_marker=False)
+    _export(staging)
     contract_path, _, _ = _write_contract(staging)
     contract_path.replace(staging / "policy_contract.json")
     runtime_path = staging / "runtime_manifest.json"
@@ -506,6 +506,15 @@ def test_model_source_requires_revision_and_bucket_forbids_it():
         "server_uri": "ws://127.0.0.1:8000",
         "prompt": "pick",
     }
+    Policy.validate_config(
+        _config(
+            {
+                **common,
+                "model_source": "viamrobotics/cosmos-xarm-pick",
+                "model_revision": "release-1",
+            }
+        )
+    )
     with pytest.raises(ValueError, match="model_revision"):
         Policy.validate_config(_config({**common, "model_source": "owner/policy"}))
     with pytest.raises(ValueError, match="forbidden"):

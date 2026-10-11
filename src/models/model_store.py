@@ -18,7 +18,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Mapping
 
 _REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
-_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_HASH_LIKE = re.compile(r"^[0-9A-Fa-f]{40}$")
+_TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _REQUIRED_EXPORT_FILES = frozenset(
     {
         "checkpoint.json",
@@ -30,9 +32,6 @@ _REQUIRED_EXPORT_FILES = frozenset(
     }
 )
 
-REMOTE_COMPLETION_MARKER = ".cosmos-policy-complete.json"
-REMOTE_MARKER_SCHEMA_VERSION = 1
-
 
 def validate_repository(value: object) -> str:
     if not isinstance(value, str) or not _REPOSITORY.fullmatch(value):
@@ -41,8 +40,21 @@ def validate_repository(value: object) -> str:
 
 
 def validate_revision(value: object) -> str:
-    if not isinstance(value, str) or not _REVISION.fullmatch(value):
-        raise ValueError("model_revision must be an immutable 40-character lowercase git commit")
+    if not isinstance(value, str) or not (
+        _COMMIT.fullmatch(value)
+        or (
+            _TAG.fullmatch(value)
+            and _HASH_LIKE.fullmatch(value) is None
+            and value not in {"main", "master"}
+        )
+    ):
+        raise ValueError("model_revision must be an immutable tag or 40-character lowercase commit")
+    return value
+
+
+def _validate_commit(value: object) -> str:
+    if not isinstance(value, str) or not _COMMIT.fullmatch(value):
+        raise ValueError("resolved model revision must be a 40-character lowercase commit")
     return value
 
 
@@ -136,27 +148,6 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"invalid required JSON file {path.name}: expected an object")
     return value
-
-def validate_remote_completion_marker(
-    marker: Mapping[str, Any], repository: str, resolved_revision: str
-) -> None:
-    """Reject unpublished, redirected, or provenance-free Hub revisions."""
-    if not isinstance(marker, Mapping):
-        raise ValueError("remote portable export completion marker must be an object")
-    if marker.get("schema_version") != REMOTE_MARKER_SCHEMA_VERSION:
-        raise ValueError("remote portable export completion marker has an unsupported schema")
-    if marker.get("repository") != repository:
-        raise ValueError("remote portable export completion marker repository does not match")
-    if marker.get("resolved_revision") != resolved_revision:
-        raise ValueError("remote portable export completion marker revision does not match")
-    provenance = marker.get("provenance")
-    if not isinstance(provenance, Mapping):
-        raise ValueError("remote portable export completion marker has no provenance")
-    source_repository = provenance.get("repository")
-    source_revision = provenance.get("revision")
-    if not isinstance(source_repository, str) or not source_repository:
-        raise ValueError("remote portable export completion marker provenance repository is invalid")
-    validate_revision(source_revision)
 
 
 def _safe_relative(name: object) -> Path:
@@ -254,23 +245,52 @@ class HuggingFaceClient:
         with self._open(url) as response:
             return response.read()
 
+    def _list_files(self, revision: str) -> list[str]:
+        encoded_repo = urllib.parse.quote(self.repository, safe="/")
+        encoded_revision = urllib.parse.quote(_validate_commit(revision), safe="")
+        url: str | None = (
+            f"https://huggingface.co/api/models/{encoded_repo}/tree/"
+            f"{encoded_revision}?recursive=true&expand=false"
+        )
+        files: list[str] = []
+        while url is not None:
+            with self._open(url) as response:
+                value = json.loads(response.read())
+                link = response.headers.get("Link", "")
+            if not isinstance(value, list):
+                raise ValueError("Hugging Face response did not list repository files")
+            files.extend(
+                _safe_relative(item.get("path")).as_posix()
+                for item in value
+                if isinstance(item, dict) and item.get("type") == "file"
+            )
+            match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            url = match.group(1) if match is not None else None
+        if not files:
+            raise ValueError("Hugging Face repository revision contains no files")
+        return files
+
     def resolve(self, requested_revision: str) -> tuple[str, list[str]]:
         requested_revision = validate_revision(requested_revision)
         encoded_repo = urllib.parse.quote(self.repository, safe="/")
-        encoded_revision = urllib.parse.quote(requested_revision, safe="")
-        value = json.loads(self._request(f"https://huggingface.co/api/models/{encoded_repo}/revision/{encoded_revision}"))
-        resolved = value.get("sha") if isinstance(value, dict) else None
-        if not isinstance(resolved, str) or not _REVISION.fullmatch(resolved):
-            raise ValueError("Hugging Face did not resolve the requested revision to a commit")
-        if resolved != requested_revision:
-            raise ValueError("Hugging Face resolved a different commit than the immutable requested revision")
-        siblings = value.get("siblings")
-        if not isinstance(siblings, list):
-            raise ValueError("Hugging Face response did not list repository files")
-        files = [_safe_relative(item.get("rfilename")).as_posix() for item in siblings if isinstance(item, dict)]
-        if not files:
-            raise ValueError("Hugging Face repository revision contains no files")
-        return resolved, files
+        resolved = requested_revision
+        if _COMMIT.fullmatch(requested_revision) is None:
+            refs = json.loads(
+                self._request(f"https://huggingface.co/api/models/{encoded_repo}/refs")
+            )
+            tags = refs.get("tags") if isinstance(refs, dict) else None
+            if not isinstance(tags, list):
+                raise ValueError("Hugging Face response did not list model tags")
+            matches = [
+                item.get("targetCommit")
+                for item in tags
+                if isinstance(item, dict) and item.get("name") == requested_revision
+            ]
+            if len(matches) != 1:
+                raise ValueError("model_revision must name an existing immutable model tag or commit")
+            resolved = _validate_commit(matches[0])
+        resolved = _validate_commit(resolved)
+        return resolved, self._list_files(resolved)
 
     def download(self, revision: str, name: str, destination: Path) -> None:
         encoded_repo = urllib.parse.quote(self.repository, safe="/")
@@ -319,19 +339,22 @@ class ModelStore:
         target = self._target(source, requested_revision)
         try:
             manifest = _read_json(self._completion(target))
+            resolved_revision = manifest.get("resolved_revision")
             if (
                 manifest.get("model_source") != source.canonical
                 or "requested_revision" not in manifest
                 or "resolved_revision" not in manifest
                 or manifest["requested_revision"] != requested_revision
-                or manifest["resolved_revision"] != requested_revision
                 or manifest.get("validation_state") != "validated"
             ):
                 return None
             if source.kind == "model":
-                validate_remote_completion_marker(
-                    manifest.get("remote_completion_marker"), source.repository, requested_revision
-                )
+                assert requested_revision is not None
+                resolved_revision = _validate_commit(resolved_revision)
+                if _COMMIT.fullmatch(requested_revision) and resolved_revision != requested_revision:
+                    return None
+            elif resolved_revision is not None:
+                return None
             hashes = manifest.get("hashes")
             if (
                 not isinstance(hashes, dict)
@@ -346,7 +369,7 @@ class ModelStore:
                 return None
         except (OSError, ValueError):
             return None
-        return ModelRecord(source, requested_revision, requested_revision, str(target), "validated")
+        return ModelRecord(source, requested_revision, resolved_revision, str(target), "validated")
 
     def _record_if_valid(self, target: Path) -> ModelRecord | None:
         marker = self._completion(target)
@@ -359,10 +382,9 @@ class ModelStore:
             resolved_revision = manifest.get("resolved_revision")
             if source.kind == "model":
                 requested_revision = validate_revision(requested_revision)
-                resolved_revision = validate_revision(resolved_revision)
-                validate_remote_completion_marker(
-                    manifest.get("remote_completion_marker"), source.repository, resolved_revision
-                )
+                resolved_revision = _validate_commit(resolved_revision)
+                if _COMMIT.fullmatch(requested_revision) and resolved_revision != requested_revision:
+                    raise ValueError("model completion revisions conflict")
             elif requested_revision is not None or resolved_revision is not None:
                 raise ValueError("bucket completion manifests cannot have model revisions")
             hashes = validate_portable_export(target)
@@ -447,7 +469,6 @@ class ModelStore:
         source: ModelSource,
         requested_revision: str | None,
         resolved_revision: str | None,
-        remote_marker: Mapping[str, Any] | None = None,
     ) -> ModelRecord:
         hashes = validate_portable_export(staging)
         marker: dict[str, Any] = {
@@ -457,8 +478,6 @@ class ModelStore:
             "validation_state": "validated",
             "hashes": hashes,
         }
-        if remote_marker is not None:
-            marker["remote_completion_marker"] = remote_marker
         self._completion(staging).write_text(
             json.dumps(marker, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
         )
@@ -484,24 +503,20 @@ class ModelStore:
             cached = self._record_if_valid(target)
             if cached is not None:
                 return cached
+            environment: Mapping[str, str] | None = None
             if source.kind == "bucket":
                 environment = self._bucket_environment(token)
                 self._bucket_preflight(source, environment)
             staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
             try:
                 if source.kind == "model":
+                    assert requested_revision is not None
                     client = HuggingFaceClient(source.repository, token)
                     resolved, files = client.resolve(requested_revision)
-                    if REMOTE_COMPLETION_MARKER not in files:
-                        raise ValueError(f"Hugging Face revision is not published: missing {REMOTE_COMPLETION_MARKER}")
-                    remote_marker_path = staging / REMOTE_COMPLETION_MARKER
-                    client.download(resolved, REMOTE_COMPLETION_MARKER, remote_marker_path)
-                    remote_marker = _read_json(remote_marker_path)
-                    validate_remote_completion_marker(remote_marker, source.repository, resolved)
                     for name in files:
-                        if name != REMOTE_COMPLETION_MARKER:
-                            client.download(resolved, name, staging / _safe_relative(name))
-                    return self._publish(staging, target, source, requested_revision, resolved, remote_marker)
+                        client.download(resolved, name, staging / _safe_relative(name))
+                    return self._publish(staging, target, source, requested_revision, resolved)
+                assert environment is not None
                 self._bucket_sync(source, staging, environment)
                 return self._publish(staging, target, source, None, None)
             except Exception:
