@@ -225,3 +225,9 @@ sample a deterministic block pose from `--seed` and apply it with the world's
 `set_prop_pose` command; omit it for physical execution or an already-prepared
 scene. `--progress-prop` independently enables world-backed prop pose diagnostics
 and therefore requires the policy component to configure a world.
+
+Console output is a bounded human-readable summary of setup, effective control
+parameters, terminal outcome, aggregate timing/execution/safety counts, final
+TCP and gripper state, and the output path. `--output` retains the complete JSON
+evidence, including raw and conditioned trajectories and per-chunk diagnostics.
+

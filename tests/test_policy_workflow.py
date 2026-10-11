@@ -11,6 +11,7 @@ from examples.policy_workflow import (
     policy_arm_model,
     prepare_lite6_setup,
     sample_prop_pose,
+    workflow_summary,
 )
 
 
@@ -198,3 +199,80 @@ def test_lite6_scene_setup_rejects_missing_placement_pose():
                 gripper_settle_sec=0.0,
             )
         )
+
+
+def test_workflow_summary_is_bounded_and_reports_run_outcome():
+    args = parse_args(
+        [
+            "machine.example",
+            "--policy",
+            "inline-policy",
+            "--prompt",
+            "Pick up the block",
+            "--max-chunks",
+            "40",
+            "--conditioner-algorithm",
+            "toppra",
+            "--action-prefix-duration-sec",
+            "0.8",
+            "--output",
+            "run.json",
+        ]
+    )
+    before = {
+        "embodiment": {
+            "arm_model": "lite6",
+            "gripper_model": "lite6_gripper",
+            "gripper_mode": "binary",
+        }
+    }
+    setup = {
+        "performed": True,
+        "scene_reset": True,
+        "prop": "pick_block",
+        "seed": 10,
+        "pose": {"position": [0.31, -0.04, 0.0125]},
+    }
+    result = {
+        **before,
+        "state": "failed",
+        "error": "ValueError: action 0 TCP is below workspace floor",
+        "safety_profile": "lite6-integrated-gripper-sim-v2",
+        "conditioner_algorithm": "toppra",
+        "prompt": "Pick up the block",
+        "started_at": "2026-10-10T17:05:29+00:00",
+        "finished_at": "2026-10-10T17:06:43+00:00",
+        "inference_responses": 21,
+        "inference_ms": [2100.0, 2200.0],
+        "executed_prefixes": 20,
+        "actions_executed": 315,
+        "conditioning": [
+            {
+                "raw_metrics": {
+                    "workspace": {
+                        "tcp_min_m": [0.1, 0.0, 0.03],
+                        "minimum_floor_margin_m": 0.01,
+                    }
+                },
+                "deferred_horizon_rejection_reason": "below floor",
+                "prefix_truncation_reason": "below floor",
+                "fallback_reason": "TOPPRA dynamic limit",
+            }
+        ],
+        "progress": [
+            {"tcp_position_m": [0.2, 0.0, 0.38], "gripper_position": 0.0},
+            {"tcp_position_m": [0.3, 0.0, 0.021], "gripper_position": 0.0},
+        ],
+        "actuation_timing": [{"barrier_transition": 0}],
+    }
+
+    summary = workflow_summary(args, before, setup, result)
+    lines = summary.splitlines()
+
+    assert 10 <= len(lines) <= 30
+    assert "Result:     FAILED after 74.0 s" in summary
+    assert "Inference:  21 responses; mean=2.15 s" in summary
+    assert "Execution:  20 prefixes; 315 action points" in summary
+    assert "minimum measured margin=0.0010 m" in summary
+    assert "Output:     run.json" in summary
+    assert "raw_action_chunks" not in summary

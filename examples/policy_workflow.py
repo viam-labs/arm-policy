@@ -11,6 +11,7 @@ import json
 import math
 import os
 import random
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence, cast
 
@@ -179,6 +180,184 @@ async def prepare_lite6_setup(
     }
 
 
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _vector(value: Any) -> str:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return "unavailable"
+    try:
+        return "[" + ", ".join(f"{float(item):.3f}" for item in value) + "]"
+    except (TypeError, ValueError):
+        return "unavailable"
+
+
+def _run_duration(result: Mapping[str, Any]) -> str:
+    try:
+        started = datetime.fromisoformat(str(result["started_at"]))
+        finished = datetime.fromisoformat(str(result["finished_at"]))
+    except (KeyError, TypeError, ValueError):
+        return "unknown duration"
+    return f"{max(0.0, (finished - started).total_seconds()):.1f} s"
+
+
+def _workspace_floor(conditioning: Any) -> float | None:
+    if not isinstance(conditioning, Sequence):
+        return None
+    for entry in conditioning:
+        workspace = _mapping(
+            _mapping(_mapping(entry).get("raw_metrics")).get("workspace")
+        )
+        tcp_min = workspace.get("tcp_min_m")
+        margin = workspace.get("minimum_floor_margin_m")
+        if (
+            isinstance(tcp_min, Sequence)
+            and len(tcp_min) == 3
+            and isinstance(margin, (int, float))
+        ):
+            return float(tcp_min[2]) - float(margin)
+    return None
+
+
+def workflow_summary(
+    args: argparse.Namespace,
+    before: Mapping[str, Any],
+    setup: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> str:
+    """Render bounded human-readable output; full evidence remains in --output."""
+    embodiment = _mapping(result.get("embodiment") or before.get("embodiment"))
+    arm_model = embodiment.get("arm_model", "unknown")
+    gripper_model = embodiment.get("gripper_model", "unknown")
+    gripper_mode = result.get("gripper_mode", embodiment.get("gripper_mode", "unknown"))
+    conditioning = result.get("conditioning")
+    condition_entries = (
+        [entry for entry in conditioning if isinstance(entry, Mapping)]
+        if isinstance(conditioning, Sequence)
+        else []
+    )
+    floor = _workspace_floor(condition_entries)
+    safety = str(result.get("safety_profile", before.get("safety_profile", "unknown")))
+    if floor is not None:
+        safety += f"; floor={floor:.3f} m"
+
+    lines = [
+        "Policy workflow",
+        f"  Machine:    {args.address}",
+        f"  Policy:     {args.policy}",
+        f"  Embodiment: {arm_model} + {gripper_model} ({gripper_mode})",
+        f"  Safety:     {safety}",
+        "",
+        "Setup",
+    ]
+    if setup.get("performed"):
+        lines.append("  Robot:      homed; gripper opened")
+    else:
+        lines.append("  Robot:      skipped (--no-setup)")
+    if setup.get("scene_reset"):
+        lines.append(
+            f"  Scene:      {setup.get('prop', args.prop)} placed with seed {setup.get('seed', args.seed)}"
+        )
+        lines.append(
+            f"  Block pose: {_vector(_mapping(setup.get('pose')).get('position'))} m"
+        )
+    else:
+        lines.append("  Scene:      unchanged")
+
+    prefix = (
+        f"prefix={args.action_prefix_duration_sec:.2f} s"
+        if args.action_prefix_duration_sec is not None
+        else f"prefix={args.action_prefix_steps} steps"
+        if args.action_prefix_steps is not None
+        else "prefix=component default"
+    )
+    started_at = str(result.get("started_at", "unknown"))
+    lines.extend(
+        [
+            "",
+            "Run",
+            f"  Prompt:     {result.get('prompt') or args.prompt or '(component default)'}",
+            f"  Control:    {result.get('conditioner_algorithm', args.conditioner_algorithm)}; {prefix}; max_chunks={args.max_chunks}",
+            f"  Started:    {started_at}",
+            f"  Result:     {str(result.get('state', 'unknown')).upper()} after {_run_duration(result)}",
+        ]
+    )
+    error = result.get("error")
+    if error:
+        lines.append(f"  Error:      {error}")
+
+    inference_ms = result.get("inference_ms")
+    inference_values = (
+        [float(value) for value in inference_ms]
+        if isinstance(inference_ms, Sequence)
+        else []
+    )
+    mean_inference = (
+        f"; mean={sum(inference_values) / len(inference_values) / 1000.0:.2f} s"
+        if inference_values
+        else ""
+    )
+    deferred = sum(
+        bool(entry.get("deferred_horizon_rejection_reason"))
+        for entry in condition_entries
+    )
+    truncated = sum(
+        bool(entry.get("prefix_truncation_reason")) for entry in condition_entries
+    )
+    fallbacks = sum(bool(entry.get("fallback_reason")) for entry in condition_entries)
+    progress = result.get("progress")
+    progress_entries = (
+        [entry for entry in progress if isinstance(entry, Mapping)]
+        if isinstance(progress, Sequence)
+        else []
+    )
+    tcp_z = [
+        float(position[2])
+        for entry in progress_entries
+        if isinstance((position := entry.get("tcp_position_m")), Sequence)
+        and len(position) == 3
+    ]
+    final_progress = progress_entries[-1] if progress_entries else {}
+    final_gripper = final_progress.get("gripper_position")
+    gripper_state = (
+        "closed"
+        if isinstance(final_gripper, (int, float)) and float(final_gripper) >= 0.5
+        else "open"
+        if isinstance(final_gripper, (int, float))
+        else "unknown"
+    )
+    timing = result.get("actuation_timing")
+    timing_entries = (
+        [entry for entry in timing if isinstance(entry, Mapping)]
+        if isinstance(timing, Sequence)
+        else []
+    )
+    transitions = sum(
+        entry.get("barrier_transition") in ("open", "grab") for entry in timing_entries
+    )
+    lines.extend(
+        [
+            "",
+            "Summary",
+            f"  Inference:  {int(cast(Any, result.get('inference_responses', 0)))} responses{mean_inference}",
+            f"  Execution:  {int(cast(Any, result.get('executed_prefixes', 0)))} prefixes; {int(cast(Any, result.get('actions_executed', 0)))} action points",
+            f"  Safety:     {deferred} deferred unsafe horizons; {truncated} truncated prefixes; {fallbacks} conditioner fallbacks",
+        ]
+    )
+    if tcp_z:
+        tcp_detail = f"final z={tcp_z[-1]:.4f} m; minimum measured z={min(tcp_z):.4f} m"
+        if floor is not None:
+            tcp_detail = f"final z={tcp_z[-1]:.4f} m; minimum measured margin={min(tcp_z) - floor:.4f} m"
+        lines.append(f"  TCP:        {tcp_detail}")
+    lines.append(f"  Gripper:    {transitions} transitions; final={gripper_state}")
+    prop_position = final_progress.get("prop_position_m")
+    if prop_position is not None:
+        lines.append(f"  Block final:{_vector(prop_position)} m")
+    lines.append(f"  Output:     {args.output or 'not written (--output omitted)'}")
+    return "\n".join(lines)
+
+
 async def run(args: argparse.Namespace) -> Mapping[str, Any]:
     api_key = os.environ.get("VIAM_API_KEY")
     api_key_id = os.environ.get("VIAM_API_KEY_ID")
@@ -196,7 +375,6 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
     async with await RobotClient.at_address(args.address, options) as machine:
         policy = Generic.from_robot(machine, args.policy)
         before = await policy.do_command({"command": "status"})
-        print(json.dumps({"before": before}, indent=2, sort_keys=True))
         setup: Mapping[str, Any] = {"performed": False}
         if not args.no_setup:
             arm_model = policy_arm_model(before)
@@ -219,7 +397,6 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 gripper_settle_sec=args.gripper_settle_sec,
                 prop=args.prop,
             )
-            print(json.dumps({"setup": setup}, indent=2, sort_keys=True))
         command: dict[str, Any] = {
             "command": "execute",
             "max_chunks": args.max_chunks,
@@ -250,7 +427,7 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
             output.write_text(
                 json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
-        print(json.dumps(evidence, indent=2, sort_keys=True))
+        print(workflow_summary(args, before, setup, result))
         completed = (
             result.get("state") == "completed"
             and int(cast(Any, result.get("chunks_inferred", 0))) > 0
