@@ -413,6 +413,134 @@ def test_bucket_source_waits_for_contract_and_download_advances_readiness(
     asyncio.run(scenario())
 
 
+def _deployed_attrs(model_path: str) -> dict[str, str]:
+    return {
+        "arm": "pick-arm",
+        "gripper": "pick-gripper",
+        "fixed_camera": "scene-cam",
+        "wrist_camera": "wrist-cam",
+        "server_uri": "ws://127.0.0.1:8000",
+        "prompt": "pick",
+        "model_path": model_path,
+    }
+
+
+def test_model_path_config_is_absolute_and_exclusive_with_model_source(tmp_path):
+    attrs = _deployed_attrs(str(tmp_path / "package"))
+    Policy.validate_config(_config(attrs))
+    with pytest.raises(ValueError, match="absolute path"):
+        Policy.validate_config(_config({**attrs, "model_path": "relative/package"}))
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Policy.validate_config(
+            _config({**attrs, "model_source": "bucket:owner/policy:export"})
+        )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        Policy.validate_config(
+            _config(
+                {
+                    **attrs,
+                    "model_source": "owner/policy",
+                    "model_revision": "release-1",
+                }
+            )
+        )
+    with pytest.raises(ValueError, match="model_revision requires"):
+        Policy.validate_config(_config({**attrs, "model_revision": "a" * 40}))
+
+
+def test_deployed_model_path_waits_for_package_then_starts_server_without_download(
+    tmp_path, monkeypatch
+):
+    _, contract, _ = _write_contract(tmp_path)
+    package = tmp_path / "package"
+    attrs = _deployed_attrs(str(package))
+    policy = Policy("policy")
+    monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
+
+    def no_store():
+        raise AssertionError("a deployed model_path must not use the model store")
+
+    monkeypatch.setattr(policy, "_require_model_store", no_store)
+    policy.reconfigure(_config(attrs), {})
+    assert policy._status.state == "wait_contract"
+
+    package.mkdir()
+    _export(package)
+    (package / "policy_contract.json").write_text(json.dumps(contract))
+    runtime_path = package / "runtime_manifest.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["policy_contract"]["sha256"] = model_store._sha256(
+        package / "policy_contract.json"
+    )
+    runtime_path.write_text(json.dumps(runtime))
+    started = []
+    monkeypatch.setattr(
+        policy._policy_server,
+        "start",
+        lambda command, *args: started.append(command) or {"pid": 1},
+    )
+
+    async def scenario():
+        assert (await policy.do_command({"command": "status"}))["state"] == "ready"
+        with pytest.raises(ValueError, match="viam-server deploys"):
+            await policy.do_command({"command": "models/download"})
+        await policy.do_command({"command": "policy_server", "action": "start"})
+        assert str(package) in started[0]
+        (package / "runtime" / "training_config.yaml").write_text("tampered\n")
+        with pytest.raises(ValueError, match="checksum failed"):
+            await policy.do_command({"command": "policy_server", "action": "start"})
+        assert len(started) == 1
+
+    asyncio.run(scenario())
+
+
+def test_hf_token_env_names_a_variable_and_is_read_at_use(tmp_path, monkeypatch):
+    attrs = {
+        "arm": "pick-arm",
+        "gripper": "pick-gripper",
+        "fixed_camera": "scene-cam",
+        "wrist_camera": "wrist-cam",
+        "server_uri": "ws://127.0.0.1:8000",
+        "prompt": "pick",
+        "model_source": "bucket:owner/policy:exports/latest",
+        "model_data_root": str(tmp_path),
+    }
+    Policy.validate_config(_config({**attrs, "hf_token_env": "HF_TOKEN"}))
+    for value in ("hf_" + "a1B2" * 9, "HF TOKEN", "", "1TOKEN"):
+        with pytest.raises(ValueError, match="hf_token_env must name"):
+            Policy.validate_config(_config({**attrs, "hf_token_env": value}))
+    with pytest.raises(ValueError, match="hf_token"):
+        Policy.validate_config(_config({**attrs, "hf_token": "hf_abcdefghijklmnop"}))
+
+    tokens = []
+
+    class Store:
+        def get(self, source, revision=None):
+            return None
+
+        def download(self, source, revision, token):
+            tokens.append(token)
+            raise ValueError("stop after token capture")
+
+    policy = Policy("policy")
+    monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
+    monkeypatch.setattr(policy, "_require_model_store", lambda: Store())
+    monkeypatch.delenv("ARM_POLICY_TEST_HF_TOKEN", raising=False)
+    policy.reconfigure(
+        _config({**attrs, "hf_token_env": "ARM_POLICY_TEST_HF_TOKEN"}), {}
+    )
+
+    async def scenario():
+        with pytest.raises(ValueError, match="ARM_POLICY_TEST_HF_TOKEN, which is unset"):
+            await policy.do_command({"command": "models/download"})
+        monkeypatch.setenv("ARM_POLICY_TEST_HF_TOKEN", "secret-from-env")
+        with pytest.raises(ValueError, match="token capture"):
+            await policy.do_command({"command": "models/download"})
+
+    asyncio.run(scenario())
+    assert tokens == ["secret-from-env"]
+
+
 def test_reconfigure_reads_only_selected_completion_and_contract(tmp_path, monkeypatch):
     store = ModelStore(tmp_path)
     source = parse_model_source("bucket:owner/policy:exports/selected")

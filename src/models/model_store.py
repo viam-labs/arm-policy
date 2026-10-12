@@ -169,8 +169,21 @@ def _export_hashes(root: Path, hashes: dict[str, str] | None = None) -> dict[str
     return hashes
 
 
-def validate_portable_export(root: Path) -> dict[str, str]:
-    """Validate the portable bundle shape and its runtime artifact digests."""
+def validate_model_path(value: object) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("model_path must be a non-empty absolute path")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError("model_path must be an absolute path")
+    return path
+
+
+def validate_runtime_manifest(root: Path) -> dict[str, str]:
+    """Validate the bundle shape and digests of the runtime manifest entries only.
+
+    Unlike :func:`validate_portable_export`, this does not hash model weights,
+    so it is cheap enough for every server start of a Viam-deployed package.
+    """
     missing = sorted(name for name in _REQUIRED_EXPORT_FILES if not (root / name).is_file())
     if missing:
         raise ValueError(f"portable export is missing required files: {', '.join(missing)}")
@@ -200,7 +213,12 @@ def validate_portable_export(root: Path) -> dict[str, str]:
             hashes[name] = _sha256(actual)
         if entry.get("sha256") != hashes[name]:
             raise ValueError(f"portable export runtime checksum failed for {field}")
-    return _export_hashes(root, hashes)
+    return hashes
+
+
+def validate_portable_export(root: Path) -> dict[str, str]:
+    """Validate the portable bundle shape and its runtime artifact digests."""
+    return _export_hashes(root, validate_runtime_manifest(root))
 
 
 @dataclass(frozen=True)
@@ -236,7 +254,7 @@ class HuggingFaceClient:
         try:
             return urllib.request.urlopen(request, timeout=60)
         except urllib.error.HTTPError as exc:
-            auth = " (check HF_TOKEN/HUGGINGFACE_HUB_TOKEN or configured hf_token)" if exc.code in (401, 403) else ""
+            auth = " (check HF_TOKEN/HUGGINGFACE_HUB_TOKEN or the variable named by hf_token_env)" if exc.code in (401, 403) else ""
             raise ValueError(f"Hugging Face request failed ({exc.code}){auth}: {url}") from exc
         except OSError as exc:
             raise ValueError(f"cannot contact Hugging Face: {exc}") from exc
@@ -424,7 +442,7 @@ class ModelStore:
             ) from exc
         if result.returncode:
             detail = f"{result.stdout}\n{result.stderr}".casefold()
-            credentials = "check configured hf_token or HF_TOKEN/HUGGINGFACE_HUB_TOKEN"
+            credentials = "check the variable named by hf_token_env or HF_TOKEN/HUGGINGFACE_HUB_TOKEN"
             if any(marker in detail for marker in ("401", "403", "unauthorized", "forbidden", "access denied", "permission denied")):
                 raise ValueError(
                     f"Hugging Face bucket preflight access denied for {source.canonical}; {credentials}"

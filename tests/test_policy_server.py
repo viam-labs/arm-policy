@@ -211,7 +211,8 @@ def test_policy_logs_redacted_startup_failure(tmp_path, monkeypatch):
         policy._policy_server = PolicyServerSupervisor(tmp_path, "startup-log")
         logger = CapturingLogger()
         monkeypatch.setattr(policy, "logger", logger)
-        policy._config.hf_token = "configured-secret"
+        monkeypatch.setenv("ARM_POLICY_TEST_HF_TOKEN", "configured-secret")
+        policy._config.hf_token_env = "ARM_POLICY_TEST_HF_TOKEN"
         policy._config.policy_server_port = _free_port()
         model = tmp_path / "model"
         model.mkdir()
@@ -499,7 +500,7 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
             fixed_camera="fixed",
             fixed_camera_2="",
             wrist_camera="wrist",
-            hf_token=None,
+            hf_token_env=None,
             model_data_root=str(tmp_path),
             policy_server_autoclose=False,
             binary_gripper_initial_state=0.0,

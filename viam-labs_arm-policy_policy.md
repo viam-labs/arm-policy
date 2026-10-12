@@ -33,7 +33,7 @@ The inference server is an optional module-owned subprocess. On its first `polic
 | `wrist_camera` | string | Camera returning exactly one 640x480 image. |
 | `server_uri` | string | `ws://` or `wss://` OpenPI policy-server endpoint. |
 | `prompt` | string | Non-empty default task prompt. |
-| `policy_contract_path` | string | Optional local path to a schema-version-3 `policy_contract.json`. Required unless `model_source` is set. When omitted, the component uses `policy_contract.json` from the matching validated download. |
+| `policy_contract_path` | string | Optional local path to a schema-version-3 `policy_contract.json`. Required unless `model_path` or `model_source` is set. When omitted, the component uses `policy_contract.json` from the deployed `model_path` package or the matching validated download. |
 
 ### Optional attributes
 
@@ -55,6 +55,51 @@ The inference server is an optional module-owned subprocess. On its first `polic
 | `binary_gripper_settle_sec` | `3` | Cancellable wait after each nonblocking `Open` or `Grab` command. |
 | `policy_server_autoclose` | `false` | Stop the managed policy-server process during component reconfiguration or close. Leave disabled to preserve the server across arm-policy and `viam-server` restarts. |
 
+### Model sources
+
+Configure at most one of `model_path` (a Viam registry package, recommended) or
+`model_source` (a Hugging Face download). Setting both is a configuration error.
+
+### Viam-deployed model
+
+Upload the portable export (the directory containing `policy_contract.json`,
+`runtime_manifest.json`, `model.safetensors.index.json`, and its shards) to the
+Viam registry as an `ml_model` package, add it to the machine's `packages`, and
+point `model_path` at it. viam-server downloads, versions, and syncs the
+package; the module does not download model weights itself.
+
+```json
+{
+  "packages": [
+    {
+      "name": "cosmos-xarm-pick",
+      "package": "<org-id>/cosmos-xarm-pick",
+      "type": "ml_model",
+      "version": "latest"
+    }
+  ],
+  "components": [
+    {
+      "name": "policy",
+      "model": "viam-labs:arm-policy:policy",
+      "attributes": {
+        "model_path": "${packages.ml_model.cosmos-xarm-pick}",
+        "...": "..."
+      }
+    }
+  ]
+}
+```
+
+`model_path` must resolve to an absolute directory and cannot be combined with
+`model_source` or `model_revision`. Startup and reconfiguration read only
+`<model_path>/policy_contract.json`; the component reports `wait_contract` until
+viam-server has finished deploying the package and the contract passes contract
+and safety-profile validation. `models/download` is rejected for a `model_path`
+component. `policy_server start` validates the export's required files and
+runtime-manifest checksums (without hashing weight shards) and launches the
+server directly from the package directory.
+
 ### Downloaded model and server attributes
 
 Set `model_source` to either an HF model repository (`owner/name` or
@@ -69,10 +114,20 @@ and resolved SHA. Bucket sources forbid `model_revision`.
 `model_data_root` is optional. When omitted, the module uses
 `$VIAM_MODULE_DATA/arm-policy`, then `$XDG_DATA_HOME/arm-policy`, then
 `~/.local/share/viam/arm-policy`; set it to an absolute persistent directory to
-override that convention. `hf_token` is optional; `HF_TOKEN` and
-`HUGGINGFACE_HUB_TOKEN` are also supported. A configured `hf_token` is exported
-as `HF_TOKEN` to the policy-server process for its gated upstream downloads and
-is never returned in command responses. `policy_server_host`,
+override that convention.
+
+`hf_token_env` is optional and holds the *name* of an environment variable that
+contains a Hugging Face token, never the token itself, because machine configs
+are readable by anyone with fleet access. Set the variable in the module's `env`
+(or the host environment) and reference it, for example
+`"hf_token_env": "HF_TOKEN"`. Values that are not valid variable names, or that
+look like a Hugging Face token, are rejected. The variable is read when it is
+used: `models/download` and `policy_server start` fail with a clear error if it
+is unset or empty. Without `hf_token_env`, `HF_TOKEN` and
+`HUGGINGFACE_HUB_TOKEN` are still honored for downloads. The token is exported
+as `HF_TOKEN` to the policy-server process for its gated upstream downloads
+(needed even with `model_path`), is redacted from server log tails, and is never
+returned in command responses. `policy_server_host`,
 `policy_server_port`, and `policy_server_readiness_timeout_sec` configure the
 module-owned inference process.
 
@@ -188,7 +243,7 @@ with the validated local path and state:
 {"command": "models/download"}
 ```
 
-For an uncached bucket source, download first lists the exact configured bucket prefix using the same Hugging Face CLI credentials as the transfer. Access denial, a missing or empty prefix, or a connection failure is returned to the caller before staging or transferring the export. A configured `hf_token` takes precedence; otherwise the CLI retains its inherited environment and saved-login behavior. The preflight is a non-recursive listing; sync performs its own transfer enumeration. Already validated cached downloads remain offline and skip this check.
+For an uncached bucket source, download first lists the exact configured bucket prefix using the same Hugging Face CLI credentials as the transfer. Access denial, a missing or empty prefix, or a connection failure is returned to the caller before staging or transferring the export. A token from `hf_token_env` takes precedence; otherwise the CLI retains its inherited environment and saved-login behavior. The preflight is a non-recursive listing; sync performs its own transfer enumeration. Already validated cached downloads remain offline and skip this check.
 
 List only locally complete, hash-validated downloads. This command is offline and makes no Hugging Face request:
 
@@ -198,7 +253,7 @@ List only locally complete, hash-validated downloads. This command is offline an
 
 Start the isolated pinned-Cosmos server for a validated model. The first start requires network access and substantial disk space while the pinned upstream CUDA 13 policy-server environment is provisioned; later starts reuse it. Start is idempotent and waits for HTTP `GET /healthz` on the configured host and port to return status 200 with body `OK\n`, so its readiness timeout must cover first-time provisioning. The bounded health request checks server responsiveness without opening a WebSocket or running inference. Readiness failures include the log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
 
-Server startup resolves the configured `model_source` and `model_revision` directly and trusts the completion receipt created by atomic publication. It verifies the receipt identity and safety-contract hash without traversing or hashing model weights and runtime payloads. A missing or invalid receipt or changed contract prevents startup; payload loading errors remain the policy server's responsibility. `models/list` retains exhaustive store-wide validation.
+With `model_path`, server startup validates the deployed package as described above. With `model_source`, server startup resolves the configured `model_source` and `model_revision` directly and trusts the completion receipt created by atomic publication. It verifies the receipt identity and safety-contract hash without traversing or hashing model weights and runtime payloads. A missing or invalid receipt or changed contract prevents startup; payload loading errors remain the policy server's responsibility. `models/list` retains exhaustive store-wide validation.
 
 ```json
 {"command": "policy_server", "action": "start"}
