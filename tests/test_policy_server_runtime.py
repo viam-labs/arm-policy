@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -147,3 +148,42 @@ def test_runtime_command_uses_module_python_for_lightweight_provisioner(tmp_path
         "--port",
         "8000",
     ]
+
+
+def _contract():
+    return {
+        "action_chunk_size": 32,
+        "action_schema": {"shape": [7]},
+        "conditioning_fps": 15.0,
+        "domain_name": "droid_lerobot",
+        "framework": {"action_space": "joint_pos", "use_state": True},
+        "transform": {"format_prompt_as_json": True, "resolution": "480"},
+    }
+
+
+def test_server_command_passes_the_trained_camera_composite_size(tmp_path):
+    meta = tmp_path / "runtime/dataset/meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text(
+        json.dumps(
+            {
+                "features": {
+                    "observation.images.wrist_image_left": {"shape": [480, 640, 3]},
+                    "observation.images.exterior_image_1_left": {"shape": [720, 1280, 3]},
+                }
+            }
+        )
+    )
+    command = service_adapter.PortableRobolabPolicyService.command(
+        model_view=tmp_path, contract=_contract(), host="127.0.0.1", port=8000
+    )
+    height = command.index("--image-height")
+    assert command[height : height + 4] == ["--image-height", "720", "--image-width", "640"]
+
+
+def test_server_command_keeps_upstream_image_size_without_dataset_info(tmp_path):
+    command = service_adapter.PortableRobolabPolicyService.command(
+        model_view=tmp_path, contract=_contract(), host="127.0.0.1", port=8000
+    )
+    assert "--image-height" not in command
+    assert "--image-width" not in command
