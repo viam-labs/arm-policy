@@ -147,3 +147,44 @@ def test_runtime_command_uses_module_python_for_lightweight_provisioner(tmp_path
         "--port",
         "8000",
     ]
+
+
+def _contract():
+    return {
+        "action_schema": {"shape": [7]},
+        "framework": {"action_space": "joint_pos", "use_state": True},
+        "transform": {"resolution": "480", "format_prompt_as_json": True},
+        "domain_name": "droid_lerobot",
+        "action_chunk_size": 32,
+        "conditioning_fps": 15.0,
+    }
+
+
+def test_server_command_defaults_to_training_composite_size(tmp_path, monkeypatch):
+    monkeypatch.setattr(service_adapter, "_override_args", lambda: [])
+    command = service_adapter.PortableRobolabPolicyService.command(
+        model_view=tmp_path, contract=_contract(), host="127.0.0.1", port=8000
+    )
+    assert command[command.index("--image-height") + 1] == "720"
+    assert command[command.index("--image-width") + 1] == "640"
+
+
+def test_server_command_override_file_wins_over_default_size(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        service_adapter, "_override_args", lambda: ["--image-height", "540", "--image-width", "640"]
+    )
+    command = service_adapter.PortableRobolabPolicyService.command(
+        model_view=tmp_path, contract=_contract(), host="127.0.0.1", port=8000
+    )
+    assert command.count("--image-height") == 1
+    assert command[command.index("--image-height") + 1] == "540"
+
+
+def test_override_file_is_read_from_the_runtime_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(service_adapter, "__file__", str(tmp_path / "service_adapter.py"))
+    assert service_adapter._override_args() == []
+    (tmp_path / "server_overrides.json").write_text('{"args": ["--num-steps", "8"]}')
+    assert service_adapter._override_args() == ["--num-steps", "8"]
+    (tmp_path / "server_overrides.json").write_text('{"args": "bad"}')
+    with pytest.raises(SystemExit):
+        service_adapter._override_args()

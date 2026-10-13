@@ -118,6 +118,26 @@ def _override_args() -> list[str]:
     return list(args)
 
 
+# arm-policy captures a 640x480 wrist image and two 1280x720 fixed images; the Cosmos
+# composite stacks the wrist view over the two exteriors at half size, so the training
+# input is 720x640 (3/2 x wrist height, wrist width). Upstream defaults to 540x640, which
+# resamples the composite into a different aspect bucket than training.
+TRAINING_COMPOSITE_HEIGHT = 720
+TRAINING_COMPOSITE_WIDTH = 640
+
+
+def _image_size_args(overrides: list[str]) -> list[str]:
+    """Pass the training composite size unless an override already sets it."""
+    if "--image-height" in overrides or "--image-width" in overrides:
+        return []
+    return [
+        "--image-height",
+        str(TRAINING_COMPOSITE_HEIGHT),
+        "--image-width",
+        str(TRAINING_COMPOSITE_WIDTH),
+    ]
+
+
 class PortableRobolabPolicyService:
     @staticmethod
     def command(
@@ -131,6 +151,7 @@ class PortableRobolabPolicyService:
         action = contract["action_schema"]
         framework = contract["framework"]
         transform = contract.get("transform", {})
+        overrides = _override_args()
         contract_path = model_view / "policy_contract.runtime.json"
         contract_path.write_text(json.dumps(contract, sort_keys=True) + "\n", encoding="utf-8")
         return [
@@ -143,7 +164,8 @@ class PortableRobolabPolicyService:
             "--resolution", str(transform.get("resolution", "720p")),
             "--guidance", "3.0", "--guidance-interval", "960", "1001", "--num-steps", "4", "--shift", "5.0",
             "--use-state" if framework["use_state"] else "--no-use-state",
-            *_override_args(),
+            *_image_size_args(overrides),
+            *overrides,
         ]
 
 
