@@ -49,7 +49,7 @@ def _deployed_export(root: Path) -> Path:
     return root
 
 
-def test_runtime_manifest_validation_hashes_only_manifest_entries(tmp_path, monkeypatch):
+def test_runtime_manifest_validation_hashes_only_small_manifest_entries(tmp_path, monkeypatch):
     root = _deployed_export(tmp_path / "package")
     hashed = []
     original = model_export._sha256
@@ -62,16 +62,16 @@ def test_runtime_manifest_validation_hashes_only_manifest_entries(tmp_path, monk
     assert set(hashes) == {
         "runtime/training_config.yaml",
         "policy_contract.json",
-        "runtime/vae/fixture.bin",
     }
     assert "model-00001-of-00001.safetensors" not in hashed
+    assert "fixture.bin" not in hashed
 
 
 @pytest.mark.parametrize(
     "mutation, error",
     [
         (lambda root: (root / "config.json").unlink(), "missing required files"),
-        (lambda root: (root / "runtime" / "vae" / "fixture.bin").write_bytes(b"x"), "checksum failed for vae"),
+        (lambda root: (root / "runtime" / "vae" / "fixture.bin").unlink(), "missing for vae"),
         (lambda root: (root / "policy_contract.json").write_text(json.dumps({"schema_version": 3, "x": 1})), "checksum failed for policy_contract"),
         (lambda root: (root / "checkpoint.json").write_text("{}"), "does not reference"),
         (lambda root: (root / "export_manifest.json").write_text("{}"), "revisions conflict"),
@@ -114,7 +114,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-assert os.environ.get("HF_TOKEN") == "server-secret"
+assert os.environ.get("POLICY_SERVER_FIXTURE") == "server-env"
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -140,7 +140,7 @@ while True:
         "127.0.0.1",
         port,
         3,
-        {"HF_TOKEN": "server-secret"},
+        {"POLICY_SERVER_FIXTURE": "server-env"},
     )
     assert started["state"] == "healthy"
     assert supervisor.start([sys.executable, "-c", program], "127.0.0.1", port, 3)["idempotent"]

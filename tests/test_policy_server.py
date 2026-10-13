@@ -56,12 +56,18 @@ class CapturingLogger:
 
 
 class CapturingSupervisor:
-    def __init__(self):
+    def __init__(self, serves_other=False):
         self.commands = []
+        self.models = []
+        self._serves_other = serves_other
 
-    def start(self, command, host, port, readiness_timeout, environment=None):
+    def start(self, command, host, port, readiness_timeout, environment=None, model=None):
         self.commands.append(command)
+        self.models.append(model)
         return {"state": "healthy", "pid": 123}
+
+    def serves_other(self, model, host, port):
+        return self._serves_other
 
     def poll_failure(self):
         return None
@@ -150,9 +156,7 @@ def test_startup_exit_includes_status_and_redacts_credentials(tmp_path, monkeypa
         "print('Authorization: Bearer hf_abcdefghijklmnopqrstuvwxyz'); "
         "raise SystemExit(23)"
     )
-    supervisor = PolicyServerSupervisor(
-        tmp_path, "startup", credential_values=("configured-secret",)
-    )
+    supervisor = PolicyServerSupervisor(tmp_path, "startup")
 
     with pytest.raises(RuntimeError) as exc_info:
         supervisor.start(
@@ -172,8 +176,8 @@ def test_startup_exit_includes_status_and_redacts_credentials(tmp_path, monkeypa
 
 
 def test_tail_discards_a_leading_partial_credential_line(tmp_path):
-    secret = "configured-secret"
-    supervisor = PolicyServerSupervisor(tmp_path, "partial", credential_values=(secret,))
+    secret = "token=configured-secret"
+    supervisor = PolicyServerSupervisor(tmp_path, "partial")
     supervisor.root.mkdir(parents=True)
     safe_line = b"\ncomplete final line\n"
     trailing = (
@@ -185,7 +189,7 @@ def test_tail_discards_a_leading_partial_credential_line(tmp_path):
     supervisor.log_path.write_bytes(
         b"previous line\n"
         + secret.encode()
-        + (b"x" * trailing)
+        + (b" " * trailing)
         + safe_line
     )
 
@@ -196,14 +200,17 @@ def test_tail_discards_a_leading_partial_credential_line(tmp_path):
 
 
 def test_redacted_tail_remains_bounded(tmp_path):
-    supervisor = PolicyServerSupervisor(tmp_path, "bounded", credential_values=("a",))
+    supervisor = PolicyServerSupervisor(tmp_path, "bounded")
     supervisor.root.mkdir(parents=True)
-    supervisor.log_path.write_bytes(b"a" * policy_server_module._TAIL_BYTES)
+    line = b"token=a\n"
+    supervisor.log_path.write_bytes(
+        line * (policy_server_module._TAIL_BYTES // len(line))
+    )
 
     tail = supervisor._log_tail()
 
     assert len(tail) == policy_server_module._TAIL_BYTES
-    assert "a" not in tail
+    assert "=a" not in tail
 
 def test_policy_logs_redacted_startup_failure(tmp_path, monkeypatch):
     async def scenario():
@@ -324,8 +331,28 @@ def test_deployed_start_leaves_weight_loading_to_the_server(tmp_path, mutation):
     assert len(supervisor.commands) == 1
 
 
-@pytest.mark.parametrize("payload", ["policy_contract.json", "runtime/vae/fixture.bin", "checkpoint.json"])
-@pytest.mark.parametrize("mutation", ["tampered", "missing"])
+def test_deployed_start_does_not_hash_vae(tmp_path):
+    target = _deployed_export(tmp_path / "package")
+    (target / "runtime" / "vae" / "fixture.bin").write_bytes(b"tampered")
+    policy = Policy("vae-start")
+    policy._config.model_path = str(target)
+    supervisor = CapturingSupervisor()
+    policy._policy_server = supervisor
+
+    assert _start_deployed(policy)["state"] == "healthy"
+    assert supervisor.models == [target]
+
+
+@pytest.mark.parametrize(
+    "payload, mutation",
+    [
+        ("policy_contract.json", "tampered"),
+        ("policy_contract.json", "missing"),
+        ("checkpoint.json", "tampered"),
+        ("checkpoint.json", "missing"),
+        ("runtime/vae/fixture.bin", "missing"),
+    ],
+)
 def test_deployed_start_rejects_invalid_runtime_files(tmp_path, payload, mutation):
     target = _deployed_export(tmp_path / "package")
     path = target / payload
@@ -463,6 +490,7 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
             fixed_camera_2="",
             wrist_camera="wrist",
             model_data_root=str(tmp_path),
+            model_path=None,
             policy_server_autoclose=False,
             binary_gripper_initial_state=0.0,
         )
@@ -485,5 +513,69 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
         assert watcher.done()
         policy._stop_command = lambda: asyncio.sleep(0, result={})
         await policy.close()
+
+    asyncio.run(scenario())
+
+
+def test_supervisor_restarts_for_a_different_model_or_address(tmp_path, monkeypatch):
+    supervisor = PolicyServerSupervisor(tmp_path, "restart")
+    live = policy_server_module._ProcessInfo("1", "S")
+
+    def process_info(pid):
+        process = supervisor._process
+        if process is not None and process.pid == pid and process.poll() is not None:
+            return None
+        return live
+
+    monkeypatch.setattr(policy_server_module, "_process_info", process_info)
+    monkeypatch.setattr(policy_server_module, "_health_ready", lambda host, port: True)
+    command = [sys.executable, "-c", "import time; time.sleep(30)"]
+    old, new = Path("/models/old"), Path("/models/new")
+    try:
+        first = supervisor.start(command, "127.0.0.1", 8000, 1, model=old)
+        assert not supervisor.serves_other(old, "127.0.0.1", 8000)
+        assert supervisor.start(command, "127.0.0.1", 8000, 1, model=old)["idempotent"]
+        assert supervisor.serves_other(new, "127.0.0.1", 8000)
+        assert supervisor.serves_other(old, "127.0.0.1", 8001)
+
+        second = supervisor.start(command, "127.0.0.1", 8000, 1, model=new)
+
+        assert second["idempotent"] is False
+        assert second["pid"] != first["pid"]
+        assert json.loads(supervisor.state_path.read_text())["model"] == str(new)
+        assert not supervisor.serves_other(new, "127.0.0.1", 8000)
+    finally:
+        supervisor.stop(grace_seconds=1)
+
+
+def test_supervisor_leaves_unrecorded_model_running(tmp_path, monkeypatch):
+    supervisor = PolicyServerSupervisor(tmp_path, "legacy")
+    supervisor.root.mkdir(parents=True)
+    supervisor.state_path.write_text(
+        json.dumps({"pid": 4242, "start_ticks": "1", "host": "127.0.0.1", "port": 8000})
+    )
+    monkeypatch.setattr(
+        policy_server_module,
+        "_process_info",
+        lambda pid: policy_server_module._ProcessInfo("1", "S"),
+    )
+
+    assert not supervisor.serves_other(Path("/models/new"), "127.0.0.1", 8000)
+
+
+@pytest.mark.parametrize("serves_other", [True, False])
+def test_reconfigured_model_restarts_running_server(tmp_path, serves_other):
+    async def scenario():
+        target = _deployed_export(tmp_path / "package")
+        policy = Policy("reconfigured")
+        policy._config.model_path = str(target)
+        supervisor = CapturingSupervisor(serves_other=serves_other)
+        policy._policy_server = supervisor
+
+        policy._restart_policy_server_if_changed()
+        if policy._policy_server_restart_task is not None:
+            await policy._policy_server_restart_task
+
+        assert supervisor.models == ([target] if serves_other else [])
 
     asyncio.run(scenario())

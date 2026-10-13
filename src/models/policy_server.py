@@ -14,12 +14,11 @@ import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 _HEALTH_CHECK_TIMEOUT = 0.2
 _HEALTH_RESPONSE = b"OK\n"
 _TAIL_BYTES = 4096
-_TOKEN_ENVIRONMENT_NAMES = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN")
 _TOKEN_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(?:hf_token|huggingface_hub_token|token|api[_-]?key)\b"
     r"(\s*[:=]\s*[\"']?)([^\s\"',}\]]+)"
@@ -103,24 +102,13 @@ def _health_ready(host: str, port: int) -> bool:
 class PolicyServerSupervisor:
     """State-file supervisor with process-group cleanup and PID identity checks."""
 
-    def __init__(
-        self,
-        root: Path,
-        name: str,
-        credential_values: Iterable[str] = (),
-    ) -> None:
+    def __init__(self, root: Path, name: str) -> None:
         self.root = root / "policy-server"
         self.state_path = self.root / f"{name}.json"
         self.log_path = self.root / f"{name}.log"
         self._lock = threading.RLock()
         self._process: subprocess.Popen[Any] | None = None
         self._owned_identity: tuple[int, str] | None = None
-        self._credential_values = {
-            value
-            for name in _TOKEN_ENVIRONMENT_NAMES
-            if (value := os.environ.get(name))
-        }
-        self._add_credential_values(credential_values)
 
     @staticmethod
     def _state_identity(state: Mapping[str, Any]) -> tuple[int, str] | None:
@@ -141,19 +129,8 @@ class PolicyServerSupervisor:
         self.state_path.unlink(missing_ok=True)
 
 
-    def _add_credential_values(self, values: Iterable[str]) -> None:
-        self._credential_values.update(value for value in values if value)
-
-    def _capture_environment_credentials(self, environment: Mapping[str, str]) -> None:
-        self._add_credential_values(
-            value
-            for name in _TOKEN_ENVIRONMENT_NAMES
-            if (value := environment.get(name))
-        )
-
-    def _redact_tail(self, tail: str) -> str:
-        for value in sorted(self._credential_values, key=len, reverse=True):
-            tail = tail.replace(value, "[REDACTED]")
+    @staticmethod
+    def _redact_tail(tail: str) -> str:
         tail = _TOKEN_ASSIGNMENT_RE.sub(r"[REDACTED]\1[REDACTED]", tail)
         tail = _BEARER_TOKEN_RE.sub(r"\1[REDACTED]", tail)
         return _HUGGING_FACE_TOKEN_RE.sub("[REDACTED]", tail)
@@ -287,6 +264,31 @@ class PolicyServerSupervisor:
         with self._lock:
             return self._poll_failure_locked()
 
+    @staticmethod
+    def _serves_other(
+        state: Mapping[str, Any], model: Path | None, host: str, port: int
+    ) -> bool:
+        # The launch command is not compared: it names the module directory,
+        # which changes on every module update. State written before the model
+        # was recorded is left alone rather than restarted on an upgrade.
+        recorded = state.get("model")
+        model_changed = (
+            model is not None and isinstance(recorded, str) and recorded != str(model)
+        )
+        return model_changed or (state.get("host"), state.get("port")) != (host, port)
+
+    def serves_other(self, model: Path, host: str, port: int) -> bool:
+        """Whether a live recorded server serves a different model or address."""
+        with self._lock:
+            state = self._read_state()
+            if state is None or not self._serves_other(state, model, host, port):
+                return False
+            identity = self._state_identity(state)
+            if identity is None:
+                return False
+            info = _process_info(identity[0])
+            return info is not None and info.state != "Z" and info.start_ticks == identity[1]
+
     def _has_state(self) -> bool:
         with self._lock:
             return self._read_state() is not None
@@ -305,12 +307,16 @@ class PolicyServerSupervisor:
         port: int,
         readiness_timeout: float = 30.0,
         environment: Mapping[str, str] | None = None,
+        model: Path | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             current = self._status_locked()
-            if current["state"] in ("starting", "healthy"):
+            state = self._read_state() or {}
+            if current["state"] in ("starting", "healthy") and not (
+                self._serves_other(state, model, host, port)
+            ):
                 return {**current, "idempotent": True}
-            if current["state"] in ("unhealthy", "exited"):
+            if current["state"] != "absent":
                 cleanup = self._stop_locked()
                 if not cleanup.get("stopped", False) and self._read_state() is not None:
                     raise RuntimeError(
@@ -323,7 +329,6 @@ class PolicyServerSupervisor:
             process_environment = os.environ.copy()
             if environment is not None:
                 process_environment.update(environment)
-            self._capture_environment_credentials(process_environment)
             with self.log_path.open("a", encoding="utf-8") as log:
                 process = subprocess.Popen(
                     list(command),
@@ -356,6 +361,7 @@ class PolicyServerSupervisor:
                 "start_ticks": info.start_ticks,
                 "host": host,
                 "port": port,
+                **({} if model is None else {"model": str(model)}),
                 "ready_deadline": time.monotonic() + readiness_timeout,
             }
             self.state_path.write_text(

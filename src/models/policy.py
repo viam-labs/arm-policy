@@ -785,6 +785,7 @@ class Policy(Generic, EasyResource):
         self._policy_server_watch_task: asyncio.Task[None] | None = None
         self._policy_server_watch_generation = 0
         self._reported_policy_server_failure: tuple[int, str] | None = None
+        self._policy_server_restart_task: asyncio.Task[None] | None = None
         self._policy_server = PolicyServerSupervisor(default_data_root(), name)
 
     @property
@@ -966,7 +967,48 @@ class Policy(Generic, EasyResource):
         self._readiness_error = ""
         self._policy_server = next_policy_server
         self._ensure_policy_server_watcher()
+        self._restart_policy_server_if_changed()
         self._advance_readiness()
+
+    def _restart_policy_server_if_changed(self) -> None:
+        """Restart a running server whose model or address no longer matches config.
+
+        Startup can take minutes, so the restart runs in the background and
+        reports through the module log like an explicit start.
+        """
+        if self._config.model_path is None:
+            return
+        try:
+            model = validate_model_path(self._config.model_path)
+            loop = asyncio.get_running_loop()
+        except (ValueError, RuntimeError):
+            return
+        if not self._policy_server.serves_other(
+            model, self._config.policy_server_host, self._config.policy_server_port
+        ):
+            return
+        self.logger.info(
+            "managed policy-server configuration changed; restarting with model=%s",
+            model,
+        )
+        task = self._policy_server_restart_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._policy_server_restart_task = loop.create_task(
+            self._restart_policy_server(), name=f"policy-server-restart:{self.name}"
+        )
+
+    async def _restart_policy_server(self) -> None:
+        try:
+            await self._policy_server_command(
+                PolicyServerCommand(command="policy_server", action="start")
+            )
+        except asyncio.CancelledError:
+            raise
+        except (OSError, RuntimeError):
+            pass  # _policy_server_command already logged the startup failure.
+        except Exception as exc:
+            self.logger.error("managed policy-server restart failed: %s", exc)
 
     @staticmethod
     def _decode_image(image: Any, expected: tuple[int, int], label: str) -> np.ndarray:
@@ -1971,6 +2013,8 @@ class Policy(Generic, EasyResource):
                 self._config.policy_server_host,
                 self._config.policy_server_port,
                 self._config.policy_server_readiness_timeout_sec,
+                None,
+                model,
             )
         except (OSError, RuntimeError) as exc:
             self.logger.error("managed policy-server failed during startup: %s", exc)
@@ -2025,6 +2069,8 @@ class Policy(Generic, EasyResource):
             return
         self._closed = True
         self._detach_policy_server_watcher()
+        if self._policy_server_restart_task is not None:
+            self._policy_server_restart_task.cancel()
         await self._stop_command()
         if self._config.policy_server_autoclose and self._policy_server is not None:
             await asyncio.to_thread(self._policy_server.stop)

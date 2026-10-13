@@ -79,7 +79,8 @@ def _safe_relative(name: object) -> Path:
 def validate_runtime_manifest(root: Path) -> dict[str, str]:
     """Validate the bundle shape and digests of the runtime manifest entries.
 
-    Model weights are not hashed, so this is cheap enough for every server start.
+    Model weights and the VAE are not hashed, so this is cheap enough for every
+    server start.
     """
     missing = sorted(name for name in _REQUIRED_EXPORT_FILES if not (root / name).is_file())
     if missing:
@@ -105,7 +106,11 @@ def validate_runtime_manifest(root: Path) -> dict[str, str]:
         actual = root / relative
         name = relative.as_posix()
         if not actual.is_file():
-            raise ValueError(f"portable export runtime checksum failed for {field}")
+            raise ValueError(f"portable export runtime file is missing for {field}")
+        if field == "vae":
+            # The VAE is hundreds of MB; like the weight shards, its payload is
+            # left to the policy server's loader.
+            continue
         if name not in hashes:
             hashes[name] = _sha256(actual)
         if entry.get("sha256") != hashes[name]:
