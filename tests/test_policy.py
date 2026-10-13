@@ -1159,3 +1159,30 @@ def test_gripper_passes_through_unchanged_by_default():
     assert policy._wire_observation(observation)["observation/gripper_position"].tolist() == [0.0]
     parsed, _timing = policy._parse_chunk({"action": _actions()})
     assert parsed[:, 6] == pytest.approx(0.25)
+
+
+def test_dataset_replay_retrieves_across_episodes_and_pads_at_episode_end():
+    from src.models.replay_source import ReplayChunkSource, ReplaySpec
+
+    rows = np.zeros((6, 7), dtype=np.float64)
+    rows[:, 0] = [0.0, 0.1, 0.2, 1.0, 1.1, 1.2]  # two episodes along joint 1
+    rows[3:, 6] = 1.0  # second episode recorded with the gripper closed
+    spec = ReplaySpec(actions=rows.tolist(), episodes=[0, 0, 0, 1, 1, 1], gripper_weight=1.0)
+    source = ReplayChunkSource.from_spec(spec)
+    assert source.metadata()["episodes"] == 2
+
+    near_second = {
+        "observation/joint_position": np.array([1.05, 0, 0, 0, 0, 0], dtype=np.float32),
+        "observation/gripper_position": np.array([1.0], dtype=np.float32),
+    }
+    response = source.respond(near_second)
+    assert response["server_timing"]["replay_frame"] == 3.0
+    assert response["server_timing"]["replay_episode"] == 1.0
+    chunk = response["action"]
+    assert chunk.shape == (32, 7)
+    assert chunk[:3, 0].tolist() == pytest.approx([1.0, 1.1, 1.2])
+    assert chunk[3:, 0].tolist() == pytest.approx([1.2] * 29)  # padded within episode 1
+
+    # Gripper mismatch pushes the match back to the open-gripper episode.
+    open_near_second = dict(near_second, **{"observation/gripper_position": np.array([0.0], dtype=np.float32)})
+    assert source.respond(open_near_second)["server_timing"]["replay_episode"] == 0.0

@@ -1841,7 +1841,7 @@ class Policy(Generic, EasyResource):
         if progress_prop and self._world is None:
             raise ValueError("progress_prop requires a configured world dependency")
         replay = (
-            ReplayChunkSource(command.replay.load_rows(), command.replay)
+            ReplayChunkSource.from_spec(command.replay)
             if command.replay is not None
             else None
         )
