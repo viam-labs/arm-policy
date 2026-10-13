@@ -123,15 +123,22 @@ async def prepare_lite6_setup(
     seed: int,
     prop: str,
     gripper_settle_sec: float = DEFAULT_GRIPPER_SETTLE_SEC,
+    home_joint_degrees: Sequence[float] | None = None,
+    prop_pose: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
-    """Home the Lite6 and optionally reset its simulated pick scene."""
-    await arm.move_to_joint_positions(JointPositions(values=list(HOME_JOINT_DEGREES)))
+    """Home the Lite6 and optionally reset its simulated pick scene.
+
+    ``home_joint_degrees`` and ``prop_pose`` (a ``set_prop_pose`` command body with
+    ``position`` and ``orientation_wxyz``) override the defaults and the seeded sample,
+    so a recorded episode can be replayed from exactly its own start state."""
+    home = list(home_joint_degrees) if home_joint_degrees is not None else list(HOME_JOINT_DEGREES)
+    await arm.move_to_joint_positions(JointPositions(values=home))
     await gripper.open()
     await asyncio.sleep(gripper_settle_sec)
     robot_setup = {
         "performed": True,
         "robot_prepared": True,
-        "home_joint_degrees": list(HOME_JOINT_DEGREES),
+        "home_joint_degrees": home,
     }
     if world is None:
         return {**robot_setup, "scene_reset": False}
@@ -139,7 +146,11 @@ async def prepare_lite6_setup(
         _arm_base_pose(machine, arm_frame),
         _world_pick_region(machine, arm_frame),
     )
-    position, orientation = sample_prop_pose(seed, world_region)
+    if prop_pose is not None:
+        position = tuple(float(v) for v in prop_pose["position"])
+        orientation = tuple(float(v) for v in prop_pose["orientation_wxyz"])
+    else:
+        position, orientation = sample_prop_pose(seed, world_region)
     pose = await world.do_command(
         {
             "command": "set_prop_pose",
@@ -411,6 +422,8 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 seed=args.seed,
                 gripper_settle_sec=args.gripper_settle_sec,
                 prop=args.prop,
+                home_joint_degrees=replay_document.get("home_joint_degrees"),
+                prop_pose=replay_document.get("set_prop_pose_command"),
             )
         command: dict[str, Any] = {
             "command": "execute",
