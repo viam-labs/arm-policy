@@ -607,7 +607,10 @@ SAFETY_PROFILES = {
         velocity_limits=(0.5,) * 6,
         acceleration_limits=(8.0,) * 6,
         max_reach_m=0.70,
-        workspace_floor_m=0.02,
+        # Scripted sim grasps put the TCP 3-8 mm above the arm base plane
+        # (as low as -14 mm measured), so a floor above that rejects every
+        # grasp the policy was trained on.
+        workspace_floor_m=-0.02,
         tcp_offset_m=0.0836,
         fk=lite6_tcp_position,
     ),
