@@ -3,6 +3,7 @@ import json
 
 import numpy as np
 import pytest
+import websockets.exceptions
 from test_policy import FakeSocket, _write_contract
 from viam.proto.app.robot import ServiceConfig
 from viam.utils import dict_to_struct, struct_to_dict
@@ -122,6 +123,24 @@ def test_infer_drops_the_socket_after_a_bad_exchange():
     asyncio.run(scenario())
 
 
+def test_infer_reconnects_once_when_the_server_closed_the_idle_socket():
+    class ClosedSocket(FakeSocket):
+        async def send(self, data):
+            raise websockets.exceptions.ConnectionClosedError(None, None)
+
+    async def scenario():
+        service = SocketCosmos(FakeSocket(pack_message({"action": np.zeros((32, 7))})))
+        service._socket = ClosedSocket()
+
+        outputs = await service.infer(_inputs())
+
+        assert service.connections == 1
+        assert outputs[ACTION_TENSOR].shape == (32, 7)
+
+    asyncio.run(scenario())
+
+
+
 def test_infer_timeout_closes_the_socket():
     async def scenario():
         socket = FakeSocket(None, block=True)
@@ -184,7 +203,12 @@ def test_config_ignores_controller_attributes_and_derives_server_defaults():
 
 
 @pytest.mark.parametrize("autoclose", [False, True])
-def test_reconfigure_and_close_only_stop_server_when_configured(tmp_path, autoclose):
+def test_reconfigure_and_close_only_stop_server_when_configured(tmp_path, autoclose, monkeypatch):
+    async def fake_start(self):
+        return {"state": "healthy"}
+
+    monkeypatch.setattr(CosmosPolicy, "_start_policy_server", fake_start)
+
     class ExistingServer:
         stopped = 0
 
