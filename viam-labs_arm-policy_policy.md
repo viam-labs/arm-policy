@@ -188,6 +188,9 @@ with the validated local path and state:
 {"command": "models/download"}
 ```
 
+Portable exports must use runtime-manifest schema 3 and carry matching immutable
+base-checkpoint provenance in both runtime and export manifests.
+
 For an uncached bucket source, download first lists the exact configured bucket prefix using the same Hugging Face CLI credentials as the transfer. Access denial, a missing or empty prefix, or a connection failure is returned to the caller before staging or transferring the export. A configured `hf_token` takes precedence; otherwise the CLI retains its inherited environment and saved-login behavior. The preflight is a non-recursive listing; sync performs its own transfer enumeration. Already validated cached downloads remain offline and skip this check.
 
 List only locally complete, hash-validated downloads. This command is offline and makes no Hugging Face request:

@@ -21,6 +21,11 @@ from models.policy_server import PolicyServerSupervisor
 
 COMMIT = "a" * 40
 FRAMEWORK_COMMIT = "efba2076c80648663a89a7fdbc92eb262fae39ac"
+BASE_CHECKPOINT = {
+    "schema_version": 1,
+    "repo_id": "nvidia/Cosmos3-Edge-Policy-DROID",
+    "commit_sha": "b" * 40,
+}
 
 
 def _hash(path: Path) -> str:
@@ -34,11 +39,16 @@ def _export(root: Path) -> None:
     (root / "policy_contract.json").write_text(json.dumps({"schema_version": 3}))
     (root / "checkpoint.json").write_text(json.dumps({"runtime_manifest": "runtime_manifest.json"}))
     (root / "config.json").write_text("{}")
-    (root / "export_manifest.json").write_text(json.dumps({"framework_commit": FRAMEWORK_COMMIT}))
+    (root / "export_manifest.json").write_text(
+        json.dumps(
+            {"framework_commit": FRAMEWORK_COMMIT, "base_checkpoint": BASE_CHECKPOINT}
+        )
+    )
     (root / "model.safetensors.index.json").write_text("{}")
     runtime = {
-        "schema_version": 2,
+        "schema_version": 3,
         "framework_commit": FRAMEWORK_COMMIT,
+        "base_checkpoint": BASE_CHECKPOINT,
         "training_config": {"path": "runtime/training_config.yaml", "sha256": _hash(root / "runtime" / "training_config.yaml")},
         "policy_contract": {"path": "policy_contract.json", "sha256": _hash(root / "policy_contract.json")},
         "vae": {"path": "runtime/vae/fixture.bin", "sha256": _hash(root / "runtime" / "vae" / "fixture.bin")},
@@ -298,6 +308,28 @@ def test_list_validates_export_structure_even_when_receipt_hashes_match(tmp_path
     completion = json.loads(marker.read_text())
     completion["hashes"][runtime_path.name] = _hash(runtime_path)
     marker.write_text(json.dumps(completion))
+    assert store.get(source, COMMIT) == published
+    assert store.list() == []
+
+
+@pytest.mark.parametrize("mutation", ["missing", "invalid", "conflicting"])
+def test_list_rejects_invalid_base_checkpoint_provenance(tmp_path, mutation):
+    store, source, published = _published_export(tmp_path)
+    target = Path(published.path)
+    runtime_path = target / "runtime_manifest.json"
+    runtime = json.loads(runtime_path.read_text())
+    if mutation == "missing":
+        del runtime["base_checkpoint"]
+    elif mutation == "invalid":
+        runtime["base_checkpoint"]["commit_sha"] = "main"
+    else:
+        runtime["base_checkpoint"]["commit_sha"] = "c" * 40
+    runtime_path.write_text(json.dumps(runtime))
+    marker = target / ".complete.json"
+    completion = json.loads(marker.read_text())
+    completion["hashes"][runtime_path.name] = _hash(runtime_path)
+    marker.write_text(json.dumps(completion))
+
     assert store.get(source, COMMIT) == published
     assert store.list() == []
 

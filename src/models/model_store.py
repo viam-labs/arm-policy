@@ -21,6 +21,8 @@ _REPOSITORY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _HASH_LIKE = re.compile(r"^[0-9A-Fa-f]{40}$")
 _TAG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+_RUNTIME_MANIFEST_SCHEMA_VERSION = 3
+_BASE_CHECKPOINT_SCHEMA_VERSION = 1
 _REQUIRED_EXPORT_FILES = frozenset(
     {
         "checkpoint.json",
@@ -150,6 +152,20 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _validate_base_checkpoint_provenance(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("portable export runtime manifest has no base_checkpoint entry")
+    if (
+        value.get("schema_version") != _BASE_CHECKPOINT_SCHEMA_VERSION
+        or not isinstance(value.get("repo_id"), str)
+        or not _REPOSITORY.fullmatch(value["repo_id"])
+        or not isinstance(value.get("commit_sha"), str)
+        or not _COMMIT.fullmatch(value["commit_sha"])
+    ):
+        raise ValueError("portable export has invalid base checkpoint provenance")
+    return value
+
+
 def _safe_relative(name: object) -> Path:
     if not isinstance(name, str) or not name or name.startswith("/"):
         raise ValueError("Hub file name is invalid")
@@ -178,10 +194,13 @@ def validate_portable_export(root: Path) -> dict[str, str]:
     export_manifest = _read_json(root / "export_manifest.json")
     runtime_manifest = _read_json(root / "runtime_manifest.json")
     contract = _read_json(root / "policy_contract.json")
-    if runtime_manifest.get("schema_version") != 2:
+    if runtime_manifest.get("schema_version") != _RUNTIME_MANIFEST_SCHEMA_VERSION:
         raise ValueError("portable export has an unsupported runtime manifest schema")
     if runtime_manifest.get("framework_commit") != export_manifest.get("framework_commit"):
         raise ValueError("portable export runtime and export framework revisions conflict")
+    base_checkpoint = _validate_base_checkpoint_provenance(runtime_manifest.get("base_checkpoint"))
+    if base_checkpoint != export_manifest.get("base_checkpoint"):
+        raise ValueError("portable export runtime and export base checkpoints conflict")
     if checkpoint.get("runtime_manifest") != "runtime_manifest.json":
         raise ValueError("portable export checkpoint does not reference runtime_manifest.json")
     if contract.get("schema_version") != 3:
