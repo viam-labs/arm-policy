@@ -59,6 +59,7 @@ class CapturingSupervisor:
     def __init__(self, serves_other=False):
         self.commands = []
         self.models = []
+        self.stops = 0
         self._serves_other = serves_other
 
     def start(self, command, host, port, readiness_timeout, environment=None, model=None):
@@ -68,6 +69,10 @@ class CapturingSupervisor:
 
     def serves_other(self, model, host, port):
         return self._serves_other
+
+    def stop(self, grace_seconds=5.0):
+        self.stops += 1
+        return {"state": "absent", "stopped": True}
 
     def poll_failure(self):
         return None
@@ -564,18 +569,14 @@ def test_supervisor_leaves_unrecorded_model_running(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("serves_other", [True, False])
-def test_reconfigured_model_restarts_running_server(tmp_path, serves_other):
-    async def scenario():
-        target = _deployed_export(tmp_path / "package")
-        policy = Policy("reconfigured")
-        policy._config.model_path = str(target)
-        supervisor = CapturingSupervisor(serves_other=serves_other)
-        policy._policy_server = supervisor
+def test_reconfigured_model_stops_running_server_without_starting(tmp_path, serves_other):
+    target = _deployed_export(tmp_path / "package")
+    policy = Policy("reconfigured")
+    policy._config.model_path = str(target)
+    supervisor = CapturingSupervisor(serves_other=serves_other)
+    policy._policy_server = supervisor
 
-        policy._restart_policy_server_if_changed()
-        if policy._policy_server_restart_task is not None:
-            await policy._policy_server_restart_task
+    policy._stop_policy_server_if_changed()
 
-        assert supervisor.models == ([target] if serves_other else [])
-
-    asyncio.run(scenario())
+    assert supervisor.stops == (1 if serves_other else 0)
+    assert supervisor.commands == []

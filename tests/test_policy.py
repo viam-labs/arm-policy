@@ -422,13 +422,17 @@ def test_readiness_reads_only_the_deployed_contract(tmp_path, monkeypatch):
     _deploy_package(package, contract)
     policy = Policy("policy")
     monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
+    attrs = {**_deployed_attrs(str(package)), "model_data_root": str(tmp_path / "data")}
     allowed = {package / "policy_contract.json"}
     opened = set()
     original_open = Path.open
 
     def guarded_open(path, *args, **kwargs):
-        assert path in allowed, f"readiness opened unrelated file or payload: {path}"
-        opened.add(path)
+        # Reconfigure may read the supervisor's own state under model_data_root;
+        # only package reads are confined to the contract.
+        if path.is_relative_to(package):
+            assert path in allowed, f"readiness opened unrelated file or payload: {path}"
+            opened.add(path)
         return original_open(path, *args, **kwargs)
 
     def no_scan(*args, **kwargs):
@@ -440,12 +444,12 @@ def test_readiness_reads_only_the_deployed_contract(tmp_path, monkeypatch):
         guard.setattr(Path, "iterdir", no_scan)
         for _ in range(2):
             opened.clear()
-            policy.reconfigure(_config(_deployed_attrs(str(package))), {})
+            policy.reconfigure(_config(attrs), {})
             assert policy._status.state == "ready"
             assert opened == allowed
 
     (package / "policy_contract.json").write_text("not json")
-    policy.reconfigure(_config(_deployed_attrs(str(package))), {})
+    policy.reconfigure(_config(attrs), {})
     assert policy._status.state == "wait_contract"
     assert not policy._ready
 
