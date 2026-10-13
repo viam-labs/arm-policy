@@ -14,12 +14,11 @@ import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 _HEALTH_CHECK_TIMEOUT = 0.2
 _HEALTH_RESPONSE = b"OK\n"
 _TAIL_BYTES = 4096
-_TOKEN_ENVIRONMENT_NAMES = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN")
 _TOKEN_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(?:hf_token|huggingface_hub_token|token|api[_-]?key)\b"
     r"(\s*[:=]\s*[\"']?)([^\s\"',}\]]+)"
@@ -103,24 +102,13 @@ def _health_ready(host: str, port: int) -> bool:
 class PolicyServerSupervisor:
     """State-file supervisor with process-group cleanup and PID identity checks."""
 
-    def __init__(
-        self,
-        root: Path,
-        name: str,
-        credential_values: Iterable[str] = (),
-    ) -> None:
+    def __init__(self, root: Path, name: str) -> None:
         self.root = root / "policy-server"
         self.state_path = self.root / f"{name}.json"
         self.log_path = self.root / f"{name}.log"
         self._lock = threading.RLock()
         self._process: subprocess.Popen[Any] | None = None
         self._owned_identity: tuple[int, str] | None = None
-        self._credential_values = {
-            value
-            for name in _TOKEN_ENVIRONMENT_NAMES
-            if (value := os.environ.get(name))
-        }
-        self._add_credential_values(credential_values)
 
     @staticmethod
     def _state_identity(state: Mapping[str, Any]) -> tuple[int, str] | None:
@@ -141,19 +129,8 @@ class PolicyServerSupervisor:
         self.state_path.unlink(missing_ok=True)
 
 
-    def _add_credential_values(self, values: Iterable[str]) -> None:
-        self._credential_values.update(value for value in values if value)
-
-    def _capture_environment_credentials(self, environment: Mapping[str, str]) -> None:
-        self._add_credential_values(
-            value
-            for name in _TOKEN_ENVIRONMENT_NAMES
-            if (value := environment.get(name))
-        )
-
-    def _redact_tail(self, tail: str) -> str:
-        for value in sorted(self._credential_values, key=len, reverse=True):
-            tail = tail.replace(value, "[REDACTED]")
+    @staticmethod
+    def _redact_tail(tail: str) -> str:
         tail = _TOKEN_ASSIGNMENT_RE.sub(r"[REDACTED]\1[REDACTED]", tail)
         tail = _BEARER_TOKEN_RE.sub(r"\1[REDACTED]", tail)
         return _HUGGING_FACE_TOKEN_RE.sub("[REDACTED]", tail)
@@ -323,7 +300,6 @@ class PolicyServerSupervisor:
             process_environment = os.environ.copy()
             if environment is not None:
                 process_environment.update(environment)
-            self._capture_environment_credentials(process_environment)
             with self.log_path.open("a", encoding="utf-8") as log:
                 process = subprocess.Popen(
                     list(command),

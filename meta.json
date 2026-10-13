@@ -13,7 +13,7 @@
   ],
   "applications": null,
   "markdown_link": "README.md",
-  "entrypoint": "run.sh",
+  "entrypoint": "dist/arm-policy",
   "build": {
     "build": "make module.tar.gz",
     "path": "module.tar.gz",

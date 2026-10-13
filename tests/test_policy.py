@@ -9,15 +9,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 from PIL import Image
-from test_model_store import _export
+from test_model_export import _deployed_export
 from viam.components.arm import Arm, JointPositions
 from viam.media.video import CameraMimeType, ViamImage
 from viam.operations import Operation
 from viam.proto.app.robot import ComponentConfig
 from viam.utils import dict_to_struct
 
-from models import model_store
-from models.model_store import ModelRecord, ModelStore, parse_model_source
+from models import model_export
 from models.policy import (
     CAMERA_ALIASES,
     CAMERA_KEYS,
@@ -346,112 +345,84 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
                 }
             )
         )
-    with pytest.raises(ValueError, match="model_revision"):
-        Policy.validate_config(
-            _config(
-                {
-                    **attrs,
-                    "model_source": "owner/policy",
-                    "model_revision": "main",
-                    "model_data_root": str(tmp_path),
-                }
-            )
-        )
+    for removed in ("model_source", "model_revision", "hf_token", "hf_token_env"):
+        with pytest.raises(ValueError, match=removed):
+            Policy.validate_config(_config({**attrs, removed: "owner/policy"}))
     with pytest.raises(ValueError, match="absolute path"):
-        Policy.validate_config(
-            _config({**attrs, "model_data_root": "relative-model-store"})
-        )
+        Policy.validate_config(_config({**attrs, "model_data_root": "relative-data"}))
 
 
-def test_bucket_source_waits_for_contract_and_download_advances_readiness(
-    tmp_path, monkeypatch
-):
-    _, contract, _ = _write_contract(tmp_path)
-    bundle = tmp_path / "bundle"
-    attrs = {
+def _deployed_attrs(model_path: str) -> dict[str, str]:
+    return {
         "arm": "pick-arm",
         "gripper": "pick-gripper",
         "fixed_camera": "scene-cam",
         "wrist_camera": "wrist-cam",
         "server_uri": "ws://127.0.0.1:8000",
         "prompt": "pick",
-        "model_source": "bucket:owner/policy:exports/latest",
-        "model_data_root": str(tmp_path),
+        "model_path": model_path,
     }
+
+
+def test_model_path_config_is_required_and_absolute(tmp_path):
+    attrs = _deployed_attrs(str(tmp_path / "package"))
     Policy.validate_config(_config(attrs))
+    with pytest.raises(ValueError, match="absolute path"):
+        Policy.validate_config(_config({**attrs, "model_path": "relative/package"}))
+    without_model = {key: value for key, value in attrs.items() if key != "model_path"}
+    with pytest.raises(ValueError, match="policy_contract_path or model_path"):
+        Policy.validate_config(_config(without_model))
 
-    class Store:
-        record = None
 
-        def get(self, source, revision=None):
-            return self.record
+def _deploy_package(package: Path, contract: dict) -> None:
+    _deployed_export(package)
+    (package / "policy_contract.json").write_text(json.dumps(contract))
+    runtime_path = package / "runtime_manifest.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["policy_contract"]["sha256"] = model_export._sha256(
+        package / "policy_contract.json"
+    )
+    runtime_path.write_text(json.dumps(runtime))
 
-        def download(self, source, revision, token):
-            assert source.canonical == "bucket:owner/policy:exports/latest"
-            assert revision is None
-            bundle.mkdir()
-            (bundle / "policy_contract.json").write_text(json.dumps(contract))
-            self.record = ModelRecord(source, None, None, str(bundle), "validated")
-            return self.record
 
-    store = Store()
+def test_deployed_model_path_waits_for_package_then_starts_server(
+    tmp_path, monkeypatch
+):
+    _, contract, _ = _write_contract(tmp_path)
+    package = tmp_path / "package"
+    attrs = _deployed_attrs(str(package))
     policy = Policy("policy")
     monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
-    monkeypatch.setattr(policy, "_require_model_store", lambda: store)
     policy.reconfigure(_config(attrs), {})
+    assert policy._status.state == "wait_contract"
+
+    _deploy_package(package, contract)
+    started = []
+    monkeypatch.setattr(
+        policy._policy_server,
+        "start",
+        lambda command, *args: started.append(command) or {"pid": 1},
+    )
 
     async def scenario():
-        assert (await policy.do_command({"command": "status"}))[
-            "state"
-        ] == "wait_contract"
-        with pytest.raises(RuntimeError, match="not ready"):
-            await policy.do_command({"command": "execute"})
-        response = await policy.do_command({"command": "models/download"})
-        assert response["model_source"] == "bucket:owner/policy:exports/latest"
         assert (await policy.do_command({"command": "status"}))["state"] == "ready"
+        await policy.do_command({"command": "policy_server", "action": "start"})
+        assert str(package) in started[0]
+        (package / "runtime" / "training_config.yaml").write_text("tampered\n")
+        with pytest.raises(ValueError, match="checksum failed"):
+            await policy.do_command({"command": "policy_server", "action": "start"})
+        assert len(started) == 1
 
     asyncio.run(scenario())
 
 
-def test_reconfigure_reads_only_selected_completion_and_contract(tmp_path, monkeypatch):
-    store = ModelStore(tmp_path)
-    source = parse_model_source("bucket:owner/policy:exports/selected")
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    _export(staging)
-    contract_path, _, _ = _write_contract(staging)
-    contract_path.replace(staging / "policy_contract.json")
-    runtime_path = staging / "runtime_manifest.json"
-    runtime = json.loads(runtime_path.read_text())
-    runtime["policy_contract"]["sha256"] = model_store._sha256(
-        staging / "policy_contract.json"
-    )
-    runtime_path.write_text(json.dumps(runtime))
-    shard = staging / "model.safetensors"
-    shard.write_bytes(b"weights")
-    target = store._target(source, None)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    store._publish(staging, target, source, None, None)
-    # A large payload must not be opened, even if changed since publication.
-    with (target / shard.name).open("wb") as payload:
-        payload.truncate(8 * 1024**3)
-    unrelated = store.root / "unrelated"
-    unrelated.mkdir()
-    (unrelated / ".complete.json").write_text("malformed unrelated completion")
-
-    attrs = {
-        "arm": "arm",
-        "gripper": "gripper",
-        "fixed_camera": "fixed",
-        "wrist_camera": "wrist",
-        "server_uri": "ws://127.0.0.1:8000",
-        "prompt": "pick",
-        "model_source": source.canonical,
-        "model_data_root": str(tmp_path),
-    }
+def test_readiness_reads_only_the_deployed_contract(tmp_path, monkeypatch):
+    _, contract, _ = _write_contract(tmp_path)
+    package = tmp_path / "package"
+    _deploy_package(package, contract)
     policy = Policy("policy")
     monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
-    allowed = {target / ".complete.json", target / "policy_contract.json"}
+    allowed = {package / "policy_contract.json"}
     opened = set()
     original_open = Path.open
 
@@ -461,26 +432,20 @@ def test_reconfigure_reads_only_selected_completion_and_contract(tmp_path, monke
         return original_open(path, *args, **kwargs)
 
     def no_scan(*args, **kwargs):
-        raise AssertionError("readiness traversed the model store")
+        raise AssertionError("readiness traversed the package")
 
     with monkeypatch.context() as guard:
         guard.setattr(Path, "open", guarded_open)
         guard.setattr(Path, "rglob", no_scan)
+        guard.setattr(Path, "iterdir", no_scan)
         for _ in range(2):
             opened.clear()
-            policy.reconfigure(_config(attrs), {})
+            policy.reconfigure(_config(_deployed_attrs(str(package))), {})
             assert policy._status.state == "ready"
             assert opened == allowed
 
-    # Still valid JSON, but no longer the contract validated at publication.
-    with (target / "policy_contract.json").open("a") as contract_file:
-        contract_file.write("\n")
-
-    def no_parse(*args, **kwargs):
-        raise AssertionError("an unverified contract reached safety parsing")
-
-    monkeypatch.setattr("models.policy._read_policy_contract", no_parse)
-    policy.reconfigure(_config(attrs), {})
+    (package / "policy_contract.json").write_text("not json")
+    policy.reconfigure(_config(_deployed_attrs(str(package))), {})
     assert policy._status.state == "wait_contract"
     assert not policy._ready
 
@@ -492,6 +457,8 @@ def test_reconfigure_reads_only_selected_completion_and_contract(tmp_path, monke
         {"command": "status", "unexpected": True},
         {"command": "policy_server", "action": "restart"},
         {"command": "policy_server", "action": "start", "model_path": "/tmp/model"},
+        {"command": "models/download"},
+        {"command": "models/list"},
     ],
 )
 def test_do_command_rejects_invalid_payloads(command):
@@ -501,38 +468,6 @@ def test_do_command_rejects_invalid_payloads(command):
             await policy.do_command(command)
 
     asyncio.run(scenario())
-
-
-def test_model_source_requires_revision_and_bucket_forbids_it():
-    common = {
-        "arm": "pick-arm",
-        "gripper": "pick-gripper",
-        "fixed_camera": "scene-cam",
-        "wrist_camera": "wrist-cam",
-        "server_uri": "ws://127.0.0.1:8000",
-        "prompt": "pick",
-    }
-    Policy.validate_config(
-        _config(
-            {
-                **common,
-                "model_source": "viamrobotics/cosmos-xarm-pick",
-                "model_revision": "release-1",
-            }
-        )
-    )
-    with pytest.raises(ValueError, match="model_revision"):
-        Policy.validate_config(_config({**common, "model_source": "owner/policy"}))
-    with pytest.raises(ValueError, match="forbidden"):
-        Policy.validate_config(
-            _config(
-                {
-                    **common,
-                    "model_source": "bucket:owner/policy:export",
-                    "model_revision": "a" * 40,
-                }
-            )
-        )
 
 
 @pytest.mark.parametrize("autoclose", [False, True])

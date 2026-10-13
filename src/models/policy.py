@@ -47,12 +47,11 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.utils import ValueTypes, struct_to_dict
 
-from .model_store import (
-    ModelStore,
+from .model_export import (
     default_data_root,
-    parse_model_source,
     validate_data_root,
-    validate_revision,
+    validate_model_path,
+    validate_runtime_manifest,
 )
 from .policy_server import PolicyServerSupervisor, runtime_command
 from .replay_source import ReplayChunkSource, ReplaySpec
@@ -224,11 +223,11 @@ class Config(BaseModel):
     action_prefix_steps: Annotated[int, Field(ge=1, le=32)] | None = None
     action_prefix_duration_sec: PositiveFiniteFloat | None = None
 
-    # The optional store is kept outside the normal module dependency set.
-    model_source: str | None = None
-    model_revision: str | None = None
+    # A portable export deployed by viam-server from the Viam registry, normally
+    # configured as "${packages.ml_model.<package-name>}".
+    model_path: str | None = None
+    # Holds the managed policy server's runtime state and log.
     model_data_root: str | None = None
-    hf_token: str | None = None
     policy_server_host: str = "127.0.0.1"
     policy_server_port: Annotated[int, Field(ge=1, le=65535)] = 8000
     policy_server_readiness_timeout_sec: PositiveFiniteFloat = 30.0
@@ -244,20 +243,12 @@ class Config(BaseModel):
             (640, 360),
         ):
             raise ValueError("fixed_camera_width/height must be 1280x720 or 640x360")
-        if self.policy_contract_path is None and self.model_source is None:
-            raise ValueError("configure policy_contract_path or model_source")
-        if self.model_source is not None:
-            source = parse_model_source(self.model_source)
-            if source.kind == "model":
-                validate_revision(self.model_revision)
-            elif self.model_revision is not None:
-                raise ValueError("model_revision is forbidden for bucket model_source")
-        elif self.model_revision is not None:
-            raise ValueError("model_revision requires model_source")
+        if self.policy_contract_path is None and self.model_path is None:
+            raise ValueError("configure policy_contract_path or model_path")
+        if self.model_path is not None:
+            validate_model_path(self.model_path)
         if self.model_data_root is not None:
             validate_data_root(self.model_data_root)
-        if self.hf_token is not None and not self.hf_token.strip():
-            raise ValueError("hf_token must not be empty")
         if not self.policy_server_host or any(
             char.isspace() for char in self.policy_server_host
         ):
@@ -396,14 +387,6 @@ class StatusCommand(CommandModel):
     command: Literal["status"]
 
 
-class ModelsDownloadCommand(CommandModel):
-    command: Literal["models/download"]
-
-
-class ModelsListCommand(CommandModel):
-    command: Literal["models/list"]
-
-
 class PolicyServerCommand(CommandModel):
     command: Literal["policy_server"]
     action: Literal["start", "status", "stop"]
@@ -459,8 +442,6 @@ DoCommand = Annotated[
     ExecuteCommand
     | StopCommand
     | StatusCommand
-    | ModelsDownloadCommand
-    | ModelsListCommand
     | PolicyServerCommand,
     Field(discriminator="command"),
 ]
@@ -804,7 +785,6 @@ class Policy(Generic, EasyResource):
         self._policy_server_watch_task: asyncio.Task[None] | None = None
         self._policy_server_watch_generation = 0
         self._reported_policy_server_failure: tuple[int, str] | None = None
-        self._policy_server_credential_values: set[str] = set()
         self._policy_server = PolicyServerSupervisor(default_data_root(), name)
 
     @property
@@ -878,22 +858,11 @@ class Policy(Generic, EasyResource):
             if self._policy_server_watch_task is asyncio.current_task():
                 self._policy_server_watch_task = None
 
-    def _matching_model_record(self) -> Path | None:
-        if self._config.model_source is None:
-            return None
-        source = parse_model_source(self._config.model_source)
-        record = self._require_model_store().get(source, self._config.model_revision)
-        return Path(record.path) if record is not None else None
-
     def _contract_path(self) -> Path:
         if self._config.policy_contract_path is not None:
             return Path(self._config.policy_contract_path).expanduser()
-        record_path = self._matching_model_record()
-        if record_path is None:
-            raise ValueError(
-                "configured model_source has not been downloaded and validated"
-            )
-        return record_path / "policy_contract.json"
+        assert self._config.model_path is not None
+        return validate_model_path(self._config.model_path) / "policy_contract.json"
 
     def _advance_readiness(self) -> bool:
         if self._ready:
@@ -917,7 +886,8 @@ class Policy(Generic, EasyResource):
         if not self._advance_readiness():
             raise RuntimeError(
                 "policy contract is not ready: "
-                f"{self._readiness_error}; configure a valid policy_contract_path or download the configured model_source"
+                f"{self._readiness_error}; configure a valid policy_contract_path or "
+                "wait for viam-server to deploy the configured model_path package"
             )
 
     def _idle_status(self) -> RunStatus:
@@ -982,12 +952,8 @@ class Policy(Generic, EasyResource):
         self._wrist_camera = self._dependency(
             dependencies, Camera, parsed.wrist_camera, "wrist camera"
         )
-        if parsed.hf_token is not None:
-            self._policy_server_credential_values.add(parsed.hf_token)
         next_policy_server = PolicyServerSupervisor(
-            _model_data_root(parsed),
-            self.name,
-            self._policy_server_credential_values,
+            _model_data_root(parsed), self.name
         )
         self._detach_policy_server_watcher()
         if parsed.policy_server_autoclose and self._policy_server is not None:
@@ -1967,24 +1933,12 @@ class Policy(Generic, EasyResource):
             )
         return result
 
-    def _require_model_store(self) -> ModelStore:
-        return ModelStore(_model_data_root(self._config))
-
-    async def _models_download_command(self) -> Mapping[str, ValueTypes]:
-        if self._config.model_source is None:
-            raise ValueError("models/download requires configured model_source")
-        record = await asyncio.to_thread(
-            self._require_model_store().download,
-            parse_model_source(self._config.model_source),
-            self._config.model_revision,
-            self._config.hf_token,
-        )
-        self._advance_readiness()
-        return record.response()
-
-    async def _models_list_command(self) -> Mapping[str, ValueTypes]:
-        records = await asyncio.to_thread(self._require_model_store().list)
-        return {"models": [record.response() for record in records]}
+    async def _policy_server_model(self) -> Path:
+        if self._config.model_path is None:
+            raise NotImplementedError("policy_server start requires configured model_path")
+        model = validate_model_path(self._config.model_path)
+        await asyncio.to_thread(validate_runtime_manifest, model)
+        return model
 
     async def _policy_server_command(
         self, command: PolicyServerCommand
@@ -2003,19 +1957,7 @@ class Policy(Generic, EasyResource):
             self._config.policy_server_host,
             self._config.policy_server_port,
         )
-        if self._config.model_source is None:
-            raise NotImplementedError(
-                "policy_server start requires configured model_source"
-            )
-        source = parse_model_source(self._config.model_source)
-        record = await asyncio.to_thread(
-            self._require_model_store().get,
-            source,
-            self._config.model_revision,
-        )
-        if record is None:
-            raise ValueError("configured model has not been downloaded and validated")
-        model = Path(record.path)
+        model = await self._policy_server_model()
         runtime_root = Path(__file__).resolve().parents[2] / "policy_server_runtime"
         try:
             result = await asyncio.to_thread(
@@ -2029,9 +1971,6 @@ class Policy(Generic, EasyResource):
                 self._config.policy_server_host,
                 self._config.policy_server_port,
                 self._config.policy_server_readiness_timeout_sec,
-                {"HF_TOKEN": self._config.hf_token}
-                if self._config.hf_token is not None
-                else None,
             )
         except (OSError, RuntimeError) as exc:
             self.logger.error("managed policy-server failed during startup: %s", exc)
@@ -2079,10 +2018,6 @@ class Policy(Generic, EasyResource):
         if isinstance(request, StatusCommand):
             self._advance_readiness()
             return self._status.to_dict()
-        if isinstance(request, ModelsDownloadCommand):
-            return await self._models_download_command()
-        if isinstance(request, ModelsListCommand):
-            return await self._models_list_command()
         return await self._policy_server_command(request)
 
     async def close(self) -> None:

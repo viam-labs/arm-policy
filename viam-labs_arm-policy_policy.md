@@ -33,7 +33,7 @@ The inference server is an optional module-owned subprocess. On its first `polic
 | `wrist_camera` | string | Camera returning exactly one 640x480 image. |
 | `server_uri` | string | `ws://` or `wss://` OpenPI policy-server endpoint. |
 | `prompt` | string | Non-empty default task prompt. |
-| `policy_contract_path` | string | Optional local path to a schema-version-3 `policy_contract.json`. Required unless `model_source` is set. When omitted, the component uses `policy_contract.json` from the matching validated download. |
+| `policy_contract_path` | string | Optional local path to a schema-version-3 `policy_contract.json`. Required unless `model_path` is set. When omitted, the component uses `policy_contract.json` from the deployed `model_path` package. |
 
 ### Optional attributes
 
@@ -55,61 +55,64 @@ The inference server is an optional module-owned subprocess. On its first `polic
 | `binary_gripper_settle_sec` | `3` | Cancellable wait after each nonblocking `Open` or `Grab` command. |
 | `policy_server_autoclose` | `false` | Stop the managed policy-server process during component reconfiguration or close. Leave disabled to preserve the server across arm-policy and `viam-server` restarts. |
 
-### Downloaded model and server attributes
+### Viam-deployed model
 
-Set `model_source` to either an HF model repository (`owner/name` or
-`model:owner/name`) or a bucket location
-(`bucket:owner/name:path/to/export`). Model repositories require
-`model_revision`: use a release tag such as the training job name, or the
-lowercase 40-character commit SHA for an untagged revision. Branches such as
-`main` and `master` are rejected. The downloader verifies that a named revision
-is a model tag, resolves it to one commit, and records both the requested tag
-and resolved SHA. Bucket sources forbid `model_revision`.
-
-`model_data_root` is optional. When omitted, the module uses
-`$VIAM_MODULE_DATA/arm-policy`, then `$XDG_DATA_HOME/arm-policy`, then
-`~/.local/share/viam/arm-policy`; set it to an absolute persistent directory to
-override that convention. `hf_token` is optional; `HF_TOKEN` and
-`HUGGINGFACE_HUB_TOKEN` are also supported. A configured `hf_token` is exported
-as `HF_TOKEN` to the policy-server process for its gated upstream downloads and
-is never returned in command responses. `policy_server_host`,
-`policy_server_port`, and `policy_server_readiness_timeout_sec` configure the
-module-owned inference process.
-
-For example, download the tagged model produced by the training workflow with:
+Upload the portable export (the directory containing `policy_contract.json`,
+`runtime_manifest.json`, `model.safetensors.index.json`, and its shards) to the
+Viam registry as an `ml_model` package, add it to the machine's `packages`, and
+point `model_path` at it. viam-server downloads, versions, and syncs the
+package.
 
 ```json
 {
-  "model_source": "viamrobotics/cosmos-xarm-pick",
-  "model_revision": "1009-new-prompts-20e-10it-m2",
-  "model_data_root": "/var/lib/viam/arm-policy"
+  "packages": [
+    {
+      "name": "cosmos-xarm-pick",
+      "package": "<org-id>/cosmos-xarm-pick",
+      "type": "ml_model",
+      "version": "latest"
+    }
+  ],
+  "components": [
+    {
+      "name": "policy",
+      "model": "viam-labs:arm-policy:policy",
+      "attributes": {
+        "model_path": "${packages.ml_model.cosmos-xarm-pick}",
+        "...": "..."
+      }
+    }
+  ]
 }
 ```
 
-For an untagged model commit, set `model_revision` to its exact Hub commit SHA.
-A bucket-backed component remains supported:
+`model_path` must resolve to an absolute directory. The module never
+downloads model weights itself.
 
-```json
-{
-  "model_source": "bucket:owner/policy:exports/production",
-  "model_data_root": "/var/lib/viam/arm-policy"
-}
-```
+On startup and every reconfiguration the component reads only
+`<model_path>/policy_contract.json` and applies contract and safety-profile
+validation; it does not traverse the package or read weight shards. It reports
+`wait_contract` until viam-server has finished deploying the package and the
+contract is valid. `policy_server` lifecycle commands remain available while
+waiting. `execute` (including observation, inference, safety validation, and
+motion) fails closed with the missing or invalid contract reason. An explicit
+`policy_contract_path` takes precedence and is parsed and safety-validated
+directly.
 
-When an explicit contract path is absent, startup and reconfiguration look up
-only the configured source/revision at its deterministic local store path. They
-validate the local completion receipt's canonical source, requested and resolved
-revisions, and hash entries, then SHA-256-check `policy_contract.json` before
-parsing it and applying safety-profile validation. This reads only the selected
-completion metadata and contract: it does not enumerate other exports or read
-model shards. Each reconfiguration rechecks these files; no discovery result is
-cached across reconfigurations.
+### Data root and server attributes
 
-The component reports `wait_contract` until a matching published download supplies a valid contract, or until a configured explicit contract becomes valid. `models/download`, `models/list`, and `policy_server` lifecycle commands remain available while waiting. `execute` (including observation, inference, safety validation, and motion) fails closed with the missing or invalid contract reason. A successful download automatically rechecks readiness and changes status to `ready` only after contract and safety-profile validation succeeds.
+`model_data_root` is optional and holds the managed policy server's state and log.
+When omitted, the module uses `$VIAM_MODULE_DATA/arm-policy`, then
+`$XDG_DATA_HOME/arm-policy`, then `~/.local/share/viam/arm-policy`; set it to an
+absolute persistent directory to override that convention.
 
-The persistent store is `<data-root>/arm-policy-models/...`. A directory is discoverable only after validation and atomic publication of its local `.complete.json`; interrupted or invalid staging directories are never listed.
+`policy_server_host`, `policy_server_port`, and
+`policy_server_readiness_timeout_sec` configure the module-owned inference
+process.
 
-Readiness verifies the selected safety contract, not the current integrity of model weights or other payload files; it trusts their validation at publication. Full offline bundle hashing remains in `models/list`, download cache/publication validation, and managed `policy_server` startup. Use `models/list` to audit local payload integrity. An explicit `policy_contract_path` still bypasses store discovery and is parsed and safety-validated directly.
+The policy server runs with Cosmos guardrails disabled. They are prompt-safety
+models fetched from a gated Hugging Face repository; arm safety is enforced by
+the module's contract, safety profile, and trajectory validation.
 
 Arm joint observations always come from `GetJointPositions`, and validated arm
 prefixes always use `MoveThroughJointPositionsStreamed`. The command path
@@ -180,25 +183,9 @@ rejected before dispatch.
 
 ### Model and server management
 
-Download the configured portable export. For model repositories, the response
-contains both the requested tag or SHA and its resolved immutable commit, along
-with the validated local path and state:
+Start the isolated pinned-Cosmos server for the deployed `model_path` package. The first start requires network access and substantial disk space while the pinned upstream CUDA 13 policy-server environment is provisioned; later starts reuse it. Start is idempotent and waits for HTTP `GET /healthz` on the configured host and port to return status 200 with body `OK\n`, so its readiness timeout must cover first-time provisioning. The bounded health request checks server responsiveness without opening a WebSocket or running inference. Readiness failures include the log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
 
-```json
-{"command": "models/download"}
-```
-
-For an uncached bucket source, download first lists the exact configured bucket prefix using the same Hugging Face CLI credentials as the transfer. Access denial, a missing or empty prefix, or a connection failure is returned to the caller before staging or transferring the export. A configured `hf_token` takes precedence; otherwise the CLI retains its inherited environment and saved-login behavior. The preflight is a non-recursive listing; sync performs its own transfer enumeration. Already validated cached downloads remain offline and skip this check.
-
-List only locally complete, hash-validated downloads. This command is offline and makes no Hugging Face request:
-
-```json
-{"command": "models/list"}
-```
-
-Start the isolated pinned-Cosmos server for a validated model. The first start requires network access and substantial disk space while the pinned upstream CUDA 13 policy-server environment is provisioned; later starts reuse it. Start is idempotent and waits for HTTP `GET /healthz` on the configured host and port to return status 200 with body `OK\n`, so its readiness timeout must cover first-time provisioning. The bounded health request checks server responsiveness without opening a WebSocket or running inference. Readiness failures include the log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
-
-Server startup resolves the configured `model_source` and `model_revision` directly and trusts the completion receipt created by atomic publication. It verifies the receipt identity and safety-contract hash without traversing or hashing model weights and runtime payloads. A missing or invalid receipt or changed contract prevents startup; payload loading errors remain the policy server's responsibility. `models/list` retains exhaustive store-wide validation.
+Server startup checks that the package contains the required export files and the VAE, and that the training config and policy contract match their `runtime_manifest.json` SHA-256 digests. It does not traverse the package or hash the VAE or weight shards; payload loading errors remain the policy server's responsibility. A missing file or digest mismatch prevents startup.
 
 ```json
 {"command": "policy_server", "action": "start"}
@@ -210,7 +197,7 @@ The supervisor is intentionally a module-owned subprocess rather than s6: it nee
 
 Each start request emits a Viam module info log with its host and port. A successful readiness check emits a second info log with the PID, host, port, child-log path, and whether the start was idempotent. Startup failures also emit an error in the Viam module log before the start command fails. After startup, a background watcher checks for unexpected process exits and logs each failed process once, with its PID, exit status when available, child-log path, and a bounded, credential-redacted log tail. Recovered processes are monitored after component reconfiguration or restart; their exit status may be unavailable. Deliberate stops do not emit failure notifications, and closing or reconfiguring the component detaches its old watcher without changing the `policy_server_autoclose` behavior. The child log remains the full diagnostic record; these notifications do not replace it or constitute an inference health check.
 
-At process startup, before importing Cosmos or downloading models, the runtime audits `trees/*.json` under every standard model, dataset, and space repository in its effective Hugging Face Hub cache. If format-version-1 metadata contains an asterisk in `xet_hash`, it renames the entire JSON to a unique `.json.poisoned.<timestamp>.<pid>.<uuid>` sibling and emits a warning in the policy-server log with both paths. Original bytes are preserved for diagnosis; model weights, healthy metadata, malformed or unknown-format metadata, and unrelated JSON files are untouched. Previously quarantined files are not scanned again. Cache selection follows `HF_HUB_CACHE`, legacy `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, and the default cache location. Subsequent downloads fetch fresh tree metadata normally; the audit does not bypass authentication or introduce automatic download retries.
+At startup the runtime quarantines corrupt Hugging Face Hub cache metadata (tree JSON with an asterisk in `xet_hash`) left by upstream Cosmos downloads, logging both paths in the policy-server log.
 
 ## Workflow client
 
