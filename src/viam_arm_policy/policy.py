@@ -983,8 +983,6 @@ class Policy(Generic, EasyResource):
 
     async def _infer(self, observation: Mapping[str, Any]) -> dict[str, Any]:
         """Call the policy model and return the OpenPI-shaped response."""
-        if self._policy_model is None:
-            raise RuntimeError("execute requires a configured policy_model")
         outputs = await self._policy_model.infer(self._observation_tensors(observation))
         response: dict[str, Any] = {ACTION_TENSOR: outputs.get(ACTION_TENSOR)}
         timing = {
@@ -1704,6 +1702,8 @@ class Policy(Generic, EasyResource):
         if self._closed:
             raise RuntimeError(f"policy {self.name} is closed")
         await self._require_ready()
+        if command.replay is None and self._policy_model is None:
+            raise RuntimeError("execute requires a configured policy_model")
         prompt = command.prompt
         max_chunks = command.max_chunks
         prefix = command.prefix_steps(self._period_s)
