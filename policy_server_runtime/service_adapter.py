@@ -98,6 +98,26 @@ def _audit_hub_tree_metadata(warning: Callable[[str], None] = logging.warning) -
     return quarantined
 
 
+def _override_args() -> list[str]:
+    """Extra upstream server flags from an optional ``server_overrides.json`` next to this file.
+
+    The file holds ``{"args": ["--image-height", "720", ...]}``. It exists so an operator
+    can change inference-only settings (input image size, guidance, denoising steps)
+    without editing the packaged adapter; absent file means no extra flags.
+    """
+    path = Path(__file__).with_name("server_overrides.json")
+    if not path.is_file():
+        return []
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        args = document["args"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise SystemExit(f"invalid policy server overrides {path}: {exc}") from exc
+    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+        raise SystemExit(f"invalid policy server overrides {path}: args must be a list of strings")
+    return list(args)
+
+
 class PortableRobolabPolicyService:
     @staticmethod
     def command(
@@ -123,6 +143,7 @@ class PortableRobolabPolicyService:
             "--resolution", str(transform.get("resolution", "720p")),
             "--guidance", "3.0", "--guidance-interval", "960", "1001", "--num-steps", "4", "--shift", "5.0",
             "--use-state" if framework["use_state"] else "--no-use-state",
+            *_override_args(),
         ]
 
 
