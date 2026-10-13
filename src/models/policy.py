@@ -187,8 +187,10 @@ class Config(BaseModel):
 
     # Fixed by the checkpoint.
     action_chunk_size: Literal[32] = 32
-    fixed_camera_width: Literal[1280] = 1280
-    fixed_camera_height: Literal[720] = 720
+    # Training shrinks each fixed view to a quarter of the wrist image, so a
+    # 640x360 render (half size, same aspect) loses nothing and renders faster.
+    fixed_camera_width: Literal[1280, 640] = 1280
+    fixed_camera_height: Literal[720, 360] = 720
     wrist_camera_width: Literal[640] = 640
     wrist_camera_height: Literal[480] = 480
 
@@ -236,6 +238,11 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def validate_static(self) -> Self:
+        if (self.fixed_camera_width, self.fixed_camera_height) not in (
+            (1280, 720),
+            (640, 360),
+        ):
+            raise ValueError("fixed_camera_width/height must be 1280x720 or 640x360")
         if self.policy_contract_path is None and self.model_source is None:
             raise ValueError("configure policy_contract_path or model_source")
         if self.model_source is not None:

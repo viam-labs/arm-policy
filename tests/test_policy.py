@@ -311,7 +311,12 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
     with pytest.raises(ValueError, match="action_chunk_size"):
         Policy.validate_config(_config({**attrs, "action_chunk_size": 31}))
     with pytest.raises(ValueError, match="fixed_camera_width"):
+        Policy.validate_config(_config({**attrs, "fixed_camera_width": 960}))
+    with pytest.raises(ValueError, match="fixed_camera_width"):
         Policy.validate_config(_config({**attrs, "fixed_camera_width": 640}))
+    Policy.validate_config(
+        _config({**attrs, "fixed_camera_width": 640, "fixed_camera_height": 360})
+    )
     with pytest.raises(ValueError, match="server_uri"):
         Policy.validate_config(_config({**attrs, "server_uri": "http://bad"}))
     Policy.validate_config(_config({**attrs, "max_reach_m": profile.max_reach_m + 1}))
