@@ -1853,6 +1853,10 @@ class Policy(Generic, EasyResource):
             generation = self._generation
             self._last_result = None
             self._status = self._idle_status()
+            # Each run starts from the configured initial gripper state: the workflow's
+            # scene setup establishes it physically, and the policy must observe that
+            # value rather than the last barrier of the previous run.
+            self._binary_gripper_state = self._config.binary_gripper_initial_state
             self._status.state = "connecting"
             self._status.run_id = str(uuid4())
             self._status.prompt = prompt
