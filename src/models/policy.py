@@ -411,6 +411,11 @@ class ExecuteCommand(CommandModel):
     conditioner_algorithm: Literal["quintic", "toppra"]
     deadline_tolerance_sec: PositiveFiniteFloat
     progress_prop: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
+    action_smoothing_window: Annotated[int, Field(ge=1, le=15)] = 1
+    """Odd moving-average window applied to the six joint columns of each returned chunk
+    before conditioning; 1 disables it. Row-to-row jitter in a sampled chunk inflates the
+    TOPPRA path length and stretches its duration, so a short window keeps the executed
+    cadence close to the training labels without changing where the chunk goes."""
     replay: ReplaySpec | None = None
 
     @model_validator(mode="after")
@@ -422,6 +427,8 @@ class ExecuteCommand(CommandModel):
             raise ValueError(
                 "set only one of action_prefix_steps and action_prefix_duration_sec"
             )
+        if self.action_smoothing_window % 2 == 0:
+            raise ValueError("action_smoothing_window must be odd")
         if self.action_prefix_steps is None and self.action_prefix_duration_sec is None:
             raise ValueError(
                 "set one of action_prefix_steps and action_prefix_duration_sec"
@@ -770,6 +777,7 @@ class Policy(Generic, EasyResource):
         self._wrist_camera: Camera
         self._config = Config._unconfigured()
         self._binary_gripper_state = 0.0
+        self._smoothing_window = 1
         self._owner_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._execution_task: Optional[asyncio.Task[Mapping[str, ValueTypes]]] = None
@@ -1302,6 +1310,22 @@ class Policy(Generic, EasyResource):
             )
         return record
 
+    def _smooth_actions(self, actions: np.ndarray) -> np.ndarray:
+        """Centered moving average over the joint columns; edges repeat the end rows."""
+        window = self._smoothing_window
+        if window <= 1:
+            return actions
+        pad = window // 2
+        padded = np.pad(actions[:, :6], ((pad, pad), (0, 0)), mode="edge")
+        kernel = np.full(window, 1.0 / window)
+        smoothed = np.stack(
+            [np.convolve(padded[:, joint], kernel, mode="valid") for joint in range(6)],
+            axis=1,
+        )
+        result = np.array(actions, dtype=np.float64, copy=True)
+        result[:, :6] = smoothed
+        return result
+
     def _condition_chunk(
         self,
         response: Any,
@@ -1310,6 +1334,8 @@ class Policy(Generic, EasyResource):
         conditioner_algorithm: str,
     ) -> tuple[np.ndarray, Mapping[str, Any], Mapping[str, Any]]:
         raw_actions, timing = self._parse_chunk(response)
+        unsmoothed_path_length = float(np.abs(np.diff(raw_actions[:, :6], axis=0)).sum())
+        raw_actions = self._smooth_actions(raw_actions)
         algorithm, version = (
             (TOPPRA_ALGORITHM, TOPPRA_ALGORITHM_VERSION)
             if conditioner_algorithm == "toppra"
@@ -1336,6 +1362,9 @@ class Policy(Generic, EasyResource):
             "selected_prefix_steps": prefix,
             "selected_prefix_duration_s": prefix * self._period_s,
             "observation_age_at_prefix_end_s": prefix * self._period_s,
+            "smoothing_window": self._smoothing_window,
+            "path_length_rad_before_smoothing": unsmoothed_path_length,
+            "path_length_rad": float(np.abs(np.diff(raw_actions[:, :6], axis=0)).sum()),
             "rejection_reason": "",
         }
         self._status.conditioning[-1] = _value_types(diagnostics)
@@ -1838,6 +1867,7 @@ class Policy(Generic, EasyResource):
         conditioner_algorithm = command.conditioner_algorithm
         deadline_tolerance = command.deadline_tolerance_sec
         progress_prop = command.progress_prop
+        self._smoothing_window = command.action_smoothing_window
         if progress_prop and self._world is None:
             raise ValueError("progress_prop requires a configured world dependency")
         replay = (

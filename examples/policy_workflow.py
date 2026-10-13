@@ -443,6 +443,8 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
             command["deadline_tolerance_sec"] = args.deadline_tolerance_sec
         if args.progress_prop:
             command["progress_prop"] = args.progress_prop
+        if args.action_smoothing_window is not None:
+            command["action_smoothing_window"] = args.action_smoothing_window
         if args.prompt:
             command["prompt"] = args.prompt
         if args.replay_json:
@@ -555,6 +557,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--conditioner-algorithm", choices=("quintic", "toppra"))
     prefix.add_argument("--action-prefix-duration-sec", type=float)
     parser.add_argument("--deadline-tolerance-sec", type=float)
+    parser.add_argument(
+        "--action-smoothing-window",
+        type=int,
+        help="odd moving-average window over each chunk's joint columns (1 = off)",
+    )
     parser.add_argument(
         "--output", help="write structured workflow evidence to this JSON file"
     )

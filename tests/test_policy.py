@@ -1186,3 +1186,21 @@ def test_dataset_replay_retrieves_across_episodes_and_pads_at_episode_end():
     # Gripper mismatch pushes the match back to the open-gripper episode.
     open_near_second = dict(near_second, **{"observation/gripper_position": np.array([0.0], dtype=np.float32)})
     assert source.respond(open_near_second)["server_timing"]["replay_episode"] == 0.0
+
+
+def test_action_smoothing_shortens_path_and_keeps_endpoints():
+    policy = FakePolicy(b"")
+    policy._smoothing_window = 5
+    actions = _actions().astype(np.float64)
+    ramp = np.linspace(0.0, 0.3, 32)
+    actions[:, 0] = ramp + 0.02 * np.where(np.arange(32) % 2 == 0, 1.0, -1.0)
+    smoothed = policy._smooth_actions(actions)
+    assert smoothed.shape == actions.shape
+    assert smoothed[:, 6] == pytest.approx(actions[:, 6])
+    before = np.abs(np.diff(actions[:, 0])).sum()
+    after = np.abs(np.diff(smoothed[:, 0])).sum()
+    assert after < 0.5 * before
+    assert smoothed[0, 0] == pytest.approx(actions[0, 0], abs=0.02)
+    assert smoothed[-1, 0] == pytest.approx(actions[-1, 0], abs=0.02)
+    policy._smoothing_window = 1
+    assert policy._smooth_actions(actions) is actions
