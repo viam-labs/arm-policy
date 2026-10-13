@@ -43,7 +43,7 @@ def policy_arm_model(status: Mapping[str, Any]) -> str:
     reason = f": {detail}" if isinstance(detail, str) and detail else ""
     raise RuntimeError(
         f"policy contract is not ready (state={state!r}){reason}; "
-        "wait for the model_path package to deploy or correct model_path"
+        "wait for the policy model's package to deploy or correct policy_model"
     )
 
 
