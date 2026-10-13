@@ -445,6 +445,8 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
             command["progress_prop"] = args.progress_prop
         if args.action_smoothing_window is not None:
             command["action_smoothing_window"] = args.action_smoothing_window
+        if args.max_consecutive_rejections is not None:
+            command["max_consecutive_rejections"] = args.max_consecutive_rejections
         if args.prompt:
             command["prompt"] = args.prompt
         if args.replay_json:
@@ -557,6 +559,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--conditioner-algorithm", choices=("quintic", "toppra"))
     prefix.add_argument("--action-prefix-duration-sec", type=float)
     parser.add_argument("--deadline-tolerance-sec", type=float)
+    parser.add_argument(
+        "--max-consecutive-rejections",
+        type=int,
+        help="chunks in a row that may fail safety validation (arm holds) before the run fails; default 0",
+    )
     parser.add_argument(
         "--action-smoothing-window",
         type=int,
