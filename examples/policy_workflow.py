@@ -451,6 +451,14 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 "mode": args.replay_mode,
                 "advance_steps": args.replay_advance_steps,
             }
+        elif args.replay_path:
+            # Rows (optionally with per-row episode ids) read by the module from its host.
+            command["replay"] = {
+                "actions_path": args.replay_path,
+                "mode": args.replay_mode,
+                "advance_steps": args.replay_advance_steps,
+                "gripper_weight": args.replay_gripper_weight,
+            }
         result = await policy.do_command(command)
         after = await policy.do_command({"command": "status"})
         evidence = {
@@ -521,6 +529,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="JSON file with 'home_joint_degrees', 'set_prop_pose_command' and 'seed' "
         "(a replay file works); sets up the scene without replaying its actions",
     )
+    parser.add_argument(
+        "--replay-path",
+        help="path on the module host to a JSON with 'actions' rows and optional "
+        "'episodes' ids; combine with --scene-json for the scene",
+    )
+    parser.add_argument("--replay-gripper-weight", type=float, default=1.0)
     parser.add_argument("--replay-mode", choices=("nearest", "clock"), default="nearest")
     parser.add_argument("--replay-advance-steps", type=int, default=16)
     parser.add_argument(
