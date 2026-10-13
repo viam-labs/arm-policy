@@ -117,6 +117,29 @@ def training_image_size(model_view: Path) -> tuple[int, int] | None:
     return height + height // 2, width
 
 
+class ActiveChunkTransform:
+    """Give each request the idle-frame count the policy trained with.
+
+    Training prompts (format_prompt_as_json) state how many of the chunk's
+    frames are idle, computed from the future actions. A request has no future,
+    so the upstream DROID-style server leaves the field out and the model sees
+    a prompt shape it never trained on. NVIDIA's LIBERO server sends 0, the
+    active-manipulation case; do the same here.
+    """
+
+    def __init__(self, inner: Callable[..., Any], idle_frames: Callable[[], Any]) -> None:
+        self._inner = inner
+        self._idle_frames = idle_frames
+
+    def __call__(self, sample: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
+        if "idle_frames" not in sample:
+            sample = {**sample, "idle_frames": self._idle_frames()}
+        return self._inner(sample, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 class PortableRobolabPolicyService:
     @staticmethod
     def command(
@@ -180,15 +203,20 @@ def main() -> None:
             del training_config
             model_max = getattr(getattr(self.model, "config", None), "max_action_dim", 64)
             transform = contract.get("transform", {})
+            import torch
+
             return (
-                ActionTransformPipeline(
-                    max_action_dim=int(model_max),
-                    cfg_dropout_rate=0.0,
-                    format_prompt_as_json=bool(transform.get("format_prompt_as_json", False)),
-                    append_viewpoint_info=bool(transform.get("append_viewpoint_info", True)),
-                    append_duration_fps_timestamps=bool(transform.get("append_duration_fps_timestamps", True)),
-                    append_resolution_info=bool(transform.get("append_resolution_info", True)),
-                    append_idle_frames=bool(transform.get("append_idle_frames", False)),
+                ActiveChunkTransform(
+                    ActionTransformPipeline(
+                        max_action_dim=int(model_max),
+                        cfg_dropout_rate=0.0,
+                        format_prompt_as_json=bool(transform.get("format_prompt_as_json", False)),
+                        append_viewpoint_info=bool(transform.get("append_viewpoint_info", True)),
+                        append_duration_fps_timestamps=bool(transform.get("append_duration_fps_timestamps", True)),
+                        append_resolution_info=bool(transform.get("append_resolution_info", True)),
+                        append_idle_frames=bool(transform.get("append_idle_frames", False)),
+                    ),
+                    lambda: torch.tensor(0, dtype=torch.long),
                 ),
                 {"action_chunk_size": int(contract["action_chunk_size"]), "conditioning_fps": float(contract["conditioning_fps"]), "resolution": str(transform.get("resolution", "720p"))},
             )
