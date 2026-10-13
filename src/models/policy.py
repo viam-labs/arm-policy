@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import math
-import os
-import re
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -49,13 +47,10 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
 from viam.utils import ValueTypes, struct_to_dict
 
-from .model_store import (
-    ModelStore,
+from .model_export import (
     default_data_root,
-    parse_model_source,
     validate_data_root,
     validate_model_path,
-    validate_revision,
     validate_runtime_manifest,
 )
 from .policy_server import PolicyServerSupervisor, runtime_command
@@ -175,11 +170,6 @@ class PolicyContract(BaseModel):
         return self
 
 
-_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-# Hugging Face user access tokens; also syntactically valid variable names.
-_HF_TOKEN_SHAPE = re.compile(r"hf_[A-Za-z0-9]{20,}")
-
-
 class Config(BaseModel):
     """Validated policy configuration, including its policy contract."""
 
@@ -236,13 +226,8 @@ class Config(BaseModel):
     # A portable export deployed by viam-server from the Viam registry, normally
     # configured as "${packages.ml_model.<package-name>}".
     model_path: str | None = None
-    # The optional store is kept outside the normal module dependency set.
-    model_source: str | None = None
-    model_revision: str | None = None
+    # Holds the managed policy server's runtime state and log.
     model_data_root: str | None = None
-    # The name of an environment variable holding a Hugging Face token, never
-    # the token itself: machine configs are readable by anyone with fleet access.
-    hf_token_env: str | None = None
     policy_server_host: str = "127.0.0.1"
     policy_server_port: Annotated[int, Field(ge=1, le=65535)] = 8000
     policy_server_readiness_timeout_sec: PositiveFiniteFloat = 30.0
@@ -258,35 +243,12 @@ class Config(BaseModel):
             (640, 360),
         ):
             raise ValueError("fixed_camera_width/height must be 1280x720 or 640x360")
-        if (
-            self.policy_contract_path is None
-            and self.model_source is None
-            and self.model_path is None
-        ):
-            raise ValueError(
-                "configure policy_contract_path, model_path, or model_source"
-            )
+        if self.policy_contract_path is None and self.model_path is None:
+            raise ValueError("configure policy_contract_path or model_path")
         if self.model_path is not None:
-            if self.model_source is not None:
-                raise ValueError("model_path and model_source are mutually exclusive")
             validate_model_path(self.model_path)
-        if self.model_source is not None:
-            source = parse_model_source(self.model_source)
-            if source.kind == "model":
-                validate_revision(self.model_revision)
-            elif self.model_revision is not None:
-                raise ValueError("model_revision is forbidden for bucket model_source")
-        elif self.model_revision is not None:
-            raise ValueError("model_revision requires model_source")
         if self.model_data_root is not None:
             validate_data_root(self.model_data_root)
-        if self.hf_token_env is not None and (
-            not _ENV_NAME.fullmatch(self.hf_token_env)
-            or _HF_TOKEN_SHAPE.fullmatch(self.hf_token_env)
-        ):
-            raise ValueError(
-                "hf_token_env must name an environment variable, not hold a token"
-            )
         if not self.policy_server_host or any(
             char.isspace() for char in self.policy_server_host
         ):
@@ -405,21 +367,6 @@ class Config(BaseModel):
         return config
 
 
-def _hf_token(config: Config, *, required: bool) -> str | None:
-    """Read the token from the variable named by hf_token_env, if any."""
-    if config.hf_token_env is None:
-        return None
-    token = os.environ.get(config.hf_token_env, "").strip()
-    if token:
-        return token
-    if required:
-        raise ValueError(
-            f"hf_token_env names {config.hf_token_env}, which is unset or empty "
-            "in the module environment"
-        )
-    return None
-
-
 def _model_data_root(config: Config) -> Path:
     return (
         validate_data_root(config.model_data_root)
@@ -438,14 +385,6 @@ class StopCommand(CommandModel):
 
 class StatusCommand(CommandModel):
     command: Literal["status"]
-
-
-class ModelsDownloadCommand(CommandModel):
-    command: Literal["models/download"]
-
-
-class ModelsListCommand(CommandModel):
-    command: Literal["models/list"]
 
 
 class PolicyServerCommand(CommandModel):
@@ -503,8 +442,6 @@ DoCommand = Annotated[
     ExecuteCommand
     | StopCommand
     | StatusCommand
-    | ModelsDownloadCommand
-    | ModelsListCommand
     | PolicyServerCommand,
     Field(discriminator="command"),
 ]
@@ -848,7 +785,6 @@ class Policy(Generic, EasyResource):
         self._policy_server_watch_task: asyncio.Task[None] | None = None
         self._policy_server_watch_generation = 0
         self._reported_policy_server_failure: tuple[int, str] | None = None
-        self._policy_server_credential_values: set[str] = set()
         self._policy_server = PolicyServerSupervisor(default_data_root(), name)
 
     @property
@@ -922,24 +858,11 @@ class Policy(Generic, EasyResource):
             if self._policy_server_watch_task is asyncio.current_task():
                 self._policy_server_watch_task = None
 
-    def _matching_model_record(self) -> Path | None:
-        if self._config.model_source is None:
-            return None
-        source = parse_model_source(self._config.model_source)
-        record = self._require_model_store().get(source, self._config.model_revision)
-        return Path(record.path) if record is not None else None
-
     def _contract_path(self) -> Path:
         if self._config.policy_contract_path is not None:
             return Path(self._config.policy_contract_path).expanduser()
-        if self._config.model_path is not None:
-            return validate_model_path(self._config.model_path) / "policy_contract.json"
-        record_path = self._matching_model_record()
-        if record_path is None:
-            raise ValueError(
-                "configured model_source has not been downloaded and validated"
-            )
-        return record_path / "policy_contract.json"
+        assert self._config.model_path is not None
+        return validate_model_path(self._config.model_path) / "policy_contract.json"
 
     def _advance_readiness(self) -> bool:
         if self._ready:
@@ -963,8 +886,8 @@ class Policy(Generic, EasyResource):
         if not self._advance_readiness():
             raise RuntimeError(
                 "policy contract is not ready: "
-                f"{self._readiness_error}; configure a valid policy_contract_path, deploy the "
-                "configured model_path package, or download the configured model_source"
+                f"{self._readiness_error}; configure a valid policy_contract_path or "
+                "wait for viam-server to deploy the configured model_path package"
             )
 
     def _idle_status(self) -> RunStatus:
@@ -1029,13 +952,8 @@ class Policy(Generic, EasyResource):
         self._wrist_camera = self._dependency(
             dependencies, Camera, parsed.wrist_camera, "wrist camera"
         )
-        hf_token = _hf_token(parsed, required=False)
-        if hf_token is not None:
-            self._policy_server_credential_values.add(hf_token)
         next_policy_server = PolicyServerSupervisor(
-            _model_data_root(parsed),
-            self.name,
-            self._policy_server_credential_values,
+            _model_data_root(parsed), self.name
         )
         self._detach_policy_server_watcher()
         if parsed.policy_server_autoclose and self._policy_server is not None:
@@ -2015,48 +1933,12 @@ class Policy(Generic, EasyResource):
             )
         return result
 
-    def _require_model_store(self) -> ModelStore:
-        return ModelStore(_model_data_root(self._config))
-
-    async def _models_download_command(self) -> Mapping[str, ValueTypes]:
-        if self._config.model_path is not None:
-            raise ValueError(
-                "models/download is unavailable with model_path; "
-                "viam-server deploys the configured registry package"
-            )
-        if self._config.model_source is None:
-            raise ValueError("models/download requires configured model_source")
-        record = await asyncio.to_thread(
-            self._require_model_store().download,
-            parse_model_source(self._config.model_source),
-            self._config.model_revision,
-            _hf_token(self._config, required=True),
-        )
-        self._advance_readiness()
-        return record.response()
-
-    async def _models_list_command(self) -> Mapping[str, ValueTypes]:
-        records = await asyncio.to_thread(self._require_model_store().list)
-        return {"models": [record.response() for record in records]}
-
     async def _policy_server_model(self) -> Path:
-        if self._config.model_path is not None:
-            model = validate_model_path(self._config.model_path)
-            await asyncio.to_thread(validate_runtime_manifest, model)
-            return model
-        if self._config.model_source is None:
-            raise NotImplementedError(
-                "policy_server start requires configured model_path or model_source"
-            )
-        source = parse_model_source(self._config.model_source)
-        record = await asyncio.to_thread(
-            self._require_model_store().get,
-            source,
-            self._config.model_revision,
-        )
-        if record is None:
-            raise ValueError("configured model has not been downloaded and validated")
-        return Path(record.path)
+        if self._config.model_path is None:
+            raise NotImplementedError("policy_server start requires configured model_path")
+        model = validate_model_path(self._config.model_path)
+        await asyncio.to_thread(validate_runtime_manifest, model)
+        return model
 
     async def _policy_server_command(
         self, command: PolicyServerCommand
@@ -2076,7 +1958,6 @@ class Policy(Generic, EasyResource):
             self._config.policy_server_port,
         )
         model = await self._policy_server_model()
-        hf_token = _hf_token(self._config, required=True)
         runtime_root = Path(__file__).resolve().parents[2] / "policy_server_runtime"
         try:
             result = await asyncio.to_thread(
@@ -2090,7 +1971,6 @@ class Policy(Generic, EasyResource):
                 self._config.policy_server_host,
                 self._config.policy_server_port,
                 self._config.policy_server_readiness_timeout_sec,
-                {"HF_TOKEN": hf_token} if hf_token is not None else None,
             )
         except (OSError, RuntimeError) as exc:
             self.logger.error("managed policy-server failed during startup: %s", exc)
@@ -2138,10 +2018,6 @@ class Policy(Generic, EasyResource):
         if isinstance(request, StatusCommand):
             self._advance_readiness()
             return self._status.to_dict()
-        if isinstance(request, ModelsDownloadCommand):
-            return await self._models_download_command()
-        if isinstance(request, ModelsListCommand):
-            return await self._models_list_command()
         return await self._policy_server_command(request)
 
     async def close(self) -> None:

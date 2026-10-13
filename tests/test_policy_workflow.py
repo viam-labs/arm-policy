@@ -85,13 +85,13 @@ def test_world_is_optional_and_enables_scene_setup_explicitly():
 def test_policy_arm_model_reports_contract_readiness_error():
     with pytest.raises(
         RuntimeError,
-        match="configured model_source has not been downloaded and validated",
+        match="invalid required JSON file policy_contract.json",
     ):
         policy_arm_model(
             {
                 "state": "wait_contract",
                 "embodiment": {"arm_model": ""},
-                "last_error": "configured model_source has not been downloaded and validated",
+                "last_error": "invalid required JSON file policy_contract.json",
             }
         )
 

@@ -223,6 +223,14 @@ def main() -> None:
     from cosmos_framework.scripts import action_policy_server_robolab as upstream
 
     class ContractRobolabPolicyService(upstream.RobolabPolicyService):
+        def _build_setup_args(self, args: Any) -> Any:
+            # Cosmos guardrails are prompt-safety models fetched from a gated
+            # Hugging Face repository; the module does not depend on Hugging
+            # Face, and arm safety is enforced by the module's own limits.
+            return super()._build_setup_args(args).model_copy(
+                update={"guardrails": False}
+            )
+
         def _build_transform(self, training_config: Any | None, args: Any) -> tuple[Any, dict[str, Any]]:
             del training_config
             model_max = getattr(getattr(self.model, "config", None), "max_action_dim", 64)
