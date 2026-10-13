@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Annotated, Any, ClassVar, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+import websockets.exceptions
 from numpy.typing import NDArray
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from typing_extensions import Self
@@ -170,7 +171,6 @@ class CosmosPolicy(MLModel, EasyResource):
         self._policy_server = PolicyServerSupervisor(parsed.data_root, self.name)
         self._contract_json = None
         self._load_contract()
-        self._ensure_policy_server_watcher()
         self._schedule_server_start(stale)
 
     def _require_config(self) -> CosmosConfig:
@@ -290,23 +290,17 @@ class CosmosPolicy(MLModel, EasyResource):
             if previous is not None:
                 # Cancelling would leave its start thread racing this one on the state file.
                 await asyncio.gather(previous, return_exceptions=True)
+            await self._close_socket()
             if stale is not None:
                 await asyncio.to_thread(stale.stop)
+            self._ensure_policy_server_watcher()
             if self._require_config().server_uri is None:
                 await self._start_policy_server()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._server_error = f"{type(exc).__name__}: {exc}"
-
-    async def _stop_policy_server(self) -> Mapping[str, ValueTypes]:
-        self._cancel_server_start()
-        self._detach_policy_server_watcher()
-        await self._close_socket()
-        result = await asyncio.to_thread(self._policy_server.stop)
-        if not result.get("stopped", False):
-            self._ensure_policy_server_watcher()
-        return result
+            self.logger.error("managed policy-server start failed: %s", self._server_error)
 
     async def _start_policy_server(self) -> Mapping[str, ValueTypes]:
         config = self._require_config()
@@ -316,22 +310,18 @@ class CosmosPolicy(MLModel, EasyResource):
             config.policy_server_port,
         )
         model = await self._policy_server_model()
-        try:
-            result = await asyncio.to_thread(
-                self._policy_server.start,
-                runtime_command(
-                    _RUNTIME_ROOT,
-                    model,
-                    config.policy_server_host,
-                    config.policy_server_port,
-                ),
+        result = await asyncio.to_thread(
+            self._policy_server.start,
+            runtime_command(
+                _RUNTIME_ROOT,
+                model,
                 config.policy_server_host,
                 config.policy_server_port,
-                config.policy_server_readiness_timeout_sec,
-            )
-        except (OSError, RuntimeError) as exc:
-            self.logger.error("managed policy-server failed during startup: %s", exc)
-            raise
+            ),
+            config.policy_server_host,
+            config.policy_server_port,
+            config.policy_server_readiness_timeout_sec,
+        )
         self._server_error = ""
         self.logger.info(
             "managed policy-server ready; pid=%s; host=%s; port=%s; "
@@ -360,8 +350,6 @@ class CosmosPolicy(MLModel, EasyResource):
     # WebSocket client -----------------------------------------------------------
 
     async def _connect(self) -> Any:
-        import websockets
-
         config = self._require_config()
         try:
             socket = await asyncio.wait_for(
@@ -452,9 +440,14 @@ class CosmosPolicy(MLModel, EasyResource):
                 if self._socket is None:
                     self._socket = await self._connect()
                 socket = self._socket
-                await asyncio.wait_for(
-                    socket.send(pack_message(observation)), timeout=config.inference_timeout_sec
-                )
+                request = pack_message(observation)
+                try:
+                    await asyncio.wait_for(socket.send(request), timeout=config.inference_timeout_sec)
+                except websockets.exceptions.ConnectionClosed:
+                    # The server went away between calls; nothing was processed, so reconnect once.
+                    await self._close_socket()
+                    socket = self._socket = await self._connect()
+                    await asyncio.wait_for(socket.send(request), timeout=config.inference_timeout_sec)
                 raw = await asyncio.wait_for(socket.recv(), timeout=config.inference_timeout_sec)
                 if not isinstance(raw, bytes):
                     # The upstream server answers a failed request with a text traceback and
