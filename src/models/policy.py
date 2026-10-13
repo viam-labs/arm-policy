@@ -55,6 +55,7 @@ from .model_store import (
     validate_revision,
 )
 from .policy_server import PolicyServerSupervisor, runtime_command
+from .replay_source import ReplayChunkSource, ReplaySpec
 from .trajectory_conditioner import (
     ALGORITHM,
     ALGORITHM_VERSION,
@@ -405,6 +406,7 @@ class ExecuteCommand(CommandModel):
     conditioner_algorithm: Literal["quintic", "toppra"]
     deadline_tolerance_sec: PositiveFiniteFloat
     progress_prop: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
+    replay: ReplaySpec | None = None
 
     @model_validator(mode="after")
     def validate_prefix(self) -> Self:
@@ -585,7 +587,7 @@ SAFETY_PROFILES = {
         fk=ur20_tcp_position,
     ),
     ("lite6", "lite6_gripper"): SafetyProfile(
-        name="lite6-integrated-gripper-sim-v2",
+        name="lite6-integrated-gripper-sim-v3",
         arm_model="lite6",
         gripper_model="lite6_gripper",
         joint_names=LITE6_JOINT_NAMES,
@@ -602,7 +604,14 @@ SAFETY_PROFILES = {
         velocity_limits=(0.5,) * 6,
         acceleration_limits=(8.0,) * 6,
         max_reach_m=0.70,
-        workspace_floor_m=0.02,
+        # v3 (2026-10-13): floor lowered from 0.02 to 0.0. In the sim cell the
+        # arm base sits 5 mm above the table top and the 25 mm block's centre is
+        # 7.5 mm above the base, so every recorded grasp in
+        # viamrobotics/1009-tricam-25 puts the TCP 5.4-7.5 mm above the base and
+        # v2 rejected all of them. The floor is a software limit, not geometry:
+        # at 0.0 the fingertips still clear the table by the 5 mm base offset.
+        # The physical cell has the same layout.
+        workspace_floor_m=0.0,
         tcp_offset_m=0.0836,
         fk=lite6_tcp_position,
     ),
@@ -1582,6 +1591,7 @@ class Policy(Generic, EasyResource):
         progress_prop: str,
         operation: Any,
         generation: int,
+        replay: ReplayChunkSource | None = None,
     ) -> Mapping[str, ValueTypes]:
         terminal_state = "completed"
         error = ""
@@ -1589,7 +1599,11 @@ class Policy(Generic, EasyResource):
             # Arm execution is always timestamped; the contract selects only
             # position-target versus binary-barrier gripper behavior.
             self._status.state = "connecting"
-            socket, metadata = await self._connect(operation, generation)
+            if replay is None:
+                socket, metadata = await self._connect(operation, generation)
+            else:
+                # Recorded rows stand in for the policy server; nothing else changes.
+                socket, metadata = None, replay.metadata()
             self._status.server_metadata = _value_types(metadata)
             for chunk_index in range(max_chunks):
                 if await self._cancelled(operation, generation):
@@ -1655,22 +1669,26 @@ class Policy(Generic, EasyResource):
                 if await self._cancelled(operation, generation):
                     raise asyncio.CancelledError
                 started = time.monotonic()
-                await self._wait_cancellable(
-                    socket.send(pack_message(observation)),
-                    self._config.inference_timeout_sec,
-                    operation,
-                    generation,
-                    "policy request send",
-                )
-                raw = await self._recv(
-                    socket, self._config.inference_timeout_sec, operation, generation
-                )
-                inference_ms = (time.monotonic() - started) * 1000.0
-                if await self._cancelled(operation, generation):
-                    raise asyncio.CancelledError
-                if not isinstance(raw, bytes):
-                    raise RuntimeError(f"policy server returned text error: {raw}")
-                response = unpack_message(raw)
+                if replay is None:
+                    await self._wait_cancellable(
+                        socket.send(pack_message(observation)),
+                        self._config.inference_timeout_sec,
+                        operation,
+                        generation,
+                        "policy request send",
+                    )
+                    raw = await self._recv(
+                        socket, self._config.inference_timeout_sec, operation, generation
+                    )
+                    inference_ms = (time.monotonic() - started) * 1000.0
+                    if await self._cancelled(operation, generation):
+                        raise asyncio.CancelledError
+                    if not isinstance(raw, bytes):
+                        raise RuntimeError(f"policy server returned text error: {raw}")
+                    response = unpack_message(raw)
+                else:
+                    response = replay.respond(observation)
+                    inference_ms = (time.monotonic() - started) * 1000.0
                 self._status.inference_responses += 1
                 self._status.inference_ms.append(inference_ms)
                 if isinstance(response, Mapping):
@@ -1805,6 +1823,11 @@ class Policy(Generic, EasyResource):
         progress_prop = command.progress_prop
         if progress_prop and self._world is None:
             raise ValueError("progress_prop requires a configured world dependency")
+        replay = (
+            ReplayChunkSource(command.replay.load_rows(), command.replay)
+            if command.replay is not None
+            else None
+        )
         async with self._owner_lock:
             if self._execution_task is not None and not self._execution_task.done():
                 raise RuntimeError("policy execution is already in progress")
@@ -1830,6 +1853,7 @@ class Policy(Generic, EasyResource):
                     progress_prop,
                     operation,
                     generation,
+                    replay,
                 )
             )
             self._execution_task = task

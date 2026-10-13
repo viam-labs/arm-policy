@@ -278,6 +278,11 @@ def workflow_summary(
             "",
             "Run",
             f"  Prompt:     {result.get('prompt') or args.prompt or '(component default)'}",
+            *(
+                [f"  Replay:     {args.replay_json} ({args.replay_mode})"]
+                if getattr(args, "replay_json", None)
+                else []
+            ),
             f"  Control:    {result.get('conditioner_algorithm', args.conditioner_algorithm)}; {prefix}; max_chunks={args.max_chunks}",
             f"  Started:    {started_at}",
             f"  Result:     {str(result.get('state', 'unknown')).upper()} after {_run_duration(result)}",
@@ -372,6 +377,16 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
         assert options.dial_options is not None
         options.dial_options.disable_webrtc = True
 
+    replay_document: dict[str, Any] = {}
+    if args.replay_json:
+        replay_document = json.loads(Path(args.replay_json).read_text(encoding="utf-8"))
+        if not isinstance(replay_document.get("actions"), list):
+            raise ValueError(f"{args.replay_json} must hold an 'actions' list of [7] rows")
+        if args.seed is None and isinstance(replay_document.get("seed"), int):
+            args.seed = replay_document["seed"]
+    if args.seed is None:
+        args.seed = 0
+
     async with await RobotClient.at_address(args.address, options) as machine:
         policy = Generic.from_robot(machine, args.policy)
         before = await policy.do_command({"command": "status"})
@@ -413,6 +428,12 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
             command["progress_prop"] = args.progress_prop
         if args.prompt:
             command["prompt"] = args.prompt
+        if args.replay_json:
+            command["replay"] = {
+                "actions": replay_document["actions"],
+                "mode": args.replay_mode,
+                "advance_steps": args.replay_advance_steps,
+            }
         result = await policy.do_command(command)
         after = await policy.do_command({"command": "status"})
         evidence = {
@@ -468,8 +489,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="optional world prop queried before and after each executed prefix",
     )
     parser.add_argument(
-        "--seed", type=int, default=0, help="deterministic scene reset seed"
+        "--seed",
+        type=int,
+        default=None,
+        help="deterministic scene reset seed (default: the replay file's seed, else 0)",
     )
+    parser.add_argument(
+        "--replay-json",
+        help="JSON file with recorded 'actions' rows (and optional 'seed'); the policy "
+        "replays them instead of calling the policy server",
+    )
+    parser.add_argument("--replay-mode", choices=("nearest", "clock"), default="nearest")
+    parser.add_argument("--replay-advance-steps", type=int, default=16)
     parser.add_argument(
         "--gripper-settle-sec",
         type=float,

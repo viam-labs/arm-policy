@@ -1,4 +1,5 @@
 import asyncio
+import math
 import json
 import time
 from dataclasses import replace
@@ -1036,3 +1037,97 @@ def test_full_validator_uses_measured_history_for_dynamic_limits():
     actions[:, :6] = 0.10
     with pytest.raises(ValueError, match="acceleration"):
         policy._validate_actions(actions, history, dynamics=True)
+
+
+def _replay_rows(count=64):
+    rows = np.zeros((count, 7), dtype=np.float64)
+    rows[:, 0] = np.arange(count, dtype=np.float64) * 0.001  # base joint only: TCP height unchanged
+    rows[:, 6] = 0.25
+    return rows
+
+
+def test_replay_rows_bypass_policy_server_and_follow_nearest_state():
+    async def scenario():
+        policy = FakePolicy(None, gripper_mode="binary")  # Lite6 profile
+        rows = _replay_rows()
+        result = await policy.do_command(
+            {
+                "command": "execute",
+                "action_prefix_steps": 3,
+                "max_chunks": 2,
+                "replay": {"actions": rows.tolist(), "mode": "nearest"},
+            }
+        )
+        assert result["state"] == "completed"
+        assert result["chunks_inferred"] == 2
+        assert policy.socket.sent == []
+        assert result["server_metadata"]["source"] == "replay"
+        frames = [entry["replay_frame"] for entry in result["server_timing"]]
+        # arm starts at zero -> row 0; after executing 3 rows it sits on row 2 -> row 2
+        assert frames == [0.0, 2.0]
+        np.testing.assert_allclose(result["raw_action_chunks"][0], rows[:32], atol=1e-6)
+        np.testing.assert_allclose(result["raw_action_chunks"][1], rows[2:34], atol=1e-6)
+        assert len(policy._arm.targets) == 6
+
+    asyncio.run(scenario())
+
+
+def test_replay_clock_mode_and_file_source(tmp_path):
+    async def scenario():
+        rows = _replay_rows(40)
+        path = tmp_path / "episode.json"
+        path.write_text(json.dumps({"seed": 3, "actions": rows.tolist()}))
+        policy = FakePolicy(None, gripper_mode="binary")  # Lite6 profile
+        result = await policy.do_command(
+            {
+                "command": "execute",
+                "action_prefix_steps": 2,
+                "max_chunks": 3,
+                "replay": {"actions_path": str(path), "mode": "clock", "advance_steps": 16},
+            }
+        )
+        assert result["state"] == "completed"
+        frames = [entry["replay_frame"] for entry in result["server_timing"]]
+        assert frames == [0.0, 16.0, 32.0]
+        # past the end of the recording the chunk holds the last row
+        last_chunk = np.asarray(result["raw_action_chunks"][2])
+        np.testing.assert_allclose(last_chunk[8:], np.repeat(rows[-1:], 24, axis=0), atol=1e-6)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "replay",
+    [
+        {},
+        {"actions": [[0.0] * 7], "actions_path": "/tmp/x.json"},
+        {"actions": [[0.0] * 6]},
+        {"actions": [[0.0] * 6 + [1.5]]},
+        {"actions": [[0.0] * 7], "advance_steps": 0},
+    ],
+)
+def test_replay_rejects_malformed_specs(replay):
+    async def scenario():
+        policy = FakePolicy(None, gripper_mode="binary")  # Lite6 profile
+        with pytest.raises(Exception):
+            await policy.do_command(
+                {"command": "execute", "action_prefix_steps": 1, "replay": replay}
+            )
+        assert policy._arm.targets == []
+
+    asyncio.run(scenario())
+
+
+def test_lite6_profile_floor_admits_recorded_grasp_height():
+    """The recorded Lite6 grasp (viamrobotics/1009-tricam-25, episode 0, frame 99)
+    puts the TCP about 7.5 mm above the arm base; the v3 profile must admit it,
+    and the old 20 mm floor must be the thing that rejected it."""
+    profile = SAFETY_PROFILES[("lite6", "lite6_gripper")]
+    grasp_joints = tuple(
+        math.radians(value) for value in (-1.7, 62.7, 83.3, 0.0, 20.6, 54.3)
+    )
+    _x, _y, z = profile.fk(grasp_joints, profile.tcp_offset_m)
+    assert profile.name == "lite6-integrated-gripper-sim-v3"
+    assert profile.workspace_floor_m == 0.0
+    assert 0.0 <= z < 0.02, z
+    assert z >= profile.workspace_floor_m
