@@ -325,8 +325,7 @@ def test_deployed_start_leaves_weight_loading_to_the_server(tmp_path, mutation):
 def test_deployed_start_does_not_hash_vae(tmp_path):
     target = _deployed_export(tmp_path / "package")
     (target / "runtime" / "vae" / "fixture.bin").write_bytes(b"tampered")
-    policy = Policy("vae-start")
-    policy._config.model_path = str(target)
+    policy = _service("vae-start", target)
     supervisor = CapturingSupervisor()
     policy._policy_server = supervisor
 
