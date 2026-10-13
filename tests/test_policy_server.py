@@ -56,18 +56,12 @@ class CapturingLogger:
 
 
 class CapturingSupervisor:
-    def __init__(self, serves_other=False):
+    def __init__(self):
         self.commands = []
-        self.models = []
-        self._serves_other = serves_other
 
-    def start(self, command, host, port, readiness_timeout, environment=None, model=None):
+    def start(self, command, host, port, readiness_timeout, environment=None):
         self.commands.append(command)
-        self.models.append(model)
         return {"state": "healthy", "pid": 123}
-
-    def serves_other(self, model, host, port):
-        return self._serves_other
 
     def poll_failure(self):
         return None
@@ -340,7 +334,7 @@ def test_deployed_start_does_not_hash_vae(tmp_path):
     policy._policy_server = supervisor
 
     assert _start_deployed(policy)["state"] == "healthy"
-    assert supervisor.models == [target]
+    assert len(supervisor.commands) == 1
 
 
 @pytest.mark.parametrize(
@@ -490,7 +484,6 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
             fixed_camera_2="",
             wrist_camera="wrist",
             model_data_root=str(tmp_path),
-            model_path=None,
             policy_server_autoclose=False,
             binary_gripper_initial_state=0.0,
         )
@@ -516,66 +509,3 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
 
     asyncio.run(scenario())
 
-
-def test_supervisor_restarts_for_a_different_model_or_address(tmp_path, monkeypatch):
-    supervisor = PolicyServerSupervisor(tmp_path, "restart")
-    live = policy_server_module._ProcessInfo("1", "S")
-
-    def process_info(pid):
-        process = supervisor._process
-        if process is not None and process.pid == pid and process.poll() is not None:
-            return None
-        return live
-
-    monkeypatch.setattr(policy_server_module, "_process_info", process_info)
-    monkeypatch.setattr(policy_server_module, "_health_ready", lambda host, port: True)
-    command = [sys.executable, "-c", "import time; time.sleep(30)"]
-    old, new = Path("/models/old"), Path("/models/new")
-    try:
-        first = supervisor.start(command, "127.0.0.1", 8000, 1, model=old)
-        assert not supervisor.serves_other(old, "127.0.0.1", 8000)
-        assert supervisor.start(command, "127.0.0.1", 8000, 1, model=old)["idempotent"]
-        assert supervisor.serves_other(new, "127.0.0.1", 8000)
-        assert supervisor.serves_other(old, "127.0.0.1", 8001)
-
-        second = supervisor.start(command, "127.0.0.1", 8000, 1, model=new)
-
-        assert second["idempotent"] is False
-        assert second["pid"] != first["pid"]
-        assert json.loads(supervisor.state_path.read_text())["model"] == str(new)
-        assert not supervisor.serves_other(new, "127.0.0.1", 8000)
-    finally:
-        supervisor.stop(grace_seconds=1)
-
-
-def test_supervisor_leaves_unrecorded_model_running(tmp_path, monkeypatch):
-    supervisor = PolicyServerSupervisor(tmp_path, "legacy")
-    supervisor.root.mkdir(parents=True)
-    supervisor.state_path.write_text(
-        json.dumps({"pid": 4242, "start_ticks": "1", "host": "127.0.0.1", "port": 8000})
-    )
-    monkeypatch.setattr(
-        policy_server_module,
-        "_process_info",
-        lambda pid: policy_server_module._ProcessInfo("1", "S"),
-    )
-
-    assert not supervisor.serves_other(Path("/models/new"), "127.0.0.1", 8000)
-
-
-@pytest.mark.parametrize("serves_other", [True, False])
-def test_reconfigured_model_restarts_running_server(tmp_path, serves_other):
-    async def scenario():
-        target = _deployed_export(tmp_path / "package")
-        policy = Policy("reconfigured")
-        policy._config.model_path = str(target)
-        supervisor = CapturingSupervisor(serves_other=serves_other)
-        policy._policy_server = supervisor
-
-        policy._restart_policy_server_if_changed()
-        if policy._policy_server_restart_task is not None:
-            await policy._policy_server_restart_task
-
-        assert supervisor.models == ([target] if serves_other else [])
-
-    asyncio.run(scenario())

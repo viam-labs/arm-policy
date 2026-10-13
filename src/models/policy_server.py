@@ -264,31 +264,6 @@ class PolicyServerSupervisor:
         with self._lock:
             return self._poll_failure_locked()
 
-    @staticmethod
-    def _serves_other(
-        state: Mapping[str, Any], model: Path | None, host: str, port: int
-    ) -> bool:
-        # The launch command is not compared: it names the module directory,
-        # which changes on every module update. State written before the model
-        # was recorded is left alone rather than restarted on an upgrade.
-        recorded = state.get("model")
-        model_changed = (
-            model is not None and isinstance(recorded, str) and recorded != str(model)
-        )
-        return model_changed or (state.get("host"), state.get("port")) != (host, port)
-
-    def serves_other(self, model: Path, host: str, port: int) -> bool:
-        """Whether a live recorded server serves a different model or address."""
-        with self._lock:
-            state = self._read_state()
-            if state is None or not self._serves_other(state, model, host, port):
-                return False
-            identity = self._state_identity(state)
-            if identity is None:
-                return False
-            info = _process_info(identity[0])
-            return info is not None and info.state != "Z" and info.start_ticks == identity[1]
-
     def _has_state(self) -> bool:
         with self._lock:
             return self._read_state() is not None
@@ -307,16 +282,12 @@ class PolicyServerSupervisor:
         port: int,
         readiness_timeout: float = 30.0,
         environment: Mapping[str, str] | None = None,
-        model: Path | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             current = self._status_locked()
-            state = self._read_state() or {}
-            if current["state"] in ("starting", "healthy") and not (
-                self._serves_other(state, model, host, port)
-            ):
+            if current["state"] in ("starting", "healthy"):
                 return {**current, "idempotent": True}
-            if current["state"] != "absent":
+            if current["state"] in ("unhealthy", "exited"):
                 cleanup = self._stop_locked()
                 if not cleanup.get("stopped", False) and self._read_state() is not None:
                     raise RuntimeError(
@@ -361,7 +332,6 @@ class PolicyServerSupervisor:
                 "start_ticks": info.start_ticks,
                 "host": host,
                 "port": port,
-                **({} if model is None else {"model": str(model)}),
                 "ready_deadline": time.monotonic() + readiness_timeout,
             }
             self.state_path.write_text(
