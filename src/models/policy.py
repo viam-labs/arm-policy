@@ -1612,6 +1612,9 @@ class Policy(Generic, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         terminal_state = "completed"
         error = ""
+        # Each run starts from the configured gripper state, not from wherever
+        # the previous run left it (callers reset the scene, gripper included).
+        self._binary_gripper_state = self._config.binary_gripper_initial_state
         try:
             # Arm execution is always timestamped; the contract selects only
             # position-target versus binary-barrier gripper behavior.

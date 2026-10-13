@@ -770,6 +770,30 @@ def test_binary_lite6_stops_at_gripper_barrier_and_settles():
     asyncio.run(scenario())
 
 
+def test_each_binary_run_starts_from_the_configured_gripper_state():
+    async def scenario():
+        actions = _actions()
+        actions[:4, 6] = [0.0, 0.75, 0.75, 0.75]
+        gripper = PhysicalFakeGripper()
+        policy = FakePolicy(
+            pack_message({"action": actions}),
+            arm=PhysicalFakeArm(),
+            gripper=gripper,
+            gripper_mode="binary",
+        )
+
+        for _ in range(2):
+            result = await policy.do_command(
+                {"command": "execute", "action_prefix_steps": 4}
+            )
+            assert result["state"] == "completed"
+
+        # The second run closes again: it does not inherit "closed" from the first.
+        assert [command for command, _ in gripper.commands] == ["close", "close"]
+
+    asyncio.run(scenario())
+
+
 def test_physical_stop_cancels_stream_and_stops_viam_resources():
     async def scenario():
         arm = PhysicalFakeArm(block=True)
