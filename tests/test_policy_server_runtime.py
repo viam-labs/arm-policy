@@ -207,3 +207,29 @@ def test_active_chunk_transform_adds_zero_idle_frames_like_training_prompts():
 
     transform({"ai_caption": "x", "idle_frames": 5}, "480")
     assert seen[-1][0]["idle_frames"] == 5
+
+
+def test_server_command_override_file_wins_over_trained_size(tmp_path, monkeypatch):
+    meta = tmp_path / "runtime/dataset/meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text(
+        json.dumps({"features": {"observation.images.wrist_image_left": {"shape": [480, 640, 3]}}})
+    )
+    monkeypatch.setattr(
+        service_adapter, "_override_args", lambda: ["--image-height", "540", "--image-width", "640"]
+    )
+    command = service_adapter.PortableRobolabPolicyService.command(
+        model_view=tmp_path, contract=_contract(), host="127.0.0.1", port=8000
+    )
+    assert command.count("--image-height") == 1
+    assert command[command.index("--image-height") + 1] == "540"
+
+
+def test_override_file_is_read_from_the_runtime_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(service_adapter, "__file__", str(tmp_path / "service_adapter.py"))
+    assert service_adapter._override_args() == []
+    (tmp_path / "server_overrides.json").write_text('{"args": ["--num-steps", "8"]}')
+    assert service_adapter._override_args() == ["--num-steps", "8"]
+    (tmp_path / "server_overrides.json").write_text('{"args": "bad"}')
+    with pytest.raises(SystemExit):
+        service_adapter._override_args()

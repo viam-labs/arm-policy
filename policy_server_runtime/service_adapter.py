@@ -98,6 +98,26 @@ def _audit_hub_tree_metadata(warning: Callable[[str], None] = logging.warning) -
     return quarantined
 
 
+def _override_args() -> list[str]:
+    """Extra upstream server flags from an optional ``server_overrides.json`` next to this file.
+
+    The file holds ``{"args": ["--image-height", "720", ...]}``. It exists so an operator
+    can change inference-only settings (input image size, guidance, denoising steps)
+    without editing the packaged adapter; absent file means no extra flags.
+    """
+    path = Path(__file__).with_name("server_overrides.json")
+    if not path.is_file():
+        return []
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        args = document["args"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise SystemExit(f"invalid policy server overrides {path}: {exc}") from exc
+    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+        raise SystemExit(f"invalid policy server overrides {path}: args must be a list of strings")
+    return list(args)
+
+
 def training_image_size(model_view: Path) -> tuple[int, int] | None:
     """Height and width of the camera composite the model was trained on.
 
@@ -153,12 +173,15 @@ class PortableRobolabPolicyService:
         action = contract["action_schema"]
         framework = contract["framework"]
         transform = contract.get("transform", {})
+        overrides = _override_args()
         contract_path = model_view / "policy_contract.runtime.json"
         contract_path.write_text(json.dumps(contract, sort_keys=True) + "\n", encoding="utf-8")
         image_size = training_image_size(model_view)
         image_size_args = (
             ["--image-height", str(image_size[0]), "--image-width", str(image_size[1])]
             if image_size is not None
+            and "--image-height" not in overrides
+            and "--image-width" not in overrides
             else []
         )
         return [
@@ -172,6 +195,7 @@ class PortableRobolabPolicyService:
             "--guidance", "3.0", "--guidance-interval", "960", "1001", "--num-steps", "4", "--shift", "5.0",
             "--use-state" if framework["use_state"] else "--no-use-state",
             *image_size_args,
+            *overrides,
         ]
 
 

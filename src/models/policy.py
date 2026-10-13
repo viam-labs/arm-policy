@@ -55,6 +55,7 @@ from .model_store import (
     validate_revision,
 )
 from .policy_server import PolicyServerSupervisor, runtime_command
+from .replay_source import ReplayChunkSource, ReplaySpec
 from .trajectory_conditioner import (
     ALGORITHM,
     ALGORITHM_VERSION,
@@ -417,6 +418,16 @@ class ExecuteCommand(CommandModel):
     conditioner_algorithm: Literal["quintic", "toppra"]
     deadline_tolerance_sec: PositiveFiniteFloat
     progress_prop: Annotated[str, StringConstraints(strip_whitespace=True)] = ""
+    max_consecutive_rejections: Annotated[int, Field(ge=0, le=10)] = 0
+    """How many chunks in a row may fail safety validation before the run fails. A
+    rejected chunk executes nothing (the arm holds) and the policy is re-queried from a
+    fresh observation; 0 keeps the fail-closed default."""
+    action_smoothing_window: Annotated[int, Field(ge=1, le=15)] = 1
+    """Odd moving-average window applied to the six joint columns of each returned chunk
+    before conditioning; 1 disables it. Row-to-row jitter in a sampled chunk inflates the
+    TOPPRA path length and stretches its duration, so a short window keeps the executed
+    cadence close to the training labels without changing where the chunk goes."""
+    replay: ReplaySpec | None = None
 
     @model_validator(mode="after")
     def validate_prefix(self) -> Self:
@@ -427,6 +438,8 @@ class ExecuteCommand(CommandModel):
             raise ValueError(
                 "set only one of action_prefix_steps and action_prefix_duration_sec"
             )
+        if self.action_smoothing_window % 2 == 0:
+            raise ValueError("action_smoothing_window must be odd")
         if self.action_prefix_steps is None and self.action_prefix_duration_sec is None:
             raise ValueError(
                 "set one of action_prefix_steps and action_prefix_duration_sec"
@@ -468,6 +481,7 @@ class RunStatus:
     action_index: int = 0
     actions_executed: int = 0
     executed_prefixes: int = 0
+    rejected_chunks: int = 0
     chunks_inferred: int = 0
     inference_responses: int = 0
     inference_ms: list[float] = field(default_factory=list)
@@ -597,7 +611,7 @@ SAFETY_PROFILES = {
         fk=ur20_tcp_position,
     ),
     ("lite6", "lite6_gripper"): SafetyProfile(
-        name="lite6-integrated-gripper-sim-v2",
+        name="lite6-integrated-gripper-sim-v4",
         arm_model="lite6",
         gripper_model="lite6_gripper",
         joint_names=LITE6_JOINT_NAMES,
@@ -616,10 +630,11 @@ SAFETY_PROFILES = {
         velocity_limits=(1.2,) * 6,
         acceleration_limits=(10.0,) * 6,
         max_reach_m=0.70,
-        # Scripted sim grasps put the TCP 3-8 mm above the arm base plane
-        # (as low as -14 mm measured), so a floor above that rejects every
-        # grasp the policy was trained on.
-        workspace_floor_m=-0.02,
+        # Floor lowered from 0.02 to 0.0 (2026-10-13). In the sim cell the arm
+        # base sits 5 mm above the table top, and scripted grasps command the
+        # TCP 3-10 mm above the base, so 0.02 rejected every trained grasp. At
+        # 0.0 the TCP still stays above the table by the base offset.
+        workspace_floor_m=0.0,
         tcp_offset_m=0.0836,
         fk=lite6_tcp_position,
     ),
@@ -773,6 +788,8 @@ class Policy(Generic, EasyResource):
         self._wrist_camera: Camera
         self._config = Config._unconfigured()
         self._binary_gripper_state = 0.0
+        self._smoothing_window = 1
+        self._max_consecutive_rejections = 0
         self._owner_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._execution_task: Optional[asyncio.Task[Mapping[str, ValueTypes]]] = None
@@ -1305,6 +1322,22 @@ class Policy(Generic, EasyResource):
             )
         return record
 
+    def _smooth_actions(self, actions: np.ndarray) -> np.ndarray:
+        """Centered moving average over the joint columns; edges repeat the end rows."""
+        window = self._smoothing_window
+        if window <= 1:
+            return actions
+        pad = window // 2
+        padded = np.pad(actions[:, :6], ((pad, pad), (0, 0)), mode="edge")
+        kernel = np.full(window, 1.0 / window)
+        smoothed = np.stack(
+            [np.convolve(padded[:, joint], kernel, mode="valid") for joint in range(6)],
+            axis=1,
+        )
+        result = np.array(actions, dtype=np.float64, copy=True)
+        result[:, :6] = smoothed
+        return result
+
     def _condition_chunk(
         self,
         response: Any,
@@ -1313,6 +1346,8 @@ class Policy(Generic, EasyResource):
         conditioner_algorithm: str,
     ) -> tuple[np.ndarray, Mapping[str, Any], Mapping[str, Any]]:
         raw_actions, timing = self._parse_chunk(response)
+        unsmoothed_path_length = float(np.abs(np.diff(raw_actions[:, :6], axis=0)).sum())
+        raw_actions = self._smooth_actions(raw_actions)
         algorithm, version = (
             (TOPPRA_ALGORITHM, TOPPRA_ALGORITHM_VERSION)
             if conditioner_algorithm == "toppra"
@@ -1339,6 +1374,9 @@ class Policy(Generic, EasyResource):
             "selected_prefix_steps": prefix,
             "selected_prefix_duration_s": prefix * self._period_s,
             "observation_age_at_prefix_end_s": prefix * self._period_s,
+            "smoothing_window": self._smoothing_window,
+            "path_length_rad_before_smoothing": unsmoothed_path_length,
+            "path_length_rad": float(np.abs(np.diff(raw_actions[:, :6], axis=0)).sum()),
             "rejection_reason": "",
         }
         self._status.conditioning[-1] = _value_types(diagnostics)
@@ -1611,18 +1649,21 @@ class Policy(Generic, EasyResource):
         progress_prop: str,
         operation: Any,
         generation: int,
+        replay: ReplayChunkSource | None = None,
     ) -> Mapping[str, ValueTypes]:
         terminal_state = "completed"
         error = ""
-        # Each run starts from the configured gripper state, not from wherever
-        # the previous run left it (callers reset the scene, gripper included).
-        self._binary_gripper_state = self._config.binary_gripper_initial_state
         try:
             # Arm execution is always timestamped; the contract selects only
             # position-target versus binary-barrier gripper behavior.
             self._status.state = "connecting"
-            socket, metadata = await self._connect(operation, generation)
+            if replay is None:
+                socket, metadata = await self._connect(operation, generation)
+            else:
+                # Recorded rows stand in for the policy server; nothing else changes.
+                socket, metadata = None, replay.metadata()
             self._status.server_metadata = _value_types(metadata)
+            consecutive_rejections = 0
             for chunk_index in range(max_chunks):
                 if await self._cancelled(operation, generation):
                     raise asyncio.CancelledError
@@ -1687,22 +1728,26 @@ class Policy(Generic, EasyResource):
                 if await self._cancelled(operation, generation):
                     raise asyncio.CancelledError
                 started = time.monotonic()
-                await self._wait_cancellable(
-                    socket.send(pack_message(self._wire_observation(observation))),
-                    self._config.inference_timeout_sec,
-                    operation,
-                    generation,
-                    "policy request send",
-                )
-                raw = await self._recv(
-                    socket, self._config.inference_timeout_sec, operation, generation
-                )
-                inference_ms = (time.monotonic() - started) * 1000.0
-                if await self._cancelled(operation, generation):
-                    raise asyncio.CancelledError
-                if not isinstance(raw, bytes):
-                    raise RuntimeError(f"policy server returned text error: {raw}")
-                response = unpack_message(raw)
+                if replay is None:
+                    await self._wait_cancellable(
+                        socket.send(pack_message(self._wire_observation(observation))),
+                        self._config.inference_timeout_sec,
+                        operation,
+                        generation,
+                        "policy request send",
+                    )
+                    raw = await self._recv(
+                        socket, self._config.inference_timeout_sec, operation, generation
+                    )
+                    inference_ms = (time.monotonic() - started) * 1000.0
+                    if await self._cancelled(operation, generation):
+                        raise asyncio.CancelledError
+                    if not isinstance(raw, bytes):
+                        raise RuntimeError(f"policy server returned text error: {raw}")
+                    response = unpack_message(raw)
+                else:
+                    response = replay.respond(observation)
+                    inference_ms = (time.monotonic() - started) * 1000.0
                 self._status.inference_responses += 1
                 self._status.inference_ms.append(inference_ms)
                 if isinstance(response, Mapping):
@@ -1732,9 +1777,25 @@ class Policy(Generic, EasyResource):
                     raw_timing = response.get("server_timing")
                     if isinstance(raw_timing, Mapping):
                         self._status.server_timing.append(_value_types(raw_timing))
-                actions, _, diagnostics = self._condition_chunk(
-                    response, history, prefix, conditioner_algorithm
-                )
+                try:
+                    actions, _, diagnostics = self._condition_chunk(
+                        response, history, prefix, conditioner_algorithm
+                    )
+                except ValueError as exc:
+                    if consecutive_rejections >= self._max_consecutive_rejections:
+                        raise
+                    # Hold instead of failing: nothing is dispatched, the next chunk is
+                    # requested from a fresh observation of the unchanged arm state.
+                    consecutive_rejections += 1
+                    self._status.chunks_inferred += 1
+                    self._status.rejected_chunks += 1
+                    if self._status.conditioning:
+                        self._status.conditioning[-1]["rejection_reason"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        self._status.conditioning[-1]["held"] = True
+                    continue
+                consecutive_rejections = 0
                 execution_prefix = int(diagnostics["validated_prefix_steps"])
                 self._status.chunks_inferred += 1
                 self._status.state = "executing"
@@ -1835,8 +1896,15 @@ class Policy(Generic, EasyResource):
         conditioner_algorithm = command.conditioner_algorithm
         deadline_tolerance = command.deadline_tolerance_sec
         progress_prop = command.progress_prop
+        self._smoothing_window = command.action_smoothing_window
+        self._max_consecutive_rejections = command.max_consecutive_rejections
         if progress_prop and self._world is None:
             raise ValueError("progress_prop requires a configured world dependency")
+        replay = (
+            ReplayChunkSource.from_spec(command.replay)
+            if command.replay is not None
+            else None
+        )
         async with self._owner_lock:
             if self._execution_task is not None and not self._execution_task.done():
                 raise RuntimeError("policy execution is already in progress")
@@ -1845,6 +1913,10 @@ class Policy(Generic, EasyResource):
             generation = self._generation
             self._last_result = None
             self._status = self._idle_status()
+            # Each run starts from the configured initial gripper state: the workflow's
+            # scene setup establishes it physically, and the policy must observe that
+            # value rather than the last barrier of the previous run.
+            self._binary_gripper_state = self._config.binary_gripper_initial_state
             self._status.state = "connecting"
             self._status.run_id = str(uuid4())
             self._status.prompt = prompt
@@ -1862,6 +1934,7 @@ class Policy(Generic, EasyResource):
                     progress_prop,
                     operation,
                     generation,
+                    replay,
                 )
             )
             self._execution_task = task
