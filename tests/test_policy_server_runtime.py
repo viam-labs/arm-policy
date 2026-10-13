@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -147,3 +148,88 @@ def test_runtime_command_uses_module_python_for_lightweight_provisioner(tmp_path
         "--port",
         "8000",
     ]
+
+
+def _contract():
+    return {
+        "action_chunk_size": 32,
+        "action_schema": {"shape": [7]},
+        "conditioning_fps": 15.0,
+        "domain_name": "droid_lerobot",
+        "framework": {"action_space": "joint_pos", "use_state": True},
+        "transform": {"format_prompt_as_json": True, "resolution": "480"},
+    }
+
+
+def test_server_command_passes_the_trained_camera_composite_size(tmp_path):
+    meta = tmp_path / "runtime/dataset/meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text(
+        json.dumps(
+            {
+                "features": {
+                    "observation.images.wrist_image_left": {"shape": [480, 640, 3]},
+                    "observation.images.exterior_image_1_left": {"shape": [720, 1280, 3]},
+                }
+            }
+        )
+    )
+    command = service_adapter.PortableRobolabPolicyService.command(
+        model_view=tmp_path, contract=_contract(), host="127.0.0.1", port=8000
+    )
+    height = command.index("--image-height")
+    assert command[height : height + 4] == ["--image-height", "720", "--image-width", "640"]
+
+
+def test_server_command_keeps_upstream_image_size_without_dataset_info(tmp_path):
+    command = service_adapter.PortableRobolabPolicyService.command(
+        model_view=tmp_path, contract=_contract(), host="127.0.0.1", port=8000
+    )
+    assert "--image-height" not in command
+    assert "--image-width" not in command
+
+
+def test_active_chunk_transform_adds_zero_idle_frames_like_training_prompts():
+    from policy_server_runtime.service_adapter import ActiveChunkTransform
+
+    seen = []
+
+    def pipeline(sample, resolution):
+        seen.append((sample, resolution))
+        return "formatted"
+
+    transform = ActiveChunkTransform(pipeline, lambda: 0)
+    original = {"ai_caption": "pick up the block"}
+
+    assert transform(original, "480") == "formatted"
+    assert seen[-1] == ({"ai_caption": "pick up the block", "idle_frames": 0}, "480")
+    assert "idle_frames" not in original
+
+    transform({"ai_caption": "x", "idle_frames": 5}, "480")
+    assert seen[-1][0]["idle_frames"] == 5
+
+
+def test_server_command_override_file_wins_over_trained_size(tmp_path, monkeypatch):
+    meta = tmp_path / "runtime/dataset/meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text(
+        json.dumps({"features": {"observation.images.wrist_image_left": {"shape": [480, 640, 3]}}})
+    )
+    monkeypatch.setattr(
+        service_adapter, "_override_args", lambda: ["--image-height", "540", "--image-width", "640"]
+    )
+    command = service_adapter.PortableRobolabPolicyService.command(
+        model_view=tmp_path, contract=_contract(), host="127.0.0.1", port=8000
+    )
+    assert command.count("--image-height") == 1
+    assert command[command.index("--image-height") + 1] == "540"
+
+
+def test_override_file_is_read_from_the_runtime_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(service_adapter, "__file__", str(tmp_path / "service_adapter.py"))
+    assert service_adapter._override_args() == []
+    (tmp_path / "server_overrides.json").write_text('{"args": ["--num-steps", "8"]}')
+    assert service_adapter._override_args() == ["--num-steps", "8"]
+    (tmp_path / "server_overrides.json").write_text('{"args": "bad"}')
+    with pytest.raises(SystemExit):
+        service_adapter._override_args()

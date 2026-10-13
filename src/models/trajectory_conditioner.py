@@ -220,6 +220,47 @@ def _nearest_path_delta(
     return best_delta, best_index
 
 
+def _gripper_along_path(
+    actions: np.ndarray, joints: np.ndarray, waypoints: np.ndarray
+) -> np.ndarray:
+    """Gripper value for each conditioned sample, by progress along the path.
+
+    The joint path drops stationary waypoints, so mapping the 32 raw gripper
+    values evenly onto the shortened duration would move a gripper change
+    that follows a dwell (a grasp) forward into the preceding motion. Instead,
+    a raw step's gripper value applies once the arm has travelled as far along
+    the path as that step; steps in a dwell apply when the arm reaches it.
+    """
+    segment_lengths = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
+    waypoint_arc = np.r_[0.0, np.cumsum(segment_lengths)]
+    total = float(waypoint_arc[-1])
+    raw_steps = np.linalg.norm(np.diff(actions[:, :6], axis=0), axis=1)
+    # Count only the steps the path kept, so both arcs end at the same length.
+    raw_arc = np.r_[0.0, np.cumsum(np.where(raw_steps > _EPS, raw_steps, 0.0))]
+    sample_arc = np.empty(joints.shape[0], dtype=np.float64)
+    for index, position in enumerate(joints):
+        best = (math.inf, 0.0)
+        for start, end, length, offset in zip(
+            waypoints[:-1], waypoints[1:], segment_lengths, waypoint_arc[:-1]
+        ):
+            direction = end - start
+            progress = (
+                0.0
+                if length == 0.0
+                else float(np.clip((position - start) @ direction / length**2, 0.0, 1.0))
+            )
+            distance = float(np.linalg.norm(position - (start + progress * direction)))
+            if distance < best[0]:
+                best = (distance, offset + progress * length)
+        sample_arc[index] = best[1]
+    # Progress never runs backwards, and the trajectory ends at the path's end.
+    sample_arc = np.maximum.accumulate(sample_arc)
+    sample_arc[-1] = total
+    tolerance = 1e-9 * max(total, 1.0)
+    last_reached = np.searchsorted(raw_arc, sample_arc + tolerance, side="right") - 1
+    return actions[np.clip(last_reached, 0, actions.shape[0] - 1), 6]
+
+
 def condition_trajectory_toppra(
     raw_actions: np.ndarray,
     history: Sequence[np.ndarray],
@@ -283,7 +324,10 @@ def condition_trajectory_toppra(
     waypoints = waypoints[unique]
     geometric_duration = float(anchor.shape[0] * period_s)
     if waypoints.shape[0] < 2:
-        result = anchor
+        # The arm holds still for the whole chunk, so every gripper change in
+        # it is due once the anchor arrives.
+        result = anchor.copy()
+        result[-1, 6] = actions[-1, 6]
     else:
         path_grid = np.r_[
             0.0,
@@ -317,11 +361,7 @@ def condition_trajectory_toppra(
             path_duration,
         )
         joints = np.asarray(trajectory(sample_times), dtype=np.float64)
-        gripper = np.interp(
-            sample_times,
-            np.linspace(0.0, path_duration, actions.shape[0]),
-            actions[:, 6],
-        )
+        gripper = _gripper_along_path(actions, joints, waypoints)
         result = np.vstack((anchor, np.column_stack((joints, gripper))))
         geometric_duration += path_duration
     sample_count = int(result.shape[0])

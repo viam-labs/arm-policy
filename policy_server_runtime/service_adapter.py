@@ -98,6 +98,68 @@ def _audit_hub_tree_metadata(warning: Callable[[str], None] = logging.warning) -
     return quarantined
 
 
+def _override_args() -> list[str]:
+    """Extra upstream server flags from an optional ``server_overrides.json`` next to this file.
+
+    The file holds ``{"args": ["--image-height", "720", ...]}``. It exists so an operator
+    can change inference-only settings (input image size, guidance, denoising steps)
+    without editing the packaged adapter; absent file means no extra flags.
+    """
+    path = Path(__file__).with_name("server_overrides.json")
+    if not path.is_file():
+        return []
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        args = document["args"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise SystemExit(f"invalid policy server overrides {path}: {exc}") from exc
+    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+        raise SystemExit(f"invalid policy server overrides {path}: args must be a list of strings")
+    return list(args)
+
+
+def training_image_size(model_view: Path) -> tuple[int, int] | None:
+    """Height and width of the camera composite the model was trained on.
+
+    Training stacks the wrist view on top of the two exterior views, each
+    resized to half the wrist size, so the composite is 1.5x the wrist height
+    by the wrist width. The upstream server otherwise resizes every composite to
+    its DROID default of 540x640, which squashes other camera layouts.
+    """
+    info_path = model_view / "runtime/dataset/meta/info.json"
+    try:
+        features = json.loads(info_path.read_text(encoding="utf-8"))["features"]
+        height, width = features["observation.images.wrist_image_left"]["shape"][:2]
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(height, int) or not isinstance(width, int) or height <= 0 or width <= 0:
+        return None
+    return height + height // 2, width
+
+
+class ActiveChunkTransform:
+    """Give each request the idle-frame count the policy trained with.
+
+    Training prompts (format_prompt_as_json) state how many of the chunk's
+    frames are idle, computed from the future actions. A request has no future,
+    so the upstream DROID-style server leaves the field out and the model sees
+    a prompt shape it never trained on. NVIDIA's LIBERO server sends 0, the
+    active-manipulation case; do the same here.
+    """
+
+    def __init__(self, inner: Callable[..., Any], idle_frames: Callable[[], Any]) -> None:
+        self._inner = inner
+        self._idle_frames = idle_frames
+
+    def __call__(self, sample: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
+        if "idle_frames" not in sample:
+            sample = {**sample, "idle_frames": self._idle_frames()}
+        return self._inner(sample, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
 class PortableRobolabPolicyService:
     @staticmethod
     def command(
@@ -111,8 +173,17 @@ class PortableRobolabPolicyService:
         action = contract["action_schema"]
         framework = contract["framework"]
         transform = contract.get("transform", {})
+        overrides = _override_args()
         contract_path = model_view / "policy_contract.runtime.json"
         contract_path.write_text(json.dumps(contract, sort_keys=True) + "\n", encoding="utf-8")
+        image_size = training_image_size(model_view)
+        image_size_args = (
+            ["--image-height", str(image_size[0]), "--image-width", str(image_size[1])]
+            if image_size is not None
+            and "--image-height" not in overrides
+            and "--image-width" not in overrides
+            else []
+        )
         return [
             str(python), str(Path(__file__).resolve()), "--portable-contract", str(contract_path),
             "--checkpoint-path", str(model_view), "--host", host, "--port", str(port),
@@ -123,6 +194,8 @@ class PortableRobolabPolicyService:
             "--resolution", str(transform.get("resolution", "720p")),
             "--guidance", "3.0", "--guidance-interval", "960", "1001", "--num-steps", "4", "--shift", "5.0",
             "--use-state" if framework["use_state"] else "--no-use-state",
+            *image_size_args,
+            *overrides,
         ]
 
 
@@ -154,15 +227,20 @@ def main() -> None:
             del training_config
             model_max = getattr(getattr(self.model, "config", None), "max_action_dim", 64)
             transform = contract.get("transform", {})
+            import torch
+
             return (
-                ActionTransformPipeline(
-                    max_action_dim=int(model_max),
-                    cfg_dropout_rate=0.0,
-                    format_prompt_as_json=bool(transform.get("format_prompt_as_json", False)),
-                    append_viewpoint_info=bool(transform.get("append_viewpoint_info", True)),
-                    append_duration_fps_timestamps=bool(transform.get("append_duration_fps_timestamps", True)),
-                    append_resolution_info=bool(transform.get("append_resolution_info", True)),
-                    append_idle_frames=bool(transform.get("append_idle_frames", False)),
+                ActiveChunkTransform(
+                    ActionTransformPipeline(
+                        max_action_dim=int(model_max),
+                        cfg_dropout_rate=0.0,
+                        format_prompt_as_json=bool(transform.get("format_prompt_as_json", False)),
+                        append_viewpoint_info=bool(transform.get("append_viewpoint_info", True)),
+                        append_duration_fps_timestamps=bool(transform.get("append_duration_fps_timestamps", True)),
+                        append_resolution_info=bool(transform.get("append_resolution_info", True)),
+                        append_idle_frames=bool(transform.get("append_idle_frames", False)),
+                    ),
+                    lambda: torch.tensor(0, dtype=torch.long),
                 ),
                 {"action_chunk_size": int(contract["action_chunk_size"]), "conditioning_fps": float(contract["conditioning_fps"]), "resolution": str(transform.get("resolution", "720p"))},
             )

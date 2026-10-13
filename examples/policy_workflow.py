@@ -123,15 +123,22 @@ async def prepare_lite6_setup(
     seed: int,
     prop: str,
     gripper_settle_sec: float = DEFAULT_GRIPPER_SETTLE_SEC,
+    home_joint_degrees: Sequence[float] | None = None,
+    prop_pose: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
-    """Home the Lite6 and optionally reset its simulated pick scene."""
-    await arm.move_to_joint_positions(JointPositions(values=list(HOME_JOINT_DEGREES)))
+    """Home the Lite6 and optionally reset its simulated pick scene.
+
+    ``home_joint_degrees`` and ``prop_pose`` (a ``set_prop_pose`` command body with
+    ``position`` and ``orientation_wxyz``) override the defaults and the seeded sample,
+    so a recorded episode can be replayed from exactly its own start state."""
+    home = list(home_joint_degrees) if home_joint_degrees is not None else list(HOME_JOINT_DEGREES)
+    await arm.move_to_joint_positions(JointPositions(values=home))
     await gripper.open()
     await asyncio.sleep(gripper_settle_sec)
     robot_setup = {
         "performed": True,
         "robot_prepared": True,
-        "home_joint_degrees": list(HOME_JOINT_DEGREES),
+        "home_joint_degrees": home,
     }
     if world is None:
         return {**robot_setup, "scene_reset": False}
@@ -139,7 +146,11 @@ async def prepare_lite6_setup(
         _arm_base_pose(machine, arm_frame),
         _world_pick_region(machine, arm_frame),
     )
-    position, orientation = sample_prop_pose(seed, world_region)
+    if prop_pose is not None:
+        position = tuple(float(v) for v in prop_pose["position"])
+        orientation = tuple(float(v) for v in prop_pose["orientation_wxyz"])
+    else:
+        position, orientation = sample_prop_pose(seed, world_region)
     pose = await world.do_command(
         {
             "command": "set_prop_pose",
@@ -278,6 +289,11 @@ def workflow_summary(
             "",
             "Run",
             f"  Prompt:     {result.get('prompt') or args.prompt or '(component default)'}",
+            *(
+                [f"  Replay:     {args.replay_json} ({args.replay_mode})"]
+                if getattr(args, "replay_json", None)
+                else []
+            ),
             f"  Control:    {result.get('conditioner_algorithm', args.conditioner_algorithm)}; {prefix}; max_chunks={args.max_chunks}",
             f"  Started:    {started_at}",
             f"  Result:     {str(result.get('state', 'unknown')).upper()} after {_run_duration(result)}",
@@ -372,6 +388,20 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
         assert options.dial_options is not None
         options.dial_options.disable_webrtc = True
 
+    replay_document: dict[str, Any] = {}
+    if args.replay_json:
+        replay_document = json.loads(Path(args.replay_json).read_text(encoding="utf-8"))
+        if not isinstance(replay_document.get("actions"), list):
+            raise ValueError(f"{args.replay_json} must hold an 'actions' list of [7] rows")
+    elif args.scene_json:
+        # Same document format as --replay-json, but only the scene (home pose, block
+        # pose, seed) is used: the policy server is still called for the actions.
+        replay_document = json.loads(Path(args.scene_json).read_text(encoding="utf-8"))
+    if replay_document and args.seed is None and isinstance(replay_document.get("seed"), int):
+        args.seed = replay_document["seed"]
+    if args.seed is None:
+        args.seed = 0
+
     async with await RobotClient.at_address(args.address, options) as machine:
         policy = Generic.from_robot(machine, args.policy)
         before = await policy.do_command({"command": "status"})
@@ -396,6 +426,8 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
                 seed=args.seed,
                 gripper_settle_sec=args.gripper_settle_sec,
                 prop=args.prop,
+                home_joint_degrees=replay_document.get("home_joint_degrees"),
+                prop_pose=replay_document.get("set_prop_pose_command"),
             )
         command: dict[str, Any] = {
             "command": "execute",
@@ -411,8 +443,26 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
             command["deadline_tolerance_sec"] = args.deadline_tolerance_sec
         if args.progress_prop:
             command["progress_prop"] = args.progress_prop
+        if args.action_smoothing_window is not None:
+            command["action_smoothing_window"] = args.action_smoothing_window
+        if args.max_consecutive_rejections is not None:
+            command["max_consecutive_rejections"] = args.max_consecutive_rejections
         if args.prompt:
             command["prompt"] = args.prompt
+        if args.replay_json:
+            command["replay"] = {
+                "actions": replay_document["actions"],
+                "mode": args.replay_mode,
+                "advance_steps": args.replay_advance_steps,
+            }
+        elif args.replay_path:
+            # Rows (optionally with per-row episode ids) read by the module from its host.
+            command["replay"] = {
+                "actions_path": args.replay_path,
+                "mode": args.replay_mode,
+                "advance_steps": args.replay_advance_steps,
+                "gripper_weight": args.replay_gripper_weight,
+            }
         result = await policy.do_command(command)
         after = await policy.do_command({"command": "status"})
         evidence = {
@@ -468,8 +518,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="optional world prop queried before and after each executed prefix",
     )
     parser.add_argument(
-        "--seed", type=int, default=0, help="deterministic scene reset seed"
+        "--seed",
+        type=int,
+        default=None,
+        help="deterministic scene reset seed (default: the replay file's seed, else 0)",
     )
+    parser.add_argument(
+        "--replay-json",
+        help="JSON file with recorded 'actions' rows (and optional 'seed'); the policy "
+        "replays them instead of calling the policy server",
+    )
+    parser.add_argument(
+        "--scene-json",
+        help="JSON file with 'home_joint_degrees', 'set_prop_pose_command' and 'seed' "
+        "(a replay file works); sets up the scene without replaying its actions",
+    )
+    parser.add_argument(
+        "--replay-path",
+        help="path on the module host to a JSON with 'actions' rows and optional "
+        "'episodes' ids; combine with --scene-json for the scene",
+    )
+    parser.add_argument("--replay-gripper-weight", type=float, default=1.0)
+    parser.add_argument("--replay-mode", choices=("nearest", "clock"), default="nearest")
+    parser.add_argument("--replay-advance-steps", type=int, default=16)
     parser.add_argument(
         "--gripper-settle-sec",
         type=float,
@@ -488,6 +559,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--conditioner-algorithm", choices=("quintic", "toppra"))
     prefix.add_argument("--action-prefix-duration-sec", type=float)
     parser.add_argument("--deadline-tolerance-sec", type=float)
+    parser.add_argument(
+        "--max-consecutive-rejections",
+        type=int,
+        help="chunks in a row that may fail safety validation (arm holds) before the run fails; default 0",
+    )
+    parser.add_argument(
+        "--action-smoothing-window",
+        type=int,
+        help="odd moving-average window over each chunk's joint columns (1 = off)",
+    )
     parser.add_argument(
         "--output", help="write structured workflow evidence to this JSON file"
     )
