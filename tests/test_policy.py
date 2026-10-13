@@ -1157,7 +1157,7 @@ def test_lite6_profile_floor_admits_recorded_grasp_height():
     )
     _x, _y, z = profile.fk(grasp_joints, profile.tcp_offset_m)
     assert profile.name == "lite6-integrated-gripper-sim-v4"
-    assert profile.workspace_floor_m == 0.0
+    assert profile.workspace_floor_m == -0.005
     assert 0.0 <= z < 0.02, z
     assert z >= profile.workspace_floor_m
 

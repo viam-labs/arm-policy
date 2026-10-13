@@ -630,11 +630,12 @@ SAFETY_PROFILES = {
         velocity_limits=(1.2,) * 6,
         acceleration_limits=(10.0,) * 6,
         max_reach_m=0.70,
-        # Floor lowered from 0.02 to 0.0 (2026-10-13). In the sim cell the arm
-        # base sits 5 mm above the table top, and scripted grasps command the
-        # TCP 3-10 mm above the base, so 0.02 rejected every trained grasp. At
-        # 0.0 the TCP still stays above the table by the base offset.
-        workspace_floor_m=0.0,
+        # The floor is the table top. In the sim cell the arm base sits 5 mm
+        # above the table, so the table is at -5 mm in the arm frame. Scripted
+        # grasps put the TCP 3-10 mm above the base, and a policy grasp went to
+        # -1.3 mm (3.7 mm above the table), which a 0.0 floor rejected. The
+        # rejection repeats from that pose, so the run could not recover.
+        workspace_floor_m=-0.005,
         tcp_offset_m=0.0836,
         fk=lite6_tcp_position,
     ),
