@@ -213,6 +213,11 @@ class Config(BaseModel):
     binary_gripper_close_threshold: UnitFloat = 0.6
     binary_gripper_initial_state: BinaryFloat = 0.0
     binary_gripper_settle_sec: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 3.0
+    # The upstream Cosmos policy server inverts the gripper on the way in
+    # (observation/gripper_position) and on the way out (action[:, -1]) for
+    # DROID variants recorded with the opposite convention. Datasets trained
+    # without that flip (e.g. droid_lerobot_20260115_no_noops) need both undone.
+    undo_server_gripper_flip: bool = False
     max_chunks: Annotated[int, Field(ge=1, le=100)] = 1
     action_prefix_steps: Annotated[int, Field(ge=1, le=32)] | None = None
     action_prefix_duration_sec: PositiveFiniteFloat | None = None
@@ -1142,6 +1147,14 @@ class Policy(Generic, EasyResource):
             self._socket = None
             raise
 
+    def _wire_observation(self, observation: Mapping[str, Any]) -> dict[str, Any]:
+        """Return the observation as sent, pre-inverting the gripper if needed."""
+        wire = dict(observation)
+        if self._config.undo_server_gripper_flip:
+            gripper = np.asarray(observation["observation/gripper_position"])
+            wire["observation/gripper_position"] = (1.0 - gripper).astype(gripper.dtype)
+        return wire
+
     def _parse_chunk(self, response: Any) -> tuple[np.ndarray, Mapping[str, Any]]:
         if not isinstance(response, Mapping):
             raise ValueError("policy response must be an object")
@@ -1157,7 +1170,11 @@ class Policy(Generic, EasyResource):
         timing = response.get("server_timing", {})
         if not isinstance(timing, Mapping):
             raise ValueError("server_timing must be an object")
-        return np.asarray(actions, dtype=np.float64), dict(timing)
+        parsed = np.asarray(actions, dtype=np.float64)
+        if self._config.undo_server_gripper_flip:
+            parsed = parsed.copy()
+            parsed[:, -1] = 1.0 - parsed[:, -1]
+        return parsed, dict(timing)
 
     def _validate_joint_positions(self, actions: np.ndarray) -> None:
         profile = self._config.profile
@@ -1671,7 +1688,7 @@ class Policy(Generic, EasyResource):
                 started = time.monotonic()
                 if replay is None:
                     await self._wait_cancellable(
-                        socket.send(pack_message(observation)),
+                        socket.send(pack_message(self._wire_observation(observation))),
                         self._config.inference_timeout_sec,
                         operation,
                         generation,

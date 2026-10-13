@@ -1131,3 +1131,31 @@ def test_lite6_profile_floor_admits_recorded_grasp_height():
     assert profile.workspace_floor_m == 0.0
     assert 0.0 <= z < 0.02, z
     assert z >= profile.workspace_floor_m
+
+
+def test_undo_server_gripper_flip_inverts_sent_state_and_returned_gripper():
+    policy = FakePolicy(b"")
+    policy._config.undo_server_gripper_flip = True
+    observation = {
+        "observation/joint_position": np.zeros(6, dtype=np.float32),
+        "observation/gripper_position": np.array([0.0], dtype=np.float32),
+    }
+    wire = policy._wire_observation(observation)
+    assert wire["observation/gripper_position"].tolist() == [1.0]
+    assert wire["observation/gripper_position"].dtype == np.float32
+    assert observation["observation/gripper_position"].tolist() == [0.0]
+
+    actions = _actions()
+    actions[:, :6] = 0.1
+    parsed, _timing = policy._parse_chunk({"action": actions})
+    assert parsed[:, 6] == pytest.approx(0.75)
+    assert parsed[:, :6] == pytest.approx(0.1)
+    assert actions[0, 6] == pytest.approx(0.25)
+
+
+def test_gripper_passes_through_unchanged_by_default():
+    policy = FakePolicy(b"")
+    observation = {"observation/gripper_position": np.array([0.0], dtype=np.float32)}
+    assert policy._wire_observation(observation)["observation/gripper_position"].tolist() == [0.0]
+    parsed, _timing = policy._parse_chunk({"action": _actions()})
+    assert parsed[:, 6] == pytest.approx(0.25)
