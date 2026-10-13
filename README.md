@@ -20,17 +20,3 @@ Build the registry archive with:
 ```sh
 make module.tar.gz
 ```
-
-The archive's entrypoint, `dist/arm-policy`, is a launcher for `run.sh` that the
-build generates. It is deliberately not committed: Viam cloud build treats a
-module whose entrypoint already exists in source as pre-built and skips `make`.
-
-Hot reload the working tree onto a machine with a cloud build:
-
-```sh
-viam module reload --part-id <part-id>
-```
-
-`viam module reload-local --part-id <part-id>` builds on your workstation
-instead; on macOS prefix it with `COPYFILE_DISABLE=1` to keep `._*` metadata
-files out of the archive.
