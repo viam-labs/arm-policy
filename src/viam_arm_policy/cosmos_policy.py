@@ -171,23 +171,21 @@ class CosmosPolicy(MLModel, EasyResource):
     ) -> None:
         parsed = CosmosConfig.model_validate(struct_to_dict(config.attributes))
         self._detach_policy_server_watcher()
-        self._cancel_server_start()
         previous = self._config
-        if (
-            previous is not None
-            and self._policy_server is not None
+        # A new package version arrives as a new model_path; a retained server
+        # would keep serving the previous weights.
+        stale = (
+            self._policy_server
+            if previous is not None
             and (parsed.policy_server_autoclose or parsed.model_path != previous.model_path)
-        ):
-            # A new package version arrives as a new model_path; a retained server
-            # would keep serving the previous weights.
-            self._policy_server.stop()
+            else None
+        )
         self._config = parsed
         self._policy_server = PolicyServerSupervisor(parsed.data_root, self.name)
         self._contract_json = None
         self._load_contract()
         self._ensure_policy_server_watcher()
-        if parsed.server_uri is None:
-            self._schedule_server_start()
+        self._schedule_server_start(stale)
 
     def _require_config(self) -> CosmosConfig:
         if self._config is None:
@@ -289,26 +287,31 @@ class CosmosPolicy(MLModel, EasyResource):
         if task is not None and not task.done():
             task.cancel()
 
-    def _schedule_server_start(self) -> None:
+    def _schedule_server_start(self, stale: PolicyServerSupervisor | None = None) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
         self._server_task = loop.create_task(
-            self._start_policy_server_in_background(), name=f"policy-server-start:{self.name}"
+            self._start_policy_server_in_background(self._server_task, stale),
+            name=f"policy-server-start:{self.name}",
         )
 
-    async def _start_policy_server_in_background(self) -> None:
+    async def _start_policy_server_in_background(
+        self, previous: asyncio.Task[None] | None, stale: PolicyServerSupervisor | None
+    ) -> None:
         try:
-            await self._start_policy_server()
+            if previous is not None:
+                # Cancelling would leave its start thread racing this one on the state file.
+                await asyncio.gather(previous, return_exceptions=True)
+            if stale is not None:
+                await asyncio.to_thread(stale.stop)
+            if self._require_config().server_uri is None:
+                await self._start_policy_server()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._server_error = f"{type(exc).__name__}: {exc}"
-
-    async def _policy_server_status(self) -> Mapping[str, ValueTypes]:
-        self._ensure_policy_server_watcher()
-        return await asyncio.to_thread(self._policy_server.status)
 
     async def _stop_policy_server(self) -> Mapping[str, ValueTypes]:
         self._cancel_server_start()
