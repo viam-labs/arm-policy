@@ -190,6 +190,7 @@ def test_reconfigure_and_close_only_stop_server_when_configured(tmp_path, autocl
         service.reconfigure(
             _config({"model_path": str(tmp_path), "policy_server_autoclose": autoclose}), {}
         )
+        await service._server_task
         assert existing.stopped == (1 if autoclose else 0)
         service._policy_server = existing
         await service.close()
@@ -217,28 +218,63 @@ def test_reconfigure_starts_server_and_restarts_only_when_model_path_changes(tmp
     async def scenario():
         service = CosmosPolicy("cosmos")
         service.reconfigure(_config({"model_path": str(tmp_path / "v1")}), {})
-        await asyncio.sleep(0)
+        await service._server_task
         assert starts == [str(tmp_path / "v1")]
         running = RecordingServer()
         service._policy_server = running
 
         # Unrelated attribute change: retained server, idempotent start.
         service.reconfigure(_config({"model_path": str(tmp_path / "v1"), "policy_server_port": 8001}), {})
-        await asyncio.sleep(0)
+        await service._server_task
         assert running.stops == 0 and len(starts) == 2
 
         # New package version: the old server must not keep serving old weights.
         # (Each reconfigure builds a fresh supervisor over the same state file.)
         service._policy_server = running
         service.reconfigure(_config({"model_path": str(tmp_path / "v2")}), {})
-        await asyncio.sleep(0)
+        await service._server_task
         assert running.stops == 1 and starts[-1] == str(tmp_path / "v2")
 
         # External server: nothing to manage.
         service._policy_server = RecordingServer()
         service.reconfigure(_config({"model_path": str(tmp_path / "v2"), "server_uri": "ws://gpu:9000"}), {})
-        await asyncio.sleep(0)
+        await service._server_task
         assert len(starts) == 3
+        await service.close()
+
+    asyncio.run(scenario())
+
+
+def test_reconfigure_waits_for_the_in_flight_start_before_stopping_or_starting(tmp_path, monkeypatch):
+    """Two starts racing on one state file orphan a server; the second must queue."""
+    release = asyncio.Event()
+    starts = []
+
+    async def slow_start(self):
+        starts.append(self._config.model_path)
+        await release.wait()
+        return {"state": "healthy"}
+
+    monkeypatch.setattr(CosmosPolicy, "_start_policy_server", slow_start)
+
+    class RecordingServer:
+        stops = 0
+
+        def stop(self):
+            self.stops += 1
+
+    async def scenario():
+        service = CosmosPolicy("cosmos")
+        service.reconfigure(_config({"model_path": str(tmp_path / "v1")}), {})
+        await asyncio.sleep(0)
+        running = RecordingServer()
+        service._policy_server = running
+        service.reconfigure(_config({"model_path": str(tmp_path / "v2")}), {})
+        await asyncio.sleep(0.05)
+        assert starts == [str(tmp_path / "v1")] and running.stops == 0
+        release.set()
+        await service._server_task
+        assert starts == [str(tmp_path / "v1"), str(tmp_path / "v2")] and running.stops == 1
         await service.close()
 
     asyncio.run(scenario())
