@@ -228,11 +228,14 @@ def test_policy_logs_redacted_startup_failure(tmp_path, monkeypatch):
             lambda *args: [sys.executable, "-c", program],
         )
 
-        with pytest.raises(RuntimeError, match="exit_status=9"):
-            await policy._start_policy_server()
+        try:
+            await policy._start_policy_server_in_background(None, None)
+        finally:
+            policy._detach_policy_server_watcher()
 
+        assert "exit_status=9" in policy._server_error
         assert len(logger.errors) == 1
-        assert "failed during startup" in logger.errors[0]
+        assert "start failed" in logger.errors[0]
         assert "inherited-secret" not in logger.errors[0]
         assert len(logger.infos) == 1
         assert "start requested" in logger.infos[0]
@@ -261,7 +264,8 @@ def test_policy_logs_server_start_and_readiness(tmp_path, monkeypatch):
         assert "ready" in logger.infos[1]
         assert f"pid={result['pid']}" in logger.infos[1]
         assert logger.errors == []
-        await policy._stop_policy_server()
+        policy._detach_policy_server_watcher()
+        await asyncio.to_thread(policy._policy_server.stop)
 
     asyncio.run(scenario())
 
@@ -403,7 +407,8 @@ def test_expected_stop_is_silent_and_releases_watcher(tmp_path, monkeypatch):
         policy._ensure_policy_server_watcher()
 
         await asyncio.sleep(0.05)
-        await policy._stop_policy_server()
+        policy._detach_policy_server_watcher()
+        await asyncio.to_thread(policy._policy_server.stop)
         deadline = time.monotonic() + 2
         while policy._policy_server_watch_task is not None and time.monotonic() < deadline:
             await asyncio.sleep(0.02)
