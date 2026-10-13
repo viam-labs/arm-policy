@@ -393,8 +393,12 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
         replay_document = json.loads(Path(args.replay_json).read_text(encoding="utf-8"))
         if not isinstance(replay_document.get("actions"), list):
             raise ValueError(f"{args.replay_json} must hold an 'actions' list of [7] rows")
-        if args.seed is None and isinstance(replay_document.get("seed"), int):
-            args.seed = replay_document["seed"]
+    elif args.scene_json:
+        # Same document format as --replay-json, but only the scene (home pose, block
+        # pose, seed) is used: the policy server is still called for the actions.
+        replay_document = json.loads(Path(args.scene_json).read_text(encoding="utf-8"))
+    if replay_document and args.seed is None and isinstance(replay_document.get("seed"), int):
+        args.seed = replay_document["seed"]
     if args.seed is None:
         args.seed = 0
 
@@ -511,6 +515,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--replay-json",
         help="JSON file with recorded 'actions' rows (and optional 'seed'); the policy "
         "replays them instead of calling the policy server",
+    )
+    parser.add_argument(
+        "--scene-json",
+        help="JSON file with 'home_joint_degrees', 'set_prop_pose_command' and 'seed' "
+        "(a replay file works); sets up the scene without replaying its actions",
     )
     parser.add_argument("--replay-mode", choices=("nearest", "clock"), default="nearest")
     parser.add_argument("--replay-advance-steps", type=int, default=16)
