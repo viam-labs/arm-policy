@@ -609,10 +609,12 @@ SAFETY_PROFILES = {
         ),
         # Isaac 5.0 step-response measurement at 20 Hz (2026-09-17): every
         # joint achieved >=0.593 rad/s and >=8.242 rad/s² across three safe
-        # poses. The articulation exposes drive gains/effort but no explicit
-        # velocity or acceleration cap, so v2 stays below both measured minima.
-        velocity_limits=(0.5,) * 6,
-        acceleration_limits=(8.0,) * 6,
+        # poses. Scripted training picks (114 episodes, 2026-10-13) drive the
+        # sim arm faster: measured joint speed p99 up to 1.04 rad/s (max 1.76)
+        # and acceleration p99 up to ~9.7 rad/s². Limits below those made the
+        # arm lag every chunk it was trained to follow, so allow p99 motion.
+        velocity_limits=(1.2,) * 6,
+        acceleration_limits=(10.0,) * 6,
         max_reach_m=0.70,
         # Scripted sim grasps put the TCP 3-8 mm above the arm base plane
         # (as low as -14 mm measured), so a floor above that rejects every

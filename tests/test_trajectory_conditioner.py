@@ -64,8 +64,9 @@ def test_toppra_preserves_path_without_stopping_at_every_waypoint():
 
     assert conditioned.shape[0] < stopped.shape[0]
     np.testing.assert_allclose(conditioned[-1, :6], raw[-1, :6], atol=1e-9)
-    assert max(diagnostics["conditioned_metrics"]["max_abs_velocity_rad_s"]) <= 0.5
-    assert max(diagnostics["conditioned_metrics"]["max_abs_acceleration_rad_s2"]) <= 8.0
+    metrics = diagnostics["conditioned_metrics"]
+    assert max(metrics["max_abs_velocity_rad_s"]) <= max(profile.velocity_limits)
+    assert max(metrics["max_abs_acceleration_rad_s2"]) <= max(profile.acceleration_limits)
     assert diagnostics["max_path_deviation_rad"] <= math.radians(5.0)
 
 
