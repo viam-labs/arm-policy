@@ -137,29 +137,6 @@ def training_image_size(model_view: Path) -> tuple[int, int] | None:
     return height + height // 2, width
 
 
-class ActiveChunkTransform:
-    """Give each request the idle-frame count the policy trained with.
-
-    Training prompts (format_prompt_as_json) state how many of the chunk's
-    frames are idle, computed from the future actions. A request has no future,
-    so the upstream DROID-style server leaves the field out and the model sees
-    a prompt shape it never trained on. NVIDIA's LIBERO server sends 0, the
-    active-manipulation case; do the same here.
-    """
-
-    def __init__(self, inner: Callable[..., Any], idle_frames: Callable[[], Any]) -> None:
-        self._inner = inner
-        self._idle_frames = idle_frames
-
-    def __call__(self, sample: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
-        if "idle_frames" not in sample:
-            sample = {**sample, "idle_frames": self._idle_frames()}
-        return self._inner(sample, *args, **kwargs)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
-
-
 class PortableRobolabPolicyService:
     @staticmethod
     def command(
@@ -235,20 +212,26 @@ def main() -> None:
             del training_config
             model_max = getattr(getattr(self.model, "config", None), "max_action_dim", 64)
             transform = contract.get("transform", {})
-            import torch
 
+            # Do not inject an idle-frame count into the request. With
+            # append_idle_frames, training prompts carry "idle_frame: N out of
+            # 33" computed from the chunk's own future actions, so the model
+            # learns to read N as "how long to hold still". A request has no
+            # future. Serving a constant 0 (NVIDIA's LIBERO choice) tells the
+            # model every chunk is a no-pause chunk: on the Lite6 pick task it
+            # descends to the cube and never closes (0/15 and 0/4 on Oct 13,
+            # 0/1 on arm-policy 0.0.4 on Oct 14). Leaving the field out lets the
+            # model decide from the images, which grabs 9/10 to 10/10 across
+            # the multi-1 models with the same executor.
             return (
-                ActiveChunkTransform(
-                    ActionTransformPipeline(
-                        max_action_dim=int(model_max),
-                        cfg_dropout_rate=0.0,
-                        format_prompt_as_json=bool(transform.get("format_prompt_as_json", False)),
-                        append_viewpoint_info=bool(transform.get("append_viewpoint_info", True)),
-                        append_duration_fps_timestamps=bool(transform.get("append_duration_fps_timestamps", True)),
-                        append_resolution_info=bool(transform.get("append_resolution_info", True)),
-                        append_idle_frames=bool(transform.get("append_idle_frames", False)),
-                    ),
-                    lambda: torch.tensor(0, dtype=torch.long),
+                ActionTransformPipeline(
+                    max_action_dim=int(model_max),
+                    cfg_dropout_rate=0.0,
+                    format_prompt_as_json=bool(transform.get("format_prompt_as_json", False)),
+                    append_viewpoint_info=bool(transform.get("append_viewpoint_info", True)),
+                    append_duration_fps_timestamps=bool(transform.get("append_duration_fps_timestamps", True)),
+                    append_resolution_info=bool(transform.get("append_resolution_info", True)),
+                    append_idle_frames=bool(transform.get("append_idle_frames", False)),
                 ),
                 {"action_chunk_size": int(contract["action_chunk_size"]), "conditioning_fps": float(contract["conditioning_fps"]), "resolution": str(transform.get("resolution", "720p"))},
             )
