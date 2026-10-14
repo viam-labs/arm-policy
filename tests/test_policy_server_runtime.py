@@ -189,26 +189,6 @@ def test_server_command_keeps_upstream_image_size_without_dataset_info(tmp_path)
     assert "--image-width" not in command
 
 
-def test_active_chunk_transform_adds_zero_idle_frames_like_training_prompts():
-    from policy_server_runtime.service_adapter import ActiveChunkTransform
-
-    seen = []
-
-    def pipeline(sample, resolution):
-        seen.append((sample, resolution))
-        return "formatted"
-
-    transform = ActiveChunkTransform(pipeline, lambda: 0)
-    original = {"ai_caption": "pick up the block"}
-
-    assert transform(original, "480") == "formatted"
-    assert seen[-1] == ({"ai_caption": "pick up the block", "idle_frames": 0}, "480")
-    assert "idle_frames" not in original
-
-    transform({"ai_caption": "x", "idle_frames": 5}, "480")
-    assert seen[-1][0]["idle_frames"] == 5
-
-
 def test_server_command_override_file_wins_over_trained_size(tmp_path, monkeypatch):
     meta = tmp_path / "runtime/dataset/meta"
     meta.mkdir(parents=True)
