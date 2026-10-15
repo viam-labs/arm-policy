@@ -12,7 +12,9 @@ dependencies = [
     "numpy>=1.26.0",
     "pillow>=10.0.0",
     "pydantic>=2.13.5",
-    "toppra>=0.6.3,<0.7",
+    # 0.6.9+ only ships Linux x86_64 wheels and no sdist; 0.6.3 builds from source elsewhere.
+    "toppra>=0.6.10,<0.7; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "toppra==0.6.3; sys_platform != 'linux' or platform_machine != 'x86_64'",
     "typing-extensions>=4.8.0",
     # switch to >= 0.81.0 when it lands. we need motion streaming
     "viam-sdk>=0.83.0",
