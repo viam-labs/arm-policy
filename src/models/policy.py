@@ -173,7 +173,7 @@ class PolicyContract(BaseModel):
 class Config(BaseModel):
     """Validated policy configuration, including its policy contract."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     world: NonEmptyStr | None = None
     arm: NonEmptyStr
