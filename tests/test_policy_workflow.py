@@ -201,6 +201,10 @@ def test_lite6_scene_setup_rejects_missing_placement_pose():
         )
 
 
+def test_max_chunks_defaults_to_a_full_attempt():
+    assert parse_args(["machine.example"]).max_chunks == 20
+
+
 def test_workflow_summary_is_bounded_and_reports_run_outcome():
     args = parse_args(
         [

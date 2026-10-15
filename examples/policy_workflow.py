@@ -553,7 +553,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="skip homing and deterministic Lite6 pick reset",
     )
     parser.add_argument("--prompt", default="")
-    parser.add_argument("--max-chunks", type=int, default=1)
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=20,
+        help="chunks before the run stops (each takes a few seconds); raise it for longer tasks",
+    )
     prefix = parser.add_mutually_exclusive_group()
     prefix.add_argument("--action-prefix-steps", type=int)
     parser.add_argument("--conditioner-algorithm", choices=("quintic", "toppra"))
