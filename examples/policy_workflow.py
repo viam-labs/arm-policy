@@ -20,7 +20,7 @@ from viam.components.generic import Generic
 from viam.components.gripper import Gripper
 from viam.proto.common import Pose, PoseInFrame
 from viam.robot.client import RobotClient
-from viam.rpc.dial import DialOptions
+from viam.rpc.dial import Credentials, DialOptions
 
 HOME_JOINT_DEGREES = (0.0, 0.0, 90.0, 0.0, 90.0, 0.0)
 PICK_REGION_MIN_M = (0.25, -0.12, 0.0)
@@ -31,6 +31,41 @@ DEFAULT_GRIPPER_SETTLE_SEC = 3.0
 PICK_BLOCK_WIDTH_M = 0.075
 PICK_BLOCK_DEPTH_M = 0.015
 PICK_BLOCK_HEIGHT_M = 0.025
+
+
+def robot_client_options(args: argparse.Namespace) -> RobotClient.Options:
+    api_key = os.environ.get("VIAM_API_KEY")
+    api_key_id = os.environ.get("VIAM_API_KEY_ID")
+    if bool(api_key) != bool(api_key_id):
+        raise ValueError("set both VIAM_API_KEY and VIAM_API_KEY_ID, or neither")
+
+    if api_key and api_key_id:
+        options = RobotClient.Options.with_api_key(
+            api_key=api_key, api_key_id=api_key_id
+        )
+    else:
+        config_path = Path(args.viam_config)
+        if config_path.is_file():
+            document = json.loads(config_path.read_text(encoding="utf-8"))
+            cloud = document.get("cloud") if isinstance(document, Mapping) else None
+            part_id = cloud.get("id") if isinstance(cloud, Mapping) else None
+            secret = cloud.get("secret") if isinstance(cloud, Mapping) else None
+            if not isinstance(part_id, str) or not part_id:
+                raise ValueError(f"{config_path} must contain a non-empty cloud.id")
+            if not isinstance(secret, str) or not secret:
+                raise ValueError(f"{config_path} must contain a non-empty cloud.secret")
+            dial_options = DialOptions(
+                auth_entity=part_id,
+                credentials=Credentials(type="robot-secret", payload=secret),
+            )
+        else:
+            dial_options = DialOptions(insecure=True)
+        options = RobotClient.Options(dial_options=dial_options)
+
+    if args.disable_webrtc:
+        assert options.dial_options is not None
+        options.dial_options.disable_webrtc = True
+    return options
 
 
 def policy_arm_model(status: Mapping[str, Any]) -> str:
@@ -131,7 +166,11 @@ async def prepare_lite6_setup(
     ``home_joint_degrees`` and ``prop_pose`` (a ``set_prop_pose`` command body with
     ``position`` and ``orientation_wxyz``) override the defaults and the seeded sample,
     so a recorded episode can be replayed from exactly its own start state."""
-    home = list(home_joint_degrees) if home_joint_degrees is not None else list(HOME_JOINT_DEGREES)
+    home = (
+        list(home_joint_degrees)
+        if home_joint_degrees is not None
+        else list(HOME_JOINT_DEGREES)
+    )
     await arm.move_to_joint_positions(JointPositions(values=home))
     await gripper.open()
     await asyncio.sleep(gripper_settle_sec)
@@ -375,29 +414,24 @@ def workflow_summary(
 
 
 async def run(args: argparse.Namespace) -> Mapping[str, Any]:
-    api_key = os.environ.get("VIAM_API_KEY")
-    api_key_id = os.environ.get("VIAM_API_KEY_ID")
-    if bool(api_key) != bool(api_key_id):
-        raise ValueError("set both VIAM_API_KEY and VIAM_API_KEY_ID, or neither")
-    options = (
-        RobotClient.Options.with_api_key(api_key=api_key, api_key_id=api_key_id)
-        if api_key and api_key_id
-        else RobotClient.Options(dial_options=DialOptions(insecure=True))
-    )
-    if args.disable_webrtc:
-        assert options.dial_options is not None
-        options.dial_options.disable_webrtc = True
+    options = robot_client_options(args)
 
     replay_document: dict[str, Any] = {}
     if args.replay_json:
         replay_document = json.loads(Path(args.replay_json).read_text(encoding="utf-8"))
         if not isinstance(replay_document.get("actions"), list):
-            raise ValueError(f"{args.replay_json} must hold an 'actions' list of [7] rows")
+            raise ValueError(
+                f"{args.replay_json} must hold an 'actions' list of [7] rows"
+            )
     elif args.scene_json:
         # Same document format as --replay-json, but only the scene (home pose, block
         # pose, seed) is used: the policy server is still called for the actions.
         replay_document = json.loads(Path(args.scene_json).read_text(encoding="utf-8"))
-    if replay_document and args.seed is None and isinstance(replay_document.get("seed"), int):
+    if (
+        replay_document
+        and args.seed is None
+        and isinstance(replay_document.get("seed"), int)
+    ):
         args.seed = replay_document["seed"]
     if args.seed is None:
         args.seed = 0
@@ -498,6 +532,11 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("address", help="machine address from the Viam CONNECT tab")
+    parser.add_argument(
+        "--viam-config",
+        default="/etc/viam.json",
+        help="viam-server config used for SDK credentials when API key variables are unset",
+    )
     parser.add_argument("--policy", default="policy")
     parser.add_argument(
         "--world",
@@ -539,7 +578,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "'episodes' ids; combine with --scene-json for the scene",
     )
     parser.add_argument("--replay-gripper-weight", type=float, default=1.0)
-    parser.add_argument("--replay-mode", choices=("nearest", "clock"), default="nearest")
+    parser.add_argument(
+        "--replay-mode", choices=("nearest", "clock"), default="nearest"
+    )
     parser.add_argument("--replay-advance-steps", type=int, default=16)
     parser.add_argument(
         "--gripper-settle-sec",
