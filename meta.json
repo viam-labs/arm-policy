@@ -1,7 +1,7 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "viam-labs:arm-policy",
-  "visibility": "public_unlisted",
+  "visibility": "public",
   "url": "",
   "description": "Safely executes contract-validated arm policies through typed Viam resources",
   "models": [
