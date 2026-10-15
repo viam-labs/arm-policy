@@ -29,7 +29,7 @@ The inference server is an optional module-owned subprocess. On its first `polic
 |---|---|---|
 | `arm` | string | Arm resource receiving validated targets. |
 | `gripper` | string | Gripper resource receiving commands selected by the policy contract's embodiment. |
-| `fixed_camera` | string | Camera returning exactly one 1280x720 image. |
+| `fixed_camera` | string | Camera returning exactly one 1280x720 or 640x360 image. |
 | `wrist_camera` | string | Camera returning exactly one 640x480 image. |
 | `server_uri` | string | `ws://` or `wss://` OpenPI policy-server endpoint. |
 | `prompt` | string | Non-empty default task prompt. |
@@ -40,7 +40,8 @@ The inference server is an optional module-owned subprocess. On its first `polic
 | Name | Default | Description |
 |---|---:|---|
 | `world` | — | Optional Generic world resource. Required only when an execute command sets `progress_prop`. |
-| `fixed_camera_2` | `""` | Optional second 1280x720 fixed camera. When set, it supplies `exterior_image_2_left`; when empty, `fixed_camera` supplies both exterior views for compatibility with two-camera policies. |
+| `fixed_camera_2` | `""` | Optional second fixed camera, same sizes as `fixed_camera`. When set, it supplies `exterior_image_2_left`; when empty, `fixed_camera` supplies both exterior views for compatibility with two-camera policies. |
+| `fixed_camera_width` / `fixed_camera_height` | unset | Unset accepts 1280x720 or 640x360 fixed images. Set both (`1280`/`720` or `640`/`360`) to require that size. |
 | `conditioner_algorithm` | `quintic` | `quintic` or `toppra`. |
 | `max_chunks` | `1` | Receding-horizon chunks per execution, from 1 through 100. |
 | `action_prefix_steps` | `8` | Steps executed from each conditioned chunk, from 1 through 32. Mutually exclusive with duration. |
