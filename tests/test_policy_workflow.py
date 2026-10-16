@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 from viam.proto.common import Pose, PoseInFrame
@@ -10,6 +11,7 @@ from examples.policy_workflow import (
     parse_args,
     policy_arm_model,
     prepare_lite6_setup,
+    robot_client_options,
     sample_prop_pose,
     workflow_summary,
 )
@@ -80,6 +82,31 @@ def test_world_is_optional_and_enables_scene_setup_explicitly():
 
     assert without_world.world is None
     assert with_world.world == "sim-world"
+
+
+def test_viam_config_auth_is_default_and_api_keys_take_precedence(
+    tmp_path, monkeypatch
+):
+    default_args = parse_args(["machine.example"])
+    assert default_args.viam_config == "/etc/viam.json"
+
+    config_path = tmp_path / "viam.json"
+    config_path.write_text(
+        json.dumps({"cloud": {"id": "part-id", "secret": "part-secret"}}),
+        encoding="utf-8",
+    )
+    args = parse_args(["machine.example", "--viam-config", str(config_path)])
+    options = robot_client_options(args)
+    assert options.dial_options.auth_entity == "part-id"
+    assert options.dial_options.credentials.type == "robot-secret"
+    assert options.dial_options.credentials.payload == "part-secret"
+
+    config_path.write_text("not json", encoding="utf-8")
+    monkeypatch.setenv("VIAM_API_KEY", "api-key")
+    monkeypatch.setenv("VIAM_API_KEY_ID", "00000000-0000-0000-0000-000000000001")
+    options = robot_client_options(args)
+    assert options.dial_options.credentials.type == "api-key"
+    assert options.dial_options.credentials.payload == "api-key"
 
 
 def test_policy_arm_model_reports_contract_readiness_error():

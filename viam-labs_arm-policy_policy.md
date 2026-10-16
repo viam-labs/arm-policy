@@ -210,6 +210,11 @@ python3 examples/policy_workflow.py <machine-address> \
   --deadline-tolerance-sec 0.15
 ```
 
+The client reads SDK credentials from `VIAM_API_KEY` and `VIAM_API_KEY_ID` when
+both are set. Otherwise, it uses the machine part credentials in
+`--viam-config` (default `/etc/viam.json`) when that file exists; if it does not,
+the client retains its insecure local-connection behavior.
+
 The workflow homes the Lite6 to `[0, 0, 90, 0, 90, 0]` degrees and opens the
 gripper unless `--no-setup` is set. Pass `--world sim-world` to additionally
 sample a deterministic block pose from `--seed` and apply it with the world's
