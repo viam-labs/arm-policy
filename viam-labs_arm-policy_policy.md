@@ -21,22 +21,25 @@ The inference server is an optional module-owned subprocess. On its first `polic
 }
 ```
 
-### Required attributes
+### Resource attributes
 
-| Name | Type | Description |
-|---|---|---|
-| `arm` | string | Arm resource receiving validated targets. |
-| `gripper` | string | Gripper resource receiving commands selected by the policy contract's embodiment. |
-| `fixed_camera` | string | Camera returning exactly one 1280x720 or 640x360 image. |
-| `wrist_camera` | string | Camera returning exactly one 640x480 image. |
-| `policy_contract_path` | string | Optional local path to a schema-version-3 `policy_contract.json`. Required unless `model_path` is set. When omitted, the component uses `policy_contract.json` from the deployed `model_path` package. |
+| Name | Default | Description |
+|---|---:|---|
+| `world` | `sim-world` | Generic world resource used when an execute command sets `progress_prop`. Set to `null` when no world resource is available. |
+| `arm` | `pick-arm` | Arm resource receiving validated targets. |
+| `gripper` | `pick-gripper` | Gripper resource receiving commands selected by the policy contract's embodiment. |
+| `fixed_camera` | `scene-cam` | Camera returning exactly one 1280x720 or 640x360 image. |
+| `fixed_camera_2` | `third-cam` | Second fixed camera, using the same supported sizes as `fixed_camera`. Set to `""` to reuse `fixed_camera` for both exterior views. |
+| `wrist_camera` | `wrist-cam` | Camera returning exactly one 640x480 image. |
+
+`policy_contract_path` is an optional local path to a schema-version-3
+`policy_contract.json`. It is required unless `model_path` is set. When omitted,
+the component uses `policy_contract.json` from the deployed `model_path` package.
 
 ### Optional attributes
 
 | Name | Default | Description |
 |---|---:|---|
-| `world` | — | Optional Generic world resource. Required only when an execute command sets `progress_prop`. |
-| `fixed_camera_2` | `""` | Optional second fixed camera, same sizes as `fixed_camera`. When set, it supplies `exterior_image_2_left`; when empty, `fixed_camera` supplies both exterior views for compatibility with two-camera policies. |
 | `fixed_camera_width` / `fixed_camera_height` | unset | Unset accepts 1280x720 or 640x360 fixed images. Set both (`1280`/`720` or `640`/`360`) to require that size. |
 | `prompt` | — | Optional non-empty default task prompt. Each `execute` must provide `prompt` when this is unset. |
 | `conditioner_algorithm` | `toppra` | `quintic` or `toppra`. |
@@ -45,7 +48,7 @@ The inference server is an optional module-owned subprocess. On its first `polic
 | `action_prefix_duration_sec` | — | Prefix duration from 0.05 through 1.6 seconds in 50 ms increments. |
 | `connect_timeout_sec` | `10` | Policy-server connection timeout. |
 | `inference_timeout_sec` | `120` | Observation/inference timeout. |
-| `deadline_tolerance_sec` | `0.025` | Maximum local target-dispatch lateness. |
+| `deadline_tolerance_sec` | `0.5` | Maximum local target-dispatch lateness. |
 | `workspace_task_min_m` / `workspace_task_max_m` | — | Optional three-value task-space bounds; set together. |
 | `binary_gripper_open_threshold` | `0.4` | Binary-open hysteresis threshold. |
 | `binary_gripper_close_threshold` | `0.6` | Binary-close hysteresis threshold. |
@@ -103,10 +106,9 @@ directly.
 
 ### Data root and server attributes
 
-`model_data_root` is optional and holds the managed policy server's state and log.
-When omitted, the module uses `$VIAM_MODULE_DATA/arm-policy`, then
-`$XDG_DATA_HOME/arm-policy`, then `~/.local/share/viam/arm-policy`; set it to an
-absolute persistent directory to override that convention.
+`model_data_root` defaults to `/opt/viam/arm-policy` and holds the managed policy
+server's state and log. Set it to another absolute persistent directory when the
+deployment uses a different writable data location.
 
 `policy_server_host` and `policy_server_port` configure the module-owned inference
 process and provide the default `server_uri`. The 900-second

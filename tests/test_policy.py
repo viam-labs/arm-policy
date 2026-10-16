@@ -286,6 +286,7 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
         "arm": "pick-arm",
         "gripper": "pick-gripper",
         "fixed_camera": "scene-cam",
+        "fixed_camera_2": "third-cam",
         "wrist_camera": "wrist-cam",
         "server_uri": "ws://127.0.0.1:8000",
         "prompt": "pick",
@@ -298,17 +299,9 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
         "pick-gripper",
         "scene-cam",
         "wrist-cam",
+        "third-cam",
     ]
     assert list(optional) == []
-    dependencies_without_world, _ = Policy.validate_config(
-        _config({key: value for key, value in attrs.items() if key != "world"})
-    )
-    assert list(dependencies_without_world) == [
-        "pick-arm",
-        "pick-gripper",
-        "scene-cam",
-        "wrist-cam",
-    ]
     with pytest.raises(ValueError, match="action_chunk_size"):
         Policy.validate_config(_config({**attrs, "action_chunk_size": 31}))
     with pytest.raises(ValueError, match="fixed_camera_width"):

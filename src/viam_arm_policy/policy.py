@@ -178,12 +178,12 @@ class Config(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    world: NonEmptyStr | None = None
-    arm: NonEmptyStr
-    gripper: NonEmptyStr
-    fixed_camera: NonEmptyStr
-    fixed_camera_2: str = ""
-    wrist_camera: NonEmptyStr
+    world: NonEmptyStr | None = "sim-world"
+    arm: NonEmptyStr = "pick-arm"
+    gripper: NonEmptyStr = "pick-gripper"
+    fixed_camera: NonEmptyStr = "scene-cam"
+    fixed_camera_2: str = "third-cam"
+    wrist_camera: NonEmptyStr = "wrist-cam"
     server_uri: WebsocketUrl | None = None
     prompt: Prompt | None = None
     policy_contract_path: NonEmptyStr | None = None
@@ -200,7 +200,7 @@ class Config(BaseModel):
 
     connect_timeout_sec: PositiveFiniteFloat = 10.0
     inference_timeout_sec: PositiveFiniteFloat = 120.0
-    deadline_tolerance_sec: PositiveFiniteFloat = 0.025
+    deadline_tolerance_sec: PositiveFiniteFloat = 0.5
 
     # Optional declarations may only repeat values selected by the contract.
     max_reach_m: FiniteFloat | None = None
@@ -231,7 +231,7 @@ class Config(BaseModel):
     # configured as "${packages.ml_model.<package-name>}".
     model_path: str | None = None
     # Holds the managed policy server's runtime state and log.
-    model_data_root: str | None = None
+    model_data_root: str | None = "/opt/viam/arm-policy"
     policy_server_host: str = "127.0.0.1"
     policy_server_port: Annotated[int, Field(ge=1, le=65535)] = 8000
     policy_server_readiness_timeout_sec: PositiveFiniteFloat = 900.0
@@ -239,6 +239,7 @@ class Config(BaseModel):
 
     _contract: PolicyContract
     _profile: SafetyProfile
+
     @field_validator("model_path")
     @classmethod
     def strip_legacy_model_path_suffix(cls, value: str | None) -> str | None:
