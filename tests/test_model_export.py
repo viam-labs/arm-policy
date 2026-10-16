@@ -7,13 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from models import model_export
-from models.model_export import (
+from viam_arm_policy import model_export
+from viam_arm_policy.model_export import (
     validate_data_root,
     validate_model_path,
     validate_runtime_manifest,
 )
-from models.policy_server import PolicyServerSupervisor
+from viam_arm_policy.policy_server import PolicyServerSupervisor
 
 FRAMEWORK_COMMIT = "efba2076c80648663a89a7fdbc92eb262fae39ac"
 

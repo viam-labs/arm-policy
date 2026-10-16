@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from tools.policy_workflow import main
+from viam_arm_policy.policy_workflow import main
 
 if __name__ == "__main__":
     main()

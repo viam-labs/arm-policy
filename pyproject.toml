@@ -41,4 +41,5 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project.scripts]
-arm-policy-workflow = "tools.policy_workflow:main"
+# external repos use this to embed the policy triggerer
+arm-policy-workflow = "viam_arm_policy.policy_workflow:main"

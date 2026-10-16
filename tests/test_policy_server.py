@@ -11,11 +11,11 @@ from test_model_export import _deployed_export
 from viam.proto.app.robot import ComponentConfig
 from viam.utils import dict_to_struct
 
-import models.policy as policy_module
-import models.policy_server as policy_server_module
-from models import model_export
-from models.policy import Policy
-from models.policy_server import PolicyServerSupervisor
+import viam_arm_policy.policy as policy_module
+import viam_arm_policy.policy_server as policy_server_module
+from viam_arm_policy import model_export
+from viam_arm_policy.policy import Policy
+from viam_arm_policy.policy_server import PolicyServerSupervisor
 
 _SERVER_PROGRAM = """
 from http.server import BaseHTTPRequestHandler, HTTPServer

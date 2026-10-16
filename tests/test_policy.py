@@ -16,8 +16,8 @@ from viam.operations import Operation
 from viam.proto.app.robot import ComponentConfig
 from viam.utils import dict_to_struct
 
-from models import model_export
-from models.policy import (
+from viam_arm_policy import model_export
+from viam_arm_policy.policy import (
     CAMERA_ALIASES,
     CAMERA_KEYS,
     SAFETY_PROFILES,
@@ -1121,7 +1121,7 @@ def test_gripper_passes_through_unchanged_by_default():
 
 
 def test_dataset_replay_retrieves_across_episodes_and_pads_at_episode_end():
-    from models.replay_source import ReplayChunkSource, ReplaySpec
+    from viam_arm_policy.replay_source import ReplayChunkSource, ReplaySpec
 
     rows = np.zeros((6, 7), dtype=np.float64)
     rows[:, 0] = [0.0, 0.1, 0.2, 1.0, 1.1, 1.2]  # two episodes along joint 1
