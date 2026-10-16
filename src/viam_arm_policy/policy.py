@@ -82,6 +82,8 @@ CAMERA_KEYS = (
 CAMERA_ALIASES = {
     key: key.replace("observation.images.", "observation/", 1) for key in CAMERA_KEYS
 }
+# Fixed camera sizes the policy server accepts (same 16:9 view, full or half size).
+FIXED_CAMERA_SIZES = ((1280, 720), (640, 360))
 
 
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
@@ -189,8 +191,9 @@ class Config(BaseModel):
     action_chunk_size: Literal[32] = 32
     # Training shrinks each fixed view to a quarter of the wrist image, so a
     # 640x360 render (half size, same aspect) loses nothing and renders faster.
-    fixed_camera_width: Literal[1280, 640] = 1280
-    fixed_camera_height: Literal[720, 360] = 720
+    # Unset accepts either supported size; set both to require one.
+    fixed_camera_width: Literal[1280, 640] | None = None
+    fixed_camera_height: Literal[720, 360] | None = None
     wrist_camera_width: Literal[640] = 640
     wrist_camera_height: Literal[480] = 480
 
@@ -239,10 +242,12 @@ class Config(BaseModel):
     @model_validator(mode="after")
     def validate_static(self) -> Self:
         if (self.fixed_camera_width, self.fixed_camera_height) not in (
-            (1280, 720),
-            (640, 360),
+            (None, None),
+            *FIXED_CAMERA_SIZES,
         ):
-            raise ValueError("fixed_camera_width/height must be 1280x720 or 640x360")
+            raise ValueError(
+                "fixed_camera_width/height must both be unset, 1280x720 or 640x360"
+            )
         if self.policy_contract_path is None and self.model_path is None:
             raise ValueError("configure policy_contract_path or model_path")
         if self.model_path is not None:
@@ -329,12 +334,14 @@ class Config(BaseModel):
         return (self.world, *required) if self.world is not None else required
 
     @property
-    def fixed_camera_size(self) -> tuple[int, int]:
-        return self.fixed_camera_width, self.fixed_camera_height
+    def fixed_camera_sizes(self) -> tuple[tuple[int, int], ...]:
+        if self.fixed_camera_width is None or self.fixed_camera_height is None:
+            return FIXED_CAMERA_SIZES
+        return ((self.fixed_camera_width, self.fixed_camera_height),)
 
     @property
-    def wrist_camera_size(self) -> tuple[int, int]:
-        return self.wrist_camera_width, self.wrist_camera_height
+    def wrist_camera_sizes(self) -> tuple[tuple[int, int], ...]:
+        return ((self.wrist_camera_width, self.wrist_camera_height),)
 
     @property
     def default_prefix_steps(self) -> int:
@@ -969,7 +976,9 @@ class Policy(Generic, EasyResource):
         self._advance_readiness()
 
     @staticmethod
-    def _decode_image(image: Any, expected: tuple[int, int], label: str) -> np.ndarray:
+    def _decode_image(
+        image: Any, allowed: tuple[tuple[int, int], ...], label: str
+    ) -> np.ndarray:
         mime = str(getattr(image, "mime_type", ""))
         if mime and not mime.startswith("image/"):
             raise ValueError(f"{label} returned unsupported MIME type {mime!r}")
@@ -978,7 +987,8 @@ class Policy(Generic, EasyResource):
             decoded.load()
         except Exception as exc:
             raise ValueError(f"{label} returned an invalid encoded image") from exc
-        if decoded.size != expected:
+        if decoded.size not in allowed:
+            expected = " or ".join(f"{w}x{h}" for w, h in allowed)
             raise ValueError(f"{label} image is {decoded.size}, expected {expected}")
         return np.ascontiguousarray(np.asarray(decoded, dtype=np.uint8))
 
@@ -1029,13 +1039,13 @@ class Policy(Generic, EasyResource):
         ):
             raise ValueError("gripper returned invalid normalized state")
         fixed = self._decode_image(
-            fixed_images[0], self._config.fixed_camera_size, "fixed camera"
+            fixed_images[0], self._config.fixed_camera_sizes, "fixed camera"
         )
         fixed_2 = self._decode_image(
-            fixed_2_images[0], self._config.fixed_camera_size, "second fixed camera"
+            fixed_2_images[0], self._config.fixed_camera_sizes, "second fixed camera"
         )
         wrist = self._decode_image(
-            wrist_images[0], self._config.wrist_camera_size, "wrist camera"
+            wrist_images[0], self._config.wrist_camera_sizes, "wrist camera"
         )
         return {
             "prompt": prompt,
