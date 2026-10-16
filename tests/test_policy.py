@@ -1013,9 +1013,12 @@ def test_slow_gripper_latch_causes_deadline_rejection_without_catchup():
         policy = FakePolicy(
             pack_message({"action": _actions()}), gripper=FakeGripper(delay=0.08)
         )
-        policy._deadline_tolerance = 0.01
         result = await policy.do_command(
-            {"command": "execute", "action_prefix_steps": 4}
+            {
+                "command": "execute",
+                "action_prefix_steps": 4,
+                "deadline_tolerance_sec": 0.01,
+            }
         )
         assert result["state"] == "failed"
         assert "dispatch" in result["error"]
