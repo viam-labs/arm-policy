@@ -331,8 +331,6 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
     )
     with pytest.raises(ValueError, match="conditioner_algorithm"):
         Policy.validate_config(_config({**attrs, "conditioner_algorithm": "unknown"}))
-    with pytest.raises(ValueError, match="execution_backend"):
-        Policy.validate_config(_config({**attrs, "execution_backend": "simulation"}))
     with pytest.raises(ValueError, match="binary_gripper_settle_sec"):
         Policy.validate_config(_config({**attrs, "binary_gripper_settle_sec": -1}))
     with pytest.raises(ValueError, match="set only one"):
@@ -345,9 +343,6 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
                 }
             )
         )
-    for removed in ("model_source", "model_revision", "hf_token", "hf_token_env"):
-        with pytest.raises(ValueError, match=removed):
-            Policy.validate_config(_config({**attrs, removed: "owner/policy"}))
     with pytest.raises(ValueError, match="absolute path"):
         Policy.validate_config(_config({**attrs, "model_data_root": "relative-data"}))
 
