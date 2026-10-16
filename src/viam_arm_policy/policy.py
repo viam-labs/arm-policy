@@ -30,6 +30,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_validator,
     StringConstraints,
     TypeAdapter,
     WebsocketUrl,
@@ -238,6 +239,13 @@ class Config(BaseModel):
 
     _contract: PolicyContract
     _profile: SafetyProfile
+    @field_validator("model_path")
+    @classmethod
+    def strip_legacy_model_path_suffix(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.removesuffix("/runtime/vae/Wan2.2_VAE.pth")
+
 
     @model_validator(mode="after")
     def validate_static(self) -> Self:
