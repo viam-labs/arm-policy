@@ -14,10 +14,8 @@ The inference server is an optional module-owned subprocess. On its first `polic
   "fixed_camera": "scene-cam",
   "fixed_camera_2": "third-cam",
   "wrist_camera": "wrist-cam",
-  "server_uri": "ws://127.0.0.1:8000",
   "prompt": "Pick up the block",
   "policy_contract_path": "/opt/models/policy_contract.json",
-  "conditioner_algorithm": "toppra",
   "action_prefix_duration_sec": 1.0,
   "max_chunks": 1
 }
@@ -31,8 +29,6 @@ The inference server is an optional module-owned subprocess. On its first `polic
 | `gripper` | string | Gripper resource receiving commands selected by the policy contract's embodiment. |
 | `fixed_camera` | string | Camera returning exactly one 1280x720 or 640x360 image. |
 | `wrist_camera` | string | Camera returning exactly one 640x480 image. |
-| `server_uri` | string | `ws://` or `wss://` OpenPI policy-server endpoint. |
-| `prompt` | string | Non-empty default task prompt. |
 | `policy_contract_path` | string | Optional local path to a schema-version-3 `policy_contract.json`. Required unless `model_path` is set. When omitted, the component uses `policy_contract.json` from the deployed `model_path` package. |
 
 ### Optional attributes
@@ -42,7 +38,8 @@ The inference server is an optional module-owned subprocess. On its first `polic
 | `world` | — | Optional Generic world resource. Required only when an execute command sets `progress_prop`. |
 | `fixed_camera_2` | `""` | Optional second fixed camera, same sizes as `fixed_camera`. When set, it supplies `exterior_image_2_left`; when empty, `fixed_camera` supplies both exterior views for compatibility with two-camera policies. |
 | `fixed_camera_width` / `fixed_camera_height` | unset | Unset accepts 1280x720 or 640x360 fixed images. Set both (`1280`/`720` or `640`/`360`) to require that size. |
-| `conditioner_algorithm` | `quintic` | `quintic` or `toppra`. |
+| `prompt` | — | Optional non-empty default task prompt. Each `execute` must provide `prompt` when this is unset. |
+| `conditioner_algorithm` | `toppra` | `quintic` or `toppra`. |
 | `max_chunks` | `1` | Receding-horizon chunks per execution, from 1 through 100. |
 | `action_prefix_steps` | `8` | Steps executed from each conditioned chunk, from 1 through 32. Mutually exclusive with duration. |
 | `action_prefix_duration_sec` | — | Prefix duration from 0.05 through 1.6 seconds in 50 ms increments. |
@@ -54,6 +51,10 @@ The inference server is an optional module-owned subprocess. On its first `polic
 | `binary_gripper_close_threshold` | `0.6` | Binary-close hysteresis threshold. |
 | `binary_gripper_initial_state` | `0` | Initial commanded binary state: `0` open or `1` closed. Setup should establish this state physically. |
 | `binary_gripper_settle_sec` | `3` | Cancellable wait after each nonblocking `Open` or `Grab` command. |
+| `server_uri` | derived | OpenPI policy-server `ws://` or `wss://` endpoint; when omitted, uses `ws://{policy_server_host}:{policy_server_port}`. |
+| `policy_server_host` | `127.0.0.1` | Bind host for the module-owned inference process. |
+| `policy_server_port` | `8000` | Bind port for the module-owned inference process. |
+| `policy_server_readiness_timeout_sec` | `900` | Startup readiness timeout, including first-run environment provisioning. |
 | `policy_server_autoclose` | `false` | Stop the managed policy-server process during component reconfiguration or close. Leave disabled to preserve the server across arm-policy and `viam-server` restarts. |
 
 ### Viam-deployed model
@@ -107,9 +108,9 @@ When omitted, the module uses `$VIAM_MODULE_DATA/arm-policy`, then
 `$XDG_DATA_HOME/arm-policy`, then `~/.local/share/viam/arm-policy`; set it to an
 absolute persistent directory to override that convention.
 
-`policy_server_host`, `policy_server_port`, and
-`policy_server_readiness_timeout_sec` configure the module-owned inference
-process.
+`policy_server_host` and `policy_server_port` configure the module-owned inference
+process and provide the default `server_uri`. The 900-second
+`policy_server_readiness_timeout_sec` includes first-run dependency installation.
 
 The policy server runs with Cosmos guardrails disabled. They are prompt-safety
 models fetched from a gated Hugging Face repository; arm safety is enforced by
@@ -159,6 +160,8 @@ Execute one or more policy chunks:
   "progress_prop": "pick_block"
 }
 ```
+`prompt` overrides the component default. It is required when the component has
+no configured default prompt.
 
 `progress_prop` is optional. When set, the policy queries the configured `world`
 for that prop's pose before and after each executed prefix. Omit both fields when

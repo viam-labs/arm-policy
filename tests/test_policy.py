@@ -21,6 +21,7 @@ from viam_arm_policy.policy import (
     CAMERA_ALIASES,
     CAMERA_KEYS,
     SAFETY_PROFILES,
+    Config,
     Policy,
     _read_policy_contract,
     pack_message,
@@ -347,6 +348,26 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
         Policy.validate_config(_config({**attrs, "model_data_root": "relative-data"}))
 
 
+def test_policy_config_derives_managed_server_defaults(tmp_path):
+    contract_path, _, _ = _write_contract(tmp_path)
+    config = Config.model_validate(
+        {
+            "arm": "pick-arm",
+            "gripper": "pick-gripper",
+            "fixed_camera": "scene-cam",
+            "wrist_camera": "wrist-cam",
+            "policy_contract_path": str(contract_path),
+            "policy_server_host": "policy.internal",
+            "policy_server_port": 9001,
+        }
+    )
+
+    assert str(config.server_uri) == "ws://policy.internal:9001/"
+    assert config.policy_server_readiness_timeout_sec == 900.0
+    assert config.conditioner_algorithm == "toppra"
+    assert config.prompt is None
+
+
 def _deployed_attrs(model_path: str) -> dict[str, str]:
     return {
         "arm": "pick-arm",
@@ -461,6 +482,29 @@ def test_do_command_rejects_invalid_payloads(command):
         policy = Policy("invalid-command")
         with pytest.raises(ValueError):
             await policy.do_command(command)
+
+    asyncio.run(scenario())
+
+
+def test_execute_requires_request_or_configured_prompt():
+    async def scenario():
+        policy = FakePolicy(pack_message({"action": _actions()}))
+        policy._config.prompt = None
+        with pytest.raises(
+            ValueError,
+            match="execute requires prompt because no default prompt is configured",
+        ):
+            await policy.do_command({"command": "execute"})
+
+        result = await policy.do_command(
+            {
+                "command": "execute",
+                "prompt": "place the part",
+                "action_prefix_steps": 1,
+            }
+        )
+        assert result["state"] == "completed"
+        assert result["prompt"] == "place the part"
 
     asyncio.run(scenario())
 
@@ -839,7 +883,7 @@ def test_finite_gripper_outputs_are_projected_to_actuator_limits():
     asyncio.run(scenario())
 
 
-def test_late_workspace_violation_does_not_block_safe_prefix():
+def test_default_toppra_late_workspace_violation_executes_safe_prefix():
     async def scenario():
         actions = _actions().astype(np.float64)
         actions[4:, 0] = 0.4
@@ -860,7 +904,7 @@ def test_late_workspace_violation_does_not_block_safe_prefix():
         )
 
         assert result["state"] == "completed"
-        assert result["actions_executed"] == 8
+        assert result["actions_executed"] == 5
         diagnostics = result["conditioning"][0]
         assert diagnostics["validation_scope"] == "selected_conditioned_prefix"
         assert "workspace floor" in diagnostics["deferred_horizon_rejection_reason"]

@@ -183,8 +183,8 @@ class Config(BaseModel):
     fixed_camera: NonEmptyStr
     fixed_camera_2: str = ""
     wrist_camera: NonEmptyStr
-    server_uri: WebsocketUrl
-    prompt: Prompt
+    server_uri: WebsocketUrl | None = None
+    prompt: Prompt | None = None
     policy_contract_path: NonEmptyStr | None = None
 
     # Fixed by the checkpoint.
@@ -212,7 +212,7 @@ class Config(BaseModel):
 
     workspace_task_min_m: Vector3 | None = None
     workspace_task_max_m: Vector3 | None = None
-    conditioner_algorithm: Literal["quintic", "toppra"] = "quintic"
+    conditioner_algorithm: Literal["quintic", "toppra"] = "toppra"
     binary_gripper_open_threshold: UnitFloat = 0.4
     binary_gripper_close_threshold: UnitFloat = 0.6
     binary_gripper_initial_state: BinaryFloat = 0.0
@@ -233,7 +233,7 @@ class Config(BaseModel):
     model_data_root: str | None = None
     policy_server_host: str = "127.0.0.1"
     policy_server_port: Annotated[int, Field(ge=1, le=65535)] = 8000
-    policy_server_readiness_timeout_sec: PositiveFiniteFloat = 30.0
+    policy_server_readiness_timeout_sec: PositiveFiniteFloat = 900.0
     policy_server_autoclose: bool = False
 
     _contract: PolicyContract
@@ -259,6 +259,12 @@ class Config(BaseModel):
         ):
             raise ValueError(
                 "policy_server_host must be a non-empty hostname or IP address"
+            )
+        if self.server_uri is None:
+            host = self.policy_server_host
+            uri_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+            self.server_uri = WebsocketUrl(
+                f"ws://{uri_host}:{self.policy_server_port}"
             )
         if (self.workspace_task_min_m is None) != (self.workspace_task_max_m is None):
             raise ValueError(
@@ -362,7 +368,7 @@ class Config(BaseModel):
             fixed_camera_2="",
             wrist_camera="",
             server_uri="",
-            prompt="",
+            prompt=None,
             policy_contract_path="",
         )
         config._contract = PolicyContract.model_construct(
@@ -2009,11 +2015,16 @@ class Policy(Generic, EasyResource):
         if payload.get("command") == "execute":
             defaults: dict[str, Any] = {
                 "command": "execute",
-                "prompt": self._config.prompt,
                 "max_chunks": self._config.max_chunks,
                 "conditioner_algorithm": self._config.conditioner_algorithm,
                 "deadline_tolerance_sec": self._config.deadline_tolerance_sec,
             }
+            if "prompt" not in payload:
+                if self._config.prompt is None:
+                    raise ValueError(
+                        "execute requires prompt because no default prompt is configured"
+                    )
+                defaults["prompt"] = self._config.prompt
             if (
                 "action_prefix_steps" not in payload
                 and "action_prefix_duration_sec" not in payload
