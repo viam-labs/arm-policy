@@ -635,6 +635,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--gripper-settle-sec must be non-negative")
     return args
 
+def main():
+    asyncio.run(run(parse_args()))
 
 if __name__ == "__main__":
-    asyncio.run(run(parse_args()))
+    main()
