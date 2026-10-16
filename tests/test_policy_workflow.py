@@ -4,7 +4,7 @@ import json
 import pytest
 from viam.proto.common import Pose, PoseInFrame
 
-from examples.policy_workflow import (
+from tools.policy_workflow import (
     HOME_JOINT_DEGREES,
     PICK_REGION_MAX_M,
     PICK_REGION_MIN_M,

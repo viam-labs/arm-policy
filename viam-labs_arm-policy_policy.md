@@ -204,7 +204,7 @@ At startup the runtime quarantines corrupt Hugging Face Hub cache metadata (tree
 With the policy server and machine running:
 
 ```sh
-python3 examples/policy_workflow.py <machine-address> \
+uv run examples/policy_workflow.py <machine-address> \
   --policy policy --prompt "Pick up the block" --max-chunks 3 \
   --conditioner-algorithm toppra --action-prefix-duration-sec 1.0 \
   --deadline-tolerance-sec 0.15
