@@ -8,6 +8,7 @@ Policy exports are deployed by viam-server as Viam registry `ml_model` packages 
 
 - [`viam-labs:arm-policy:policy`](viam-labs_arm-policy_policy.md) — generic component implementing policy execution, status, cancellation, trajectory conditioning, and simulator or physical Lite6 dispatch.
 
+
 ## Development
 
 ```sh
@@ -19,4 +20,13 @@ Build the registry archive with:
 
 ```sh
 make module.tar.gz
+```
+
+## Install for the policy runner command
+
+If you just want the policy runner command:
+
+```sh
+uv add git+https://github.com/viam-labs/arm-policy.git
+uv run arm-policy-workflow --help
 ```

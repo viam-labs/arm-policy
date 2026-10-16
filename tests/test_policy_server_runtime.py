@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from models.policy_server import runtime_command
+from viam_arm_policy.policy_server import runtime_command
 from policy_server_runtime import service_adapter
 from policy_server_runtime.service_adapter import (
     _audit_hub_tree_metadata,

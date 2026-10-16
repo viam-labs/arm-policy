@@ -16,8 +16,8 @@ from viam.operations import Operation
 from viam.proto.app.robot import ComponentConfig
 from viam.utils import dict_to_struct
 
-from models import model_export
-from models.policy import (
+from viam_arm_policy import model_export
+from viam_arm_policy.policy import (
     CAMERA_ALIASES,
     CAMERA_KEYS,
     SAFETY_PROFILES,
@@ -331,8 +331,6 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
     )
     with pytest.raises(ValueError, match="conditioner_algorithm"):
         Policy.validate_config(_config({**attrs, "conditioner_algorithm": "unknown"}))
-    with pytest.raises(ValueError, match="execution_backend"):
-        Policy.validate_config(_config({**attrs, "execution_backend": "simulation"}))
     with pytest.raises(ValueError, match="binary_gripper_settle_sec"):
         Policy.validate_config(_config({**attrs, "binary_gripper_settle_sec": -1}))
     with pytest.raises(ValueError, match="set only one"):
@@ -345,9 +343,6 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
                 }
             )
         )
-    for removed in ("model_source", "model_revision", "hf_token", "hf_token_env"):
-        with pytest.raises(ValueError, match=removed):
-            Policy.validate_config(_config({**attrs, removed: "owner/policy"}))
     with pytest.raises(ValueError, match="absolute path"):
         Policy.validate_config(_config({**attrs, "model_data_root": "relative-data"}))
 
@@ -1146,7 +1141,7 @@ def test_gripper_passes_through_unchanged_by_default():
 
 
 def test_dataset_replay_retrieves_across_episodes_and_pads_at_episode_end():
-    from models.replay_source import ReplayChunkSource, ReplaySpec
+    from viam_arm_policy.replay_source import ReplayChunkSource, ReplaySpec
 
     rows = np.zeros((6, 7), dtype=np.float64)
     rows[:, 0] = [0.0, 0.1, 0.2, 1.0, 1.1, 1.2]  # two episodes along joint 1

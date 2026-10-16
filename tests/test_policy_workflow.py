@@ -4,7 +4,7 @@ import json
 import pytest
 from viam.proto.common import Pose, PoseInFrame
 
-from examples.policy_workflow import (
+from viam_arm_policy.policy_workflow import (
     HOME_JOINT_DEGREES,
     PICK_REGION_MAX_M,
     PICK_REGION_MIN_M,
@@ -96,6 +96,8 @@ def test_viam_config_auth_is_default_and_api_keys_take_precedence(
         encoding="utf-8",
     )
     args = parse_args(["machine.example", "--viam-config", str(config_path)])
+    monkeypatch.delenv("VIAM_API_KEY", raising=False)
+    monkeypatch.delenv("VIAM_API_KEY_ID", raising=False)
     options = robot_client_options(args)
     assert options.dial_options.auth_entity == "part-id"
     assert options.dial_options.credentials.type == "robot-secret"

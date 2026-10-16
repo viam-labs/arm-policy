@@ -3,8 +3,8 @@ import math
 import numpy as np
 import pytest
 
-from models.policy import SAFETY_PROFILES
-from models.trajectory_conditioner import (
+from viam_arm_policy.policy import SAFETY_PROFILES
+from viam_arm_policy.trajectory_conditioner import (
     condition_trajectory,
     condition_trajectory_toppra,
 )

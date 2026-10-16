@@ -12,6 +12,9 @@ $(ENTRYPOINT): run.sh
 	printf '#!/usr/bin/env bash\nexec "$$(dirname "$$0")/../run.sh" "$$@"\n' > $@
 	chmod +x $@
 
+lint:
+	uv run --with ruff ruff check .
+
 test:
 	uv run pytest tests/
 
