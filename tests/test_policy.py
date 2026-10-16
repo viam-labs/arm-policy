@@ -591,6 +591,26 @@ def test_arm_observation_uses_standard_degree_api():
     asyncio.run(scenario())
 
 
+def test_observation_accepts_either_fixed_size_unless_one_is_configured():
+    async def scenario():
+        policy = FakePolicy(b"")
+        policy._fixed_camera = FakeCamera(_image(640, 360, (1, 2, 3)))
+        observation = await policy._observation("pick")
+        assert observation["observation/exterior_image_1_left"].shape == (360, 640, 3)
+
+        policy._fixed_camera = FakeCamera(_image(960, 540, (1, 2, 3)))
+        with pytest.raises(ValueError, match="1280x720 or 640x360"):
+            await policy._observation("pick")
+
+        policy._fixed_camera = FakeCamera(_image(640, 360, (1, 2, 3)))
+        policy._config.fixed_camera_width = 1280
+        policy._config.fixed_camera_height = 720
+        with pytest.raises(ValueError, match="expected 1280x720$"):
+            await policy._observation("pick")
+
+    asyncio.run(scenario())
+
+
 def test_observation_uses_configured_second_fixed_camera():
     async def scenario():
         policy = FakePolicy(b"")
