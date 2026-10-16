@@ -522,6 +522,12 @@ async def run(args: argparse.Namespace) -> Mapping[str, Any]:
             and bool(result.get("error"))
         )
         if not (completed or safe_rejection):
+            error = result.get("error")
+            if isinstance(error, str) and error:
+                print("\nError from remote side:")
+                print(error)
+                print("\nNote: if this is a ConnectionRefusedError, it's probably the robot failing to connect to the policy server. Double check the policy server is running")
+                return evidence
             raise RuntimeError(
                 "workflow produced neither completed inference nor explicit "
                 "output rejection"

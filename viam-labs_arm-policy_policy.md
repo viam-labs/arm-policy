@@ -227,4 +227,6 @@ Console output is a bounded human-readable summary of setup, effective control
 parameters, terminal outcome, aggregate timing/execution/safety counts, final
 TCP and gripper state, and the output path. `--output` retains the complete JSON
 evidence, including raw and conditioned trajectories and per-chunk diagnostics.
+Remote errors returned before the first inference response are printed after the
+summary, and the client exits normally without a traceback.
 
