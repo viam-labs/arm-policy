@@ -16,7 +16,7 @@ dependencies = [
     "toppra>=0.6.10,<0.7; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "toppra==0.6.3; sys_platform != 'linux' or platform_machine != 'x86_64'",
     "typing-extensions>=4.8.0",
-    "viam-sdk>=0.83.0",
+    "viam-sdk>=0.85.0",
     "websockets>=12.0",
 ]
 
