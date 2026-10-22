@@ -223,15 +223,11 @@ def main() -> int:
     )
     overlay = _overlay_root()
     if args.print_command:
-        print(
-            f"LD_LIBRARY_PATH='' PYTHONPATH={shlex.quote(str(overlay))} "
-            f"{shlex.join(command)}"
-        )
+        print(f"PYTHONPATH={shlex.quote(str(overlay))} {shlex.join(command)}")
         return 0
     overlay = _prepare_overlay(framework)
     env = os.environ.copy()
     env.pop("VIRTUAL_ENV", None)
-    env["LD_LIBRARY_PATH"] = ""
     prior = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(overlay) + (os.pathsep + prior if prior else "")
     os.chdir(view)
