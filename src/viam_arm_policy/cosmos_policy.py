@@ -173,12 +173,11 @@ class CosmosPolicy(MLModel, EasyResource):
         parsed = CosmosConfig.model_validate(struct_to_dict(config.attributes))
         self._detach_policy_server_watcher()
         previous = self._config
-        # A new package version arrives as a new model_path; a retained server
-        # would keep serving the previous weights.
+        # A retained server keeps serving its loaded weights across reconfigures,
+        # including a model_path change; see APP-18431 for stopping it on identity change.
         stale = (
             self._policy_server
-            if previous is not None
-            and (parsed.policy_server_autoclose or parsed.model_path != previous.model_path)
+            if previous is not None and parsed.policy_server_autoclose
             else None
         )
         self._config = parsed

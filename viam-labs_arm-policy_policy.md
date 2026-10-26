@@ -51,7 +51,7 @@ The policy server is a subprocess owned by the MLModel service. On its first sta
 | `model_data_root` | `/opt/viam/arm-policy` | Holds the managed policy server's state file and log. Set it to another absolute persistent directory when the deployment uses a different writable data location; `null` falls back to `$VIAM_MODULE_DATA/arm-policy`, then `$XDG_DATA_HOME/arm-policy`, then `~/.local/share/viam/arm-policy`. |
 | `policy_server_host` / `policy_server_port` | `127.0.0.1` / `8000` | Bind address of the managed server. |
 | `policy_server_readiness_timeout_sec` | `900` | How long a start waits for `GET /healthz`; includes first-run dependency installation. |
-| `policy_server_autoclose` | `false` | Also stop the managed server on every reconfigure. The server is always stopped when the service closes (module or `viam-server` restart, resource rebuild, removal) and on a `model_path` change; leave this disabled so unrelated attribute edits do not restart it. |
+| `policy_server_autoclose` | `false` | Also stop the managed server on every reconfigure. The server is always stopped when the service closes (module or `viam-server` restart, resource rebuild, removal); leave this disabled so attribute edits do not restart it. |
 | `server_uri` | — | `ws://` or `wss://` endpoint of a policy server this service does not manage. When set, no subprocess is started. |
 | `connect_timeout_sec` | `10` | WebSocket connect timeout. |
 | `inference_timeout_sec` | `120` | Per-request WebSocket timeout. |
@@ -75,7 +75,7 @@ The prompt travels as bytes because tensors cannot carry strings and viam-server
 
 ### Server lifecycle
 
-The service starts the managed server from `reconfigure` in the background once `model_path` is configured and `server_uri` is unset. A `model_path` change (a new package version) stops the running server before restarting it so it cannot keep serving the previous weights; any other reconfigure leaves a healthy server alone (start is idempotent). `Metadata` works as soon as `<model_path>/policy_contract.json` is readable; `Infer` fails with the supervisor's state and the last start error until the server answers.
+The service starts the managed server from `reconfigure` in the background once `model_path` is configured and `server_uri` is unset. Any later reconfigure leaves a healthy server alone (start is idempotent), including a `model_path` change: a running server keeps serving the weights it loaded until the service closes or `policy_server_autoclose` stops it, so after a package version change set `policy_server_autoclose` or restart the module to pick up the new weights. `Metadata` works as soon as `<model_path>/policy_contract.json` is readable; `Infer` fails with the supervisor's state and the last start error until the server answers.
 
 ## `viam-labs:arm-policy:policy` (controller component)
 
@@ -223,7 +223,7 @@ The MLModel service starts the isolated pinned-Cosmos server for its `model_path
 
 Server startup checks that the package contains the required export files and the VAE, and that the training config and policy contract match their `runtime_manifest.json` SHA-256 digests. It does not traverse the package or hash the VAE or weight shards; payload loading errors remain the policy server's responsibility. A missing file or digest mismatch prevents startup.
 
-The supervisor is intentionally a module-owned subprocess rather than s6: it needs no host package, records Linux start ticks to avoid PID-reuse kills, and recovers the persistent process state when the service restarts with the same name and data root. The server survives reconfigures that leave `model_path` unchanged; a `model_path` change, `policy_server_autoclose`, or closing the service (module or `viam-server` restart, resource rebuild, removal) stops it, because the MLModel API offers no command to stop an orphaned server afterwards.
+The supervisor is intentionally a module-owned subprocess rather than s6: it needs no host package, records Linux start ticks to avoid PID-reuse kills, and recovers the persistent process state when the service restarts with the same name and data root. The server survives reconfigures; `policy_server_autoclose` or closing the service (module or `viam-server` restart, resource rebuild, removal) stops it, because the MLModel API offers no command to stop an orphaned server afterwards.
 
 Each start emits a Viam module info log with its host and port. A successful readiness check emits a second info log with the PID, host, port, child-log path, and whether the start was idempotent. After startup, a background watcher checks for unexpected process exits and logs each failed process once, with its PID, exit status when available, child-log path, and a bounded, credential-redacted log tail. Recovered processes are monitored after service reconfiguration or restart; their exit status may be unavailable. Deliberate stops do not emit failure notifications.
 

@@ -233,7 +233,7 @@ def test_reconfigure_stops_server_only_with_autoclose_but_close_always_stops(tmp
     asyncio.run(scenario())
 
 
-def test_reconfigure_starts_server_and_restarts_only_when_model_path_changes(tmp_path, monkeypatch):
+def test_reconfigure_starts_server_once_and_retains_it_across_reconfigures(tmp_path, monkeypatch):
     class RecordingServer:
         def __init__(self):
             self.stops = 0
@@ -255,19 +255,17 @@ def test_reconfigure_starts_server_and_restarts_only_when_model_path_changes(tmp
         await service._server_task
         assert starts == [str(tmp_path / "v1")]
         running = RecordingServer()
-        service._policy_server = running
 
-        # Unrelated attribute change: retained server, idempotent start.
-        service.reconfigure(_config({"model_path": str(tmp_path / "v1"), "policy_server_port": 8001}), {})
-        await service._server_task
-        assert running.stops == 0 and len(starts) == 2
-
-        # New package version: the old server must not keep serving old weights.
-        # (Each reconfigure builds a fresh supervisor over the same state file.)
-        service._policy_server = running
-        service.reconfigure(_config({"model_path": str(tmp_path / "v2")}), {})
-        await service._server_task
-        assert running.stops == 1 and starts[-1] == str(tmp_path / "v2")
+        # Any reconfigure, including a model_path change, leaves a running server alone
+        # (start is idempotent on a healthy state file); see APP-18431.
+        for attrs in (
+            {"model_path": str(tmp_path / "v1"), "policy_server_port": 8001},
+            {"model_path": str(tmp_path / "v2")},
+        ):
+            service._policy_server = running
+            service.reconfigure(_config(attrs), {})
+            await service._server_task
+        assert running.stops == 0 and len(starts) == 3
 
         # External server: nothing to manage.
         service._policy_server = RecordingServer()
@@ -303,7 +301,9 @@ def test_reconfigure_waits_for_the_in_flight_start_before_stopping_or_starting(t
         await asyncio.sleep(0)
         running = RecordingServer()
         service._policy_server = running
-        service.reconfigure(_config({"model_path": str(tmp_path / "v2")}), {})
+        service.reconfigure(
+            _config({"model_path": str(tmp_path / "v2"), "policy_server_autoclose": True}), {}
+        )
         await asyncio.sleep(0.05)
         assert starts == [str(tmp_path / "v1")] and running.stops == 0
         release.set()
