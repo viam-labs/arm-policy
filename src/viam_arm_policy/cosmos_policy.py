@@ -516,9 +516,7 @@ class CosmosPolicy(MLModel, EasyResource):
         await self._cancel_server_start()
         self._detach_policy_server_watcher()
         await self._close_socket()
-        if (
-            self._config is not None
-            and self._config.policy_server_autoclose
-            and self._policy_server is not None
-        ):
+        # close() also runs when the service is removed from config, and MLModel has no
+        # DoCommand to stop the server afterwards; a retained server would be orphaned.
+        if self._config is not None and self._config.server_uri is None:
             await asyncio.to_thread(self._policy_server.stop)

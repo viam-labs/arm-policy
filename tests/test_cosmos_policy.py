@@ -203,7 +203,7 @@ def test_config_ignores_controller_attributes_and_derives_server_defaults():
 
 
 @pytest.mark.parametrize("autoclose", [False, True])
-def test_reconfigure_and_close_only_stop_server_when_configured(tmp_path, autoclose, monkeypatch):
+def test_reconfigure_stops_server_only_with_autoclose_but_close_always_stops(tmp_path, autoclose, monkeypatch):
     async def fake_start(self):
         return {"state": "healthy"}
 
@@ -227,7 +227,8 @@ def test_reconfigure_and_close_only_stop_server_when_configured(tmp_path, autocl
         assert existing.stopped == (1 if autoclose else 0)
         service._policy_server = existing
         await service.close()
-        assert existing.stopped == (2 if autoclose else 0)
+        # Removal of the service also goes through close(); a retained server would be orphaned.
+        assert existing.stopped == (2 if autoclose else 1)
 
     asyncio.run(scenario())
 
