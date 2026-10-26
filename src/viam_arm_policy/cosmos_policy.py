@@ -282,10 +282,13 @@ class CosmosPolicy(MLModel, EasyResource):
         await asyncio.to_thread(validate_runtime_manifest, model)
         return model
 
-    def _cancel_server_start(self) -> None:
+    async def _cancel_server_start(self) -> None:
         task, self._server_task = self._server_task, None
         if task is not None and not task.done():
             task.cancel()
+            # The start itself runs in a thread and cannot be cancelled; wait for it so
+            # a following stop() cannot run before the server it must stop exists.
+            await asyncio.gather(task, return_exceptions=True)
 
     def _schedule_server_start(self, stale: PolicyServerSupervisor | None = None) -> None:
         try:
@@ -304,7 +307,8 @@ class CosmosPolicy(MLModel, EasyResource):
             if previous is not None:
                 # Cancelling would leave its start thread racing this one on the state file.
                 await asyncio.gather(previous, return_exceptions=True)
-            await self._close_socket()
+            async with self._infer_lock:
+                await self._close_socket()
             if stale is not None:
                 await asyncio.to_thread(stale.stop)
             self._ensure_policy_server_watcher()
@@ -509,7 +513,7 @@ class CosmosPolicy(MLModel, EasyResource):
         if self._closed:
             return
         self._closed = True
-        self._cancel_server_start()
+        await self._cancel_server_start()
         self._detach_policy_server_watcher()
         await self._close_socket()
         if (
