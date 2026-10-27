@@ -68,6 +68,7 @@ class PolicyServerSupervisor:
         self._process: subprocess.Popen[Any] | None = None
         self._host = ""
         self._port = 0
+        self._model = ""
         self._ready_deadline = 0.0
 
     @staticmethod
@@ -114,6 +115,9 @@ class PolicyServerSupervisor:
             "pid": process.pid,
             "host": self._host,
             "port": self._port,
+            # What this process was launched with; the configured model_path may differ
+            # while viam-server is still downloading a package for a pending config.
+            "model": self._model,
             "log_path": str(self.log_path),
         }
         if _health_ready(self._host, self._port):
@@ -187,6 +191,7 @@ class PolicyServerSupervisor:
                     env=process_environment,
                 )
             self._process, self._host, self._port = process, host, port
+            self._model = _model_from_command(command)
             self._ready_deadline = time.monotonic() + readiness_timeout
         # Poll unlocked so stop()/status() are not blocked for the whole model load.
         while time.monotonic() < self._ready_deadline:
@@ -202,6 +207,7 @@ class PolicyServerSupervisor:
                     "pid": process.pid,
                     "host": host,
                     "port": port,
+                    "model": self._model,
                     "log_path": str(self.log_path),
                     "idempotent": False,
                 }
@@ -261,3 +267,9 @@ def runtime_command(runtime_root: Path, model: Path, host: str, port: int) -> li
         "--port",
         str(port),
     ]
+
+
+def _model_from_command(command: Sequence[str]) -> str:
+    """Inverse of runtime_command for the `--model` argument; empty for other commands."""
+    args = list(command)
+    return args[args.index("--model") + 1] if "--model" in args[:-1] else ""
