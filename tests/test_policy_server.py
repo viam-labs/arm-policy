@@ -1,6 +1,8 @@
 import asyncio
 import socket
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +21,7 @@ from viam_arm_policy.policy_server import PolicyServerSupervisor
 _SERVER_PROGRAM = """
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import sys
+import threading
 import threading
 import time
 
@@ -473,3 +476,49 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
 
     asyncio.run(scenario())
 
+
+
+def test_start_refuses_a_port_already_served_by_a_foreign_server(tmp_path):
+    port = _free_port()
+    foreign = subprocess.Popen(_server_command(port, 30, 0))
+    try:
+        deadline = time.monotonic() + 5
+        while not policy_server_module._health_ready("127.0.0.1", port):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        supervisor = PolicyServerSupervisor(tmp_path, "foreign")
+        with pytest.raises(RuntimeError, match="does not own"):
+            supervisor.start(_server_command(port, 30, 0), "127.0.0.1", port, 2)
+        assert supervisor.status()["state"] == "absent"
+    finally:
+        foreign.kill()
+        foreign.wait()
+
+
+def test_stop_during_start_unblocks_the_start(tmp_path):
+    """start() must not hold the lock across the readiness wait."""
+    port = _free_port()
+    supervisor = PolicyServerSupervisor(tmp_path, "slow")
+    # A child that never answers /healthz: readiness would wait the full 30 s.
+    program = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_DFL); time.sleep(60)"
+    outcome = {}
+
+    def run_start():
+        try:
+            supervisor.start([sys.executable, "-c", program], "127.0.0.1", port, 30)
+        except RuntimeError as exc:
+            outcome["error"] = str(exc)
+
+    starter = threading.Thread(target=run_start)
+    starter.start()
+    deadline = time.monotonic() + 5
+    while not supervisor.running():
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    began = time.monotonic()
+    assert supervisor.stop(grace_seconds=1)["stopped"]
+    assert time.monotonic() - began < 5
+    starter.join(5)
+    assert not starter.is_alive()
+    assert "stopped during startup" in outcome["error"]
+    assert supervisor.status()["state"] == "absent"

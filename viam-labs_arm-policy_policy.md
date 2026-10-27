@@ -106,7 +106,7 @@ directly.
 ### Data root and server attributes
 
 `model_data_root` defaults to `/opt/viam/arm-policy` and holds the managed policy
-server's state and log. Set it to another absolute persistent directory when the
+server's log. Set it to another absolute persistent directory when the
 deployment uses a different writable data location.
 
 `policy_server_host` and `policy_server_port` configure the module-owned inference

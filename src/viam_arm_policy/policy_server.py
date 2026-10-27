@@ -140,8 +140,10 @@ class PolicyServerSupervisor:
                 process, process.returncode, str(self.log_path), self._log_tail()
             )
 
-    def _fail_startup(self, exit_status: int) -> NoReturn:
-        self._process = None
+    def _fail_startup(self, process: subprocess.Popen[Any], exit_status: int) -> NoReturn:
+        with self._lock:
+            if self._process is process:
+                self._process = None
         raise RuntimeError(
             "policy server exited before readiness; "
             f"exit_status={exit_status}; log_path={self.log_path}; tail={self._log_tail()}"
@@ -163,6 +165,13 @@ class PolicyServerSupervisor:
                 self._stop_locked()
             if not command:
                 raise ValueError("policy server launch command is empty")
+            if _health_ready(host, port):
+                # Nothing of ours is running, so this is a server left behind by a
+                # crashed module or an older release; adopting it would serve its weights.
+                raise RuntimeError(
+                    f"{host}:{port} already serves a policy server this component does "
+                    "not own; stop it and retry"
+                )
             self.root.mkdir(parents=True, exist_ok=True)
             process_environment = os.environ.copy()
             if environment is not None:
@@ -179,31 +188,38 @@ class PolicyServerSupervisor:
                 )
             self._process, self._host, self._port = process, host, port
             self._ready_deadline = time.monotonic() + readiness_timeout
-            while time.monotonic() < self._ready_deadline:
-                exit_status = process.poll()
-                if exit_status is not None:
-                    self._fail_startup(exit_status)
-                if _health_ready(host, port):
-                    return {
-                        "state": "healthy",
-                        "pid": process.pid,
-                        "host": host,
-                        "port": port,
-                        "log_path": str(self.log_path),
-                        "idempotent": False,
-                    }
-                time.sleep(0.1)
+        # Poll unlocked so stop()/status() are not blocked for the whole model load.
+        while time.monotonic() < self._ready_deadline:
+            with self._lock:
+                if self._process is not process:
+                    raise RuntimeError("policy server was stopped during startup")
             exit_status = process.poll()
             if exit_status is not None:
-                self._fail_startup(exit_status)
-            detail = self._log_tail()
-            cleanup = self._stop_locked(
-                grace_seconds=min(5.0, max(0.1, readiness_timeout))
+                self._fail_startup(process, exit_status)
+            if _health_ready(host, port):
+                return {
+                    "state": "healthy",
+                    "pid": process.pid,
+                    "host": host,
+                    "port": port,
+                    "log_path": str(self.log_path),
+                    "idempotent": False,
+                }
+            time.sleep(0.1)
+        exit_status = process.poll()
+        if exit_status is not None:
+            self._fail_startup(process, exit_status)
+        detail = self._log_tail()
+        with self._lock:
+            cleanup = (
+                self._stop_locked(grace_seconds=min(5.0, max(0.1, readiness_timeout)))
+                if self._process is process
+                else {"state": "absent", "stopped": False}
             )
-            raise RuntimeError(
-                "policy server did not become ready; "
-                f"cleanup={cleanup}; log_path={self.log_path}; tail={detail}"
-            )
+        raise RuntimeError(
+            "policy server did not become ready; "
+            f"cleanup={cleanup}; log_path={self.log_path}; tail={detail}"
+        )
 
     def _stop_locked(self, grace_seconds: float = 5.0) -> dict[str, Any]:
         process = self._process
