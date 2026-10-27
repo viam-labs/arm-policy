@@ -204,11 +204,21 @@ def _prepare_overlay(framework: Path) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--model", type=Path)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--print-command", action="store_true")
+    parser.add_argument(
+        "--provision-only",
+        action="store_true",
+        help="sync the pinned Cosmos runtime and exit; used by the module's first_run",
+    )
     args = parser.parse_args()
+    if args.provision_only:
+        _provision_framework()
+        return 0
+    if args.model is None:
+        parser.error("--model is required unless --provision-only")
     model = args.model.expanduser().resolve()
     contract = _validate(model)
     view = _model_view(model)

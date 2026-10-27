@@ -229,7 +229,7 @@ class Config(BaseModel):
     model_data_root: str | None = "/opt/viam/arm-policy"
     policy_server_host: str = "127.0.0.1"
     policy_server_port: Annotated[int, Field(ge=1, le=65535)] = 8000
-    policy_server_readiness_timeout_sec: PositiveFiniteFloat = 900.0
+    policy_server_readiness_timeout_sec: PositiveFiniteFloat = 300.0
 
     _contract: PolicyContract
     _profile: SafetyProfile
