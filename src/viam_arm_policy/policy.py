@@ -972,14 +972,15 @@ class Policy(Generic, EasyResource):
             _model_data_root(parsed), self.name
         )
         self._detach_policy_server_watcher()
-        if self._policy_server is not None and self._policy_server.serves_other(
+        # The SDK rebuilds this component on every config edit (close, then new), so
+        # the server is handed between instances through its state file. Stop it only
+        # when it serves a different model or address; starting stays explicit.
+        if next_policy_server.serves_other(
             validate_model_path(parsed.model_path) if parsed.model_path else None,
             parsed.policy_server_host,
             parsed.policy_server_port,
         ):
-            # A retained server would keep serving the previous package's weights;
-            # starting stays explicit (`policy_server start`).
-            self._policy_server.stop()
+            next_policy_server.stop()
         parsed._contract = self._config.contract
         parsed._profile = self._config.profile
         self._config = parsed
@@ -2070,7 +2071,6 @@ class Policy(Generic, EasyResource):
         self._closed = True
         self._detach_policy_server_watcher()
         await self._stop_command()
-        # The server's lifetime is the component's; a process with no owner cannot be
-        # stopped from Viam after the component is removed.
-        if self._policy_server is not None:
-            await asyncio.to_thread(self._policy_server.stop)
+        # close() runs on every config edit as well as on removal, and the SDK cannot
+        # tell them apart; the server stays up so an edit does not cost a model load.
+        # Run `policy_server stop` before removing the component.

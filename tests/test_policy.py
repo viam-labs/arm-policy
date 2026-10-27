@@ -17,6 +17,7 @@ from viam.proto.app.robot import ComponentConfig
 from viam.utils import dict_to_struct
 
 from viam_arm_policy import model_export
+from viam_arm_policy import policy_server as policy_server_module
 from viam_arm_policy.policy import (
     CAMERA_ALIASES,
     CAMERA_KEYS,
@@ -502,10 +503,14 @@ def test_execute_requires_request_or_configured_prompt():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("serves_other", [False, True])
-def test_reconfigure_stops_policy_server_only_when_its_identity_changes(
-    tmp_path, monkeypatch, serves_other
+@pytest.mark.parametrize(
+    "edit, expect_stop",
+    [({"prompt": "place"}, False), ({"model_path": "{v2}"}, True), ({"policy_server_port": 8001}, True)],
+)
+def test_rebuilt_policy_stops_server_only_when_its_identity_changes(
+    tmp_path, monkeypatch, edit, expect_stop
 ):
+    """The SDK rebuilds the component on every edit: close() the old one, new() the next."""
     contract_path, _, _ = _write_contract(tmp_path)
     attrs = {
         "arm": "pick-arm",
@@ -515,47 +520,36 @@ def test_reconfigure_stops_policy_server_only_when_its_identity_changes(
         "server_uri": "ws://127.0.0.1:8000",
         "prompt": "pick",
         "policy_contract_path": str(contract_path),
-        "model_path": str(tmp_path / "package"),
+        "model_path": str(tmp_path / "v1"),
+        "model_data_root": str(tmp_path / "data"),
     }
-
-    class ExistingServer:
-        stopped = False
-        asked = None
-
-        def serves_other(self, model, host, port):
-            self.asked = (model, host, port)
-            return serves_other
-
-        def stop(self):
-            self.stopped = True
-
-    existing = ExistingServer()
-    policy = Policy("policy")
-    policy._policy_server = existing
+    edit = {k: v.replace("{v2}", str(tmp_path / "v2")) if isinstance(v, str) else v for k, v in edit.items()}
     monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
-    policy.reconfigure(_config(attrs), {})
-    assert existing.stopped is serves_other
-    assert existing.asked == (tmp_path / "package", "127.0.0.1", 8000)
-
-
-def test_close_always_stops_policy_server():
-    class ExistingServer:
-        stopped = False
-
-        def stop(self):
-            self.stopped = True
+    monkeypatch.setattr(
+        policy_server_module, "_process_info", lambda pid: policy_server_module._ProcessInfo("t", "S")
+    )
+    monkeypatch.setattr(policy_server_module, "_health_ready", lambda host, port: True)
+    stops = []
+    monkeypatch.setattr(
+        policy_server_module.PolicyServerSupervisor, "stop", lambda self, *a, **k: stops.append(self.state_path)
+    )
 
     async def scenario():
-        existing = ExistingServer()
-        policy = Policy("policy")
-        policy._policy_server = existing
+        first = Policy.new(_config(attrs), {})
+        state = first._policy_server.state_path
+        state.parent.mkdir(parents=True)
+        state.write_text(
+            json.dumps({"pid": 1, "start_ticks": "t", "host": "127.0.0.1", "port": 8000, "model": str(tmp_path / "v1")})
+        )
 
         async def stop_execution():
             return {}
 
-        policy._stop_command = stop_execution
-        await policy.close()
-        assert existing.stopped
+        first._stop_command = stop_execution
+        await first.close()
+        assert stops == []
+        Policy.new(_config({**attrs, **edit}), {})
+        assert stops == ([state] if expect_stop else [])
 
     asyncio.run(scenario())
 
