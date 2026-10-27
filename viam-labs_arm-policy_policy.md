@@ -57,7 +57,7 @@ the component uses `policy_contract.json` from the deployed `model_path` package
 | `server_uri` | derived | OpenPI policy-server `ws://` or `wss://` endpoint; when omitted, uses `ws://{policy_server_host}:{policy_server_port}`. |
 | `policy_server_host` | `127.0.0.1` | Bind host for the module-owned inference process. |
 | `policy_server_port` | `8000` | Bind port for the module-owned inference process. |
-| `policy_server_readiness_timeout_sec` | `300` | How long a start waits for `GET /healthz`. Covers the model load; the pinned Cosmos runtime is installed by the module's `first_run` script, and only falls back to installing during a start if that did not run. |
+| `policy_server_readiness_timeout_sec` | `300` | How long a start waits for `GET /healthz`. Covers the model load; the pinned Cosmos runtime is installed by the module's `first_run` script. If that did not run (`viam module reload-local` skips it, or it had no network), the first start installs it under this timeout instead — run `./first_run.sh` once by hand or raise this value. |
 
 ### Viam-deployed model
 

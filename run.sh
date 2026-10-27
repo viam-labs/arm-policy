@@ -2,6 +2,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
+export HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
 export PATH=$PATH:$HOME/.local/bin
 
 # temp workaround to set up container paths
