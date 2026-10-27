@@ -58,7 +58,7 @@ the component uses `policy_contract.json` from the deployed `model_path` package
 | `policy_server_host` | `127.0.0.1` | Bind host for the module-owned inference process. |
 | `policy_server_port` | `8000` | Bind port for the module-owned inference process. |
 | `policy_server_readiness_timeout_sec` | `900` | Startup readiness timeout, including first-run environment provisioning. |
-| `policy_server_autoclose` | `false` | Stop the managed policy-server process during component reconfiguration or close. Leave disabled to preserve the server across arm-policy and `viam-server` restarts. |
+| `policy_server_autoclose` | `false` | Stop the managed policy-server process during every component reconfiguration and on close. Leave disabled to preserve the server across arm-policy and `viam-server` restarts; a reconfiguration that changes `model_path`, `policy_server_host`, or `policy_server_port` stops a running server regardless, so it cannot keep serving the previous package's weights. |
 
 ### Viam-deployed model
 
@@ -189,7 +189,7 @@ rejected before dispatch.
 
 ### Model and server management
 
-Start the isolated pinned-Cosmos server for the deployed `model_path` package. The first start requires network access and substantial disk space while the pinned upstream CUDA 13 policy-server environment is provisioned; later starts reuse it. Start is idempotent and waits for HTTP `GET /healthz` on the configured host and port to return status 200 with body `OK\n`, so its readiness timeout must cover first-time provisioning. The bounded health request checks server responsiveness without opening a WebSocket or running inference. Readiness failures include the log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
+Start the isolated pinned-Cosmos server for the deployed `model_path` package. The first start requires network access and substantial disk space while the pinned upstream CUDA 13 policy-server environment is provisioned; later starts reuse it. Start is idempotent while the running server was started for the same `model_path`, host, and port; otherwise it stops that server first and starts a new one. Start waits for HTTP `GET /healthz` on the configured host and port to return status 200 with body `OK\n`, so its readiness timeout must cover first-time provisioning. The bounded health request checks server responsiveness without opening a WebSocket or running inference. Readiness failures include the log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
 
 Server startup checks that the package contains the required export files and the VAE, and that the training config and policy contract match their `runtime_manifest.json` SHA-256 digests. It does not traverse the package or hash the VAE or weight shards; payload loading errors remain the policy server's responsibility. A missing file or digest mismatch prevents startup.
 

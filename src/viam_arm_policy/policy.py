@@ -973,7 +973,16 @@ class Policy(Generic, EasyResource):
             _model_data_root(parsed), self.name
         )
         self._detach_policy_server_watcher()
-        if parsed.policy_server_autoclose and self._policy_server is not None:
+        if self._policy_server is not None and (
+            parsed.policy_server_autoclose
+            or self._policy_server.serves_other(
+                validate_model_path(parsed.model_path) if parsed.model_path else None,
+                parsed.policy_server_host,
+                parsed.policy_server_port,
+            )
+        ):
+            # A retained server would keep serving the previous package's weights;
+            # starting stays explicit (`policy_server start`).
             self._policy_server.stop()
         parsed._contract = self._config.contract
         parsed._profile = self._config.profile
@@ -2003,6 +2012,8 @@ class Policy(Generic, EasyResource):
                 self._config.policy_server_host,
                 self._config.policy_server_port,
                 self._config.policy_server_readiness_timeout_sec,
+                None,
+                model,
             )
         except (OSError, RuntimeError) as exc:
             self.logger.error("managed policy-server failed during startup: %s", exc)

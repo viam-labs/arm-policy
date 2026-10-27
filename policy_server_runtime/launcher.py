@@ -62,7 +62,9 @@ def _model_view(model: Path) -> Path:
     vae_rel = runtime.get("vae", {}).get("path")
     if not isinstance(vae_rel, str) or not (model / vae_rel).is_file():
         raise SystemExit("portable export has no packaged VAE")
-    digest = hashlib.sha256((model / "config.json").read_bytes() + (model / "runtime_manifest.json").read_bytes()).hexdigest()[:16]
+    # Keyed by location too: a re-published export has identical bytes in a new package
+    # directory, and the view's symlinks must not point into the removed old one.
+    digest = hashlib.sha256(str(model.resolve()).encode() + (model / "config.json").read_bytes() + (model / "runtime_manifest.json").read_bytes()).hexdigest()[:16]
     root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "arm-policy" / f"policy-model-{digest}"
     root.parent.mkdir(parents=True, exist_ok=True)
     with (root.parent / f".{root.name}.lock").open("a+", encoding="utf-8") as lock:

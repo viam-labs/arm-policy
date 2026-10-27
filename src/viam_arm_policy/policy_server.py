@@ -275,6 +275,24 @@ class PolicyServerSupervisor:
             f"exit_status={status}; log_path={self.log_path}; tail={self._log_tail()}"
         )
 
+    def serves_other(self, model: Path | None, host: str, port: int) -> bool:
+        """Whether a live server was started for a different model or address.
+
+        State written before `model` was recorded is treated as matching so a
+        module upgrade does not restart a healthy server.
+        """
+        with self._lock:
+            if not self.state_path.is_file():
+                return False
+            state = self._read_state() or {}
+            if self._status_locked()["state"] not in ("starting", "healthy"):
+                return False
+            recorded = state.get("model")
+            model_changed = (
+                model is not None and isinstance(recorded, str) and recorded != str(model)
+            )
+            return model_changed or (state.get("host"), state.get("port")) != (host, port)
+
     def start(
         self,
         command: Sequence[str],
@@ -282,11 +300,19 @@ class PolicyServerSupervisor:
         port: int,
         readiness_timeout: float = 30.0,
         environment: Mapping[str, str] | None = None,
+        model: Path | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             current = self._status_locked()
             if current["state"] in ("starting", "healthy"):
-                return {**current, "idempotent": True}
+                if not self.serves_other(model, host, port):
+                    return {**current, "idempotent": True}
+                cleanup = self._stop_locked()
+                if not cleanup.get("stopped", False) and self._read_state() is not None:
+                    raise RuntimeError(
+                        "cannot safely stop policy server serving a different model; "
+                        f"detail={cleanup.get('detail', 'unknown')}"
+                    )
             if current["state"] in ("unhealthy", "exited"):
                 cleanup = self._stop_locked()
                 if not cleanup.get("stopped", False) and self._read_state() is not None:
@@ -332,6 +358,7 @@ class PolicyServerSupervisor:
                 "start_ticks": info.start_ticks,
                 "host": host,
                 "port": port,
+                **({} if model is None else {"model": str(model)}),
                 "ready_deadline": time.monotonic() + readiness_timeout,
             }
             self.state_path.write_text(

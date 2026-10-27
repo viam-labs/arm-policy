@@ -59,7 +59,7 @@ class CapturingSupervisor:
     def __init__(self):
         self.commands = []
 
-    def start(self, command, host, port, readiness_timeout, environment=None):
+    def start(self, command, host, port, readiness_timeout, environment=None, model=None):
         self.commands.append(command)
         return {"state": "healthy", "pid": 123}
 
@@ -453,6 +453,58 @@ def test_recovered_zombie_reports_exit_without_pid_reuse_kill(tmp_path, monkeypa
     assert supervisor.status()["state"] == "absent"
 
 
+def _healthy_state(supervisor, monkeypatch, **extra):
+    supervisor.root.mkdir(parents=True, exist_ok=True)
+    supervisor.state_path.write_text(
+        json.dumps({"pid": 1234, "start_ticks": "t", "host": "127.0.0.1", "port": 8000, **extra})
+    )
+    monkeypatch.setattr(
+        policy_server_module, "_process_info", lambda pid: policy_server_module._ProcessInfo("t", "S")
+    )
+    monkeypatch.setattr(policy_server_module, "_health_ready", lambda host, port: True)
+
+
+def test_serves_other_compares_model_and_address_and_tolerates_legacy_state(tmp_path, monkeypatch):
+    supervisor = PolicyServerSupervisor(tmp_path, "identity")
+    old, new = Path("/models/old"), Path("/models/new")
+    _healthy_state(supervisor, monkeypatch, model=str(old))
+    assert not supervisor.serves_other(old, "127.0.0.1", 8000)
+    assert supervisor.serves_other(new, "127.0.0.1", 8000)
+    assert supervisor.serves_other(old, "127.0.0.1", 8001)
+    # State written before `model` was recorded must not trigger a restart on upgrade.
+    _healthy_state(supervisor, monkeypatch)
+    assert not supervisor.serves_other(new, "127.0.0.1", 8000)
+
+
+def test_start_restarts_a_healthy_server_that_serves_another_model(tmp_path, monkeypatch):
+    supervisor = PolicyServerSupervisor(tmp_path, "restart")
+    _healthy_state(supervisor, monkeypatch, model="/models/old")
+    stopped = []
+    monkeypatch.setattr(
+        supervisor, "_stop_locked", lambda *a, **k: stopped.append(True) or {"stopped": True}
+    )
+    monkeypatch.setattr(supervisor, "_clear", lambda: supervisor.state_path.unlink(missing_ok=True))
+    spawned = []
+
+    class FakeProcess:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        spawned.append(command)
+        supervisor.state_path.unlink(missing_ok=True)
+        return FakeProcess()
+
+    monkeypatch.setattr(policy_server_module.subprocess, "Popen", fake_popen)
+
+    assert supervisor.start(["srv"], "127.0.0.1", 8000, 1, model=Path("/models/old"))["idempotent"]
+    assert stopped == [] and spawned == []
+    result = supervisor.start(["srv"], "127.0.0.1", 8000, 1, model=Path("/models/new"))
+    assert stopped == [True] and spawned == [["srv"]] and result["idempotent"] is False
+    assert json.loads(supervisor.state_path.read_text())["model"] == "/models/new"
+
 def test_reconfigure_detaches_watcher_without_stopping_retained_server(
     tmp_path, monkeypatch
 ):
@@ -465,6 +517,9 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
 
         def _has_state(self):
             return True
+
+        def serves_other(self, model, host, port):
+            return False
 
         def stop(self):
             self.stop_calls += 1
@@ -485,6 +540,9 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
             wrist_camera="wrist",
             model_data_root=str(tmp_path),
             policy_server_autoclose=False,
+            model_path=None,
+            policy_server_host="127.0.0.1",
+            policy_server_port=8000,
             binary_gripper_initial_state=0.0,
         )
         monkeypatch.setattr(
