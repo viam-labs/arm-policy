@@ -4,6 +4,8 @@
 # script only moves slow work out of the module-startup and readiness budgets.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+# viam-server may not set HOME; the launcher caches under ~/.cache and uv installs to ~/.local.
+export HOME="${HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}"
 export PATH="$PATH:$HOME/.local/bin"
 
 if ! command -v uv >/dev/null; then
