@@ -356,7 +356,7 @@ def test_policy_config_derives_managed_server_defaults(tmp_path):
     )
 
     assert str(config.server_uri) == "ws://policy.internal:9001/"
-    assert config.policy_server_readiness_timeout_sec == 900.0
+    assert config.policy_server_readiness_timeout_sec == 300.0
     assert config.conditioner_algorithm == "toppra"
     assert config.prompt is None
 

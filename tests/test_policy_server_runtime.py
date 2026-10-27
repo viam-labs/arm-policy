@@ -213,3 +213,29 @@ def test_override_file_is_read_from_the_runtime_directory(tmp_path, monkeypatch)
     (tmp_path / "server_overrides.json").write_text('{"args": "bad"}')
     with pytest.raises(SystemExit):
         service_adapter._override_args()
+
+
+def test_provision_only_is_a_no_op_when_the_runtime_is_already_provisioned(tmp_path, monkeypatch):
+    """first_run calls this on every module version; a cache hit must not touch git or uv."""
+    from policy_server_runtime import launcher
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    root = launcher._framework_root()
+    (root / ".venv" / "bin").mkdir(parents=True)
+    (root / ".venv" / "bin" / "python").write_text("")
+    (root / ".arm-policy-policy-server-runtime").write_text(launcher.FRAMEWORK_RUNTIME_MARKER)
+    monkeypatch.setattr(launcher, "_framework_revision", lambda path: launcher.FRAMEWORK_COMMIT)
+    calls = []
+    monkeypatch.setattr(launcher.subprocess, "run", lambda *a, **k: calls.append(a[0]))
+    monkeypatch.setattr(sys, "argv", ["launcher", "--provision-only"])
+
+    assert launcher.main() == 0
+    assert calls == []
+
+
+def test_launcher_requires_model_unless_provisioning_only(monkeypatch):
+    from policy_server_runtime import launcher
+
+    monkeypatch.setattr(sys, "argv", ["launcher"])
+    with pytest.raises(SystemExit):
+        launcher.main()

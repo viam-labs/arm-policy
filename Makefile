@@ -3,7 +3,7 @@ RUNTIME_SOURCES := $(shell find src policy_server_runtime -path '*/.venv' -prune
 # module whose entrypoint already exists in source as pre-built and skips `make`.
 ENTRYPOINT := dist/arm-policy
 
-module.tar.gz: meta.json pyproject.toml uv.lock run.sh .python-version $(ENTRYPOINT) $(RUNTIME_SOURCES)
+module.tar.gz: meta.json pyproject.toml uv.lock run.sh first_run.sh .python-version $(ENTRYPOINT) $(RUNTIME_SOURCES)
 	rm -f $@
 	tar czf $@ --exclude='__pycache__' --exclude='**/*.pyc' --exclude='.venv' $^
 

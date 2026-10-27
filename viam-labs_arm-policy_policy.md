@@ -57,7 +57,7 @@ the component uses `policy_contract.json` from the deployed `model_path` package
 | `server_uri` | derived | OpenPI policy-server `ws://` or `wss://` endpoint; when omitted, uses `ws://{policy_server_host}:{policy_server_port}`. |
 | `policy_server_host` | `127.0.0.1` | Bind host for the module-owned inference process. |
 | `policy_server_port` | `8000` | Bind port for the module-owned inference process. |
-| `policy_server_readiness_timeout_sec` | `900` | Startup readiness timeout, including first-run environment provisioning. |
+| `policy_server_readiness_timeout_sec` | `300` | How long a start waits for `GET /healthz`. Covers the model load; the pinned Cosmos runtime is installed by the module's `first_run` script. If that did not run (`viam module reload-local` skips it, or it had no network), the first start installs it under this timeout instead — run `./first_run.sh` once by hand or raise this value. |
 
 ### Viam-deployed model
 
@@ -110,8 +110,8 @@ server's log. Set it to another absolute persistent directory when the
 deployment uses a different writable data location.
 
 `policy_server_host` and `policy_server_port` configure the module-owned inference
-process and provide the default `server_uri`. The 900-second
-`policy_server_readiness_timeout_sec` includes first-run dependency installation.
+process and provide the default `server_uri`. The 300-second
+`policy_server_readiness_timeout_sec` covers loading the model onto the GPU; dependency installation happens in `first_run`.
 
 The policy server runs with Cosmos guardrails disabled. They are prompt-safety
 models fetched from a gated Hugging Face repository; arm safety is enforced by
@@ -188,7 +188,7 @@ rejected before dispatch.
 
 ### Model and server management
 
-Start the isolated pinned-Cosmos server for the deployed `model_path` package. The first start requires network access and substantial disk space while the pinned upstream CUDA 13 policy-server environment is provisioned; later starts reuse it. Start is idempotent and waits for HTTP `GET /healthz` on the configured host and port to return status 200 with body `OK\n`, so its readiness timeout must cover first-time provisioning. The bounded health request checks server responsiveness without opening a WebSocket or running inference. Readiness failures include the log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; a running server also reports `model`, the directory it was launched with. That can differ from the `model_path` shown in the app while `viam-server` is still downloading a package for a pending configuration, so compare the two before trusting a `healthy` server after a model change. `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
+Start the isolated pinned-Cosmos server for the deployed `model_path` package. The pinned upstream CUDA 13 policy-server environment (~10 GB, network-bound) is installed by the module's `first_run` script, which `viam-server` runs once per module version before the entrypoint with its own long timeout; if it has not run, the first start installs it under the readiness timeout instead. Start is idempotent and waits for HTTP `GET /healthz` on the configured host and port to return status 200 with body `OK\n`. The bounded health request checks server responsiveness without opening a WebSocket or running inference. Readiness failures include the log path and log tail. `status` reports `absent`, `starting`, `healthy`, `unhealthy`, or `exited`; a running server also reports `model`, the directory it was launched with. That can differ from the `model_path` shown in the app while `viam-server` is still downloading a package for a pending configuration, so compare the two before trusting a `healthy` server after a model change. `stop` sends a bounded graceful process-group termination followed by forced cleanup when needed.
 
 Server startup checks that the package contains the required export files and the VAE, and that the training config and policy contract match their `runtime_manifest.json` SHA-256 digests. It does not traverse the package or hash the VAE or weight shards; payload loading errors remain the policy server's responsibility. A missing file or digest mismatch prevents startup.
 
