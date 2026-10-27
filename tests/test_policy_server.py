@@ -539,7 +539,6 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
             fixed_camera_2="",
             wrist_camera="wrist",
             model_data_root=str(tmp_path),
-            policy_server_autoclose=False,
             model_path=None,
             policy_server_host="127.0.0.1",
             policy_server_port=8000,

@@ -230,7 +230,6 @@ class Config(BaseModel):
     policy_server_host: str = "127.0.0.1"
     policy_server_port: Annotated[int, Field(ge=1, le=65535)] = 8000
     policy_server_readiness_timeout_sec: PositiveFiniteFloat = 900.0
-    policy_server_autoclose: bool = False
 
     _contract: PolicyContract
     _profile: SafetyProfile
@@ -973,13 +972,10 @@ class Policy(Generic, EasyResource):
             _model_data_root(parsed), self.name
         )
         self._detach_policy_server_watcher()
-        if self._policy_server is not None and (
-            parsed.policy_server_autoclose
-            or self._policy_server.serves_other(
-                validate_model_path(parsed.model_path) if parsed.model_path else None,
-                parsed.policy_server_host,
-                parsed.policy_server_port,
-            )
+        if self._policy_server is not None and self._policy_server.serves_other(
+            validate_model_path(parsed.model_path) if parsed.model_path else None,
+            parsed.policy_server_host,
+            parsed.policy_server_port,
         ):
             # A retained server would keep serving the previous package's weights;
             # starting stays explicit (`policy_server start`).
@@ -2074,5 +2070,7 @@ class Policy(Generic, EasyResource):
         self._closed = True
         self._detach_policy_server_watcher()
         await self._stop_command()
-        if self._config.policy_server_autoclose and self._policy_server is not None:
+        # The server's lifetime is the component's; a process with no owner cannot be
+        # stopped from Viam after the component is removed.
+        if self._policy_server is not None:
             await asyncio.to_thread(self._policy_server.stop)

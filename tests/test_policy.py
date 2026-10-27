@@ -502,12 +502,9 @@ def test_execute_requires_request_or_configured_prompt():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(
-    "autoclose, serves_other, expect_stop",
-    [(False, False, False), (True, False, True), (False, True, True)],
-)
-def test_reconfigure_stops_policy_server_on_autoclose_or_model_change(
-    tmp_path, monkeypatch, autoclose, serves_other, expect_stop
+@pytest.mark.parametrize("serves_other", [False, True])
+def test_reconfigure_stops_policy_server_only_when_its_identity_changes(
+    tmp_path, monkeypatch, serves_other
 ):
     contract_path, _, _ = _write_contract(tmp_path)
     attrs = {
@@ -519,7 +516,6 @@ def test_reconfigure_stops_policy_server_on_autoclose_or_model_change(
         "prompt": "pick",
         "policy_contract_path": str(contract_path),
         "model_path": str(tmp_path / "package"),
-        "policy_server_autoclose": autoclose,
     }
 
     class ExistingServer:
@@ -538,12 +534,11 @@ def test_reconfigure_stops_policy_server_on_autoclose_or_model_change(
     policy._policy_server = existing
     monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
     policy.reconfigure(_config(attrs), {})
-    assert existing.stopped is expect_stop
-    assert autoclose or existing.asked == (tmp_path / "package", "127.0.0.1", 8000)
+    assert existing.stopped is serves_other
+    assert existing.asked == (tmp_path / "package", "127.0.0.1", 8000)
 
 
-@pytest.mark.parametrize("autoclose", [False, True])
-def test_close_only_stops_policy_server_when_configured(autoclose):
+def test_close_always_stops_policy_server():
     class ExistingServer:
         stopped = False
 
@@ -553,7 +548,6 @@ def test_close_only_stops_policy_server_when_configured(autoclose):
     async def scenario():
         existing = ExistingServer()
         policy = Policy("policy")
-        policy._config.policy_server_autoclose = autoclose
         policy._policy_server = existing
 
         async def stop_execution():
@@ -561,7 +555,7 @@ def test_close_only_stops_policy_server_when_configured(autoclose):
 
         policy._stop_command = stop_execution
         await policy.close()
-        assert existing.stopped is autoclose
+        assert existing.stopped
 
     asyncio.run(scenario())
 
