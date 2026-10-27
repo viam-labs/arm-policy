@@ -1,7 +1,8 @@
 import asyncio
-import json
 import socket
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from viam_arm_policy.policy_server import PolicyServerSupervisor
 _SERVER_PROGRAM = """
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import sys
+import threading
 import threading
 import time
 
@@ -66,7 +68,7 @@ class CapturingSupervisor:
     def poll_failure(self):
         return None
 
-    def _has_state(self):
+    def running(self):
         return False
 
 
@@ -419,40 +421,6 @@ def test_expected_stop_is_silent_and_releases_watcher(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_recovered_zombie_reports_exit_without_pid_reuse_kill(tmp_path, monkeypatch):
-    supervisor = PolicyServerSupervisor(tmp_path, "recovered")
-    supervisor.root.mkdir(parents=True)
-    supervisor.state_path.write_text(
-        json.dumps(
-            {
-                "pid": 1234,
-                "start_ticks": "original",
-                "host": "127.0.0.1",
-                "port": 8000,
-                "ready_deadline": 0,
-            }
-        )
-    )
-    monkeypatch.setattr(
-        policy_server_module,
-        "_process_info",
-        lambda pid: policy_server_module._ProcessInfo("original", "Z"),
-    )
-
-    assert supervisor.status()["state"] == "exited"
-    failure = supervisor.poll_failure()
-    assert failure is not None
-    assert failure.exit_status is None
-
-    monkeypatch.setattr(
-        policy_server_module,
-        "_process_info",
-        lambda pid: policy_server_module._ProcessInfo("reused", "S"),
-    )
-    assert supervisor.poll_failure() is None
-    assert supervisor.status()["state"] == "absent"
-
-
 def test_reconfigure_detaches_watcher_without_stopping_retained_server(
     tmp_path, monkeypatch
 ):
@@ -463,7 +431,7 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
         def poll_failure(self):
             return None
 
-        def _has_state(self):
+        def running(self):
             return True
 
         def stop(self):
@@ -484,7 +452,6 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
             fixed_camera_2="",
             wrist_camera="wrist",
             model_data_root=str(tmp_path),
-            policy_server_autoclose=False,
             binary_gripper_initial_state=0.0,
         )
         monkeypatch.setattr(
@@ -509,3 +476,49 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
 
     asyncio.run(scenario())
 
+
+
+def test_start_refuses_a_port_already_served_by_a_foreign_server(tmp_path):
+    port = _free_port()
+    foreign = subprocess.Popen(_server_command(port, 30, 0))
+    try:
+        deadline = time.monotonic() + 5
+        while not policy_server_module._health_ready("127.0.0.1", port):
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        supervisor = PolicyServerSupervisor(tmp_path, "foreign")
+        with pytest.raises(RuntimeError, match="does not own"):
+            supervisor.start(_server_command(port, 30, 0), "127.0.0.1", port, 2)
+        assert supervisor.status()["state"] == "absent"
+    finally:
+        foreign.kill()
+        foreign.wait()
+
+
+def test_stop_during_start_unblocks_the_start(tmp_path):
+    """start() must not hold the lock across the readiness wait."""
+    port = _free_port()
+    supervisor = PolicyServerSupervisor(tmp_path, "slow")
+    # A child that never answers /healthz: readiness would wait the full 30 s.
+    program = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_DFL); time.sleep(60)"
+    outcome = {}
+
+    def run_start():
+        try:
+            supervisor.start([sys.executable, "-c", program], "127.0.0.1", port, 30)
+        except RuntimeError as exc:
+            outcome["error"] = str(exc)
+
+    starter = threading.Thread(target=run_start)
+    starter.start()
+    deadline = time.monotonic() + 5
+    while not supervisor.running():
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    began = time.monotonic()
+    assert supervisor.stop(grace_seconds=1)["stopped"]
+    assert time.monotonic() - began < 5
+    starter.join(5)
+    assert not starter.is_alive()
+    assert "stopped during startup" in outcome["error"]
+    assert supervisor.status()["state"] == "absent"

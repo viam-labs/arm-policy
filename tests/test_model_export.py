@@ -136,15 +136,16 @@ while True:
 """
     supervisor = PolicyServerSupervisor(tmp_path, "fixture")
     started = supervisor.start(
-        [sys.executable, "-c", program],
+        [sys.executable, "-c", program, "--model", "/models/v1"],
         "127.0.0.1",
         port,
         3,
         {"POLICY_SERVER_FIXTURE": "server-env"},
     )
-    assert started["state"] == "healthy"
+    assert started["state"] == "healthy" and started["model"] == "/models/v1"
     assert supervisor.start([sys.executable, "-c", program], "127.0.0.1", port, 3)["idempotent"]
-    assert supervisor.status()["state"] == "healthy"
+    status = supervisor.status()
+    assert status["state"] == "healthy" and status["model"] == "/models/v1"
     assert supervisor.stop(grace_seconds=1)["state"] == "absent"
 
 def test_supervisor_readiness_timeout_stops_process(tmp_path):

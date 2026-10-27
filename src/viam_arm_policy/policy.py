@@ -230,7 +230,6 @@ class Config(BaseModel):
     policy_server_host: str = "127.0.0.1"
     policy_server_port: Annotated[int, Field(ge=1, le=65535)] = 8000
     policy_server_readiness_timeout_sec: PositiveFiniteFloat = 900.0
-    policy_server_autoclose: bool = False
 
     _contract: PolicyContract
     _profile: SafetyProfile
@@ -801,7 +800,7 @@ class Policy(Generic, EasyResource):
         self._last_result: Optional[dict[str, Any]] = None
         self._policy_server_watch_task: asyncio.Task[None] | None = None
         self._policy_server_watch_generation = 0
-        self._reported_policy_server_failure: tuple[int, str] | None = None
+        self._reported_policy_server_failure: object | None = None
         self._policy_server = PolicyServerSupervisor(default_data_root(), name)
 
     @property
@@ -851,23 +850,18 @@ class Policy(Generic, EasyResource):
                 ):
                     return
                 if failure is not None:
-                    if failure.identity != self._reported_policy_server_failure:
-                        self._reported_policy_server_failure = failure.identity
-                        exit_status = (
-                            "unavailable"
-                            if failure.exit_status is None
-                            else failure.exit_status
-                        )
+                    if failure.process is not self._reported_policy_server_failure:
+                        self._reported_policy_server_failure = failure.process
                         self.logger.error(
                             "managed policy-server exited unexpectedly; pid=%s; "
                             "exit_status=%s; log_path=%s; tail=%s",
-                            failure.pid,
-                            exit_status,
+                            failure.process.pid,
+                            failure.exit_status,
                             failure.log_path,
                             failure.detail,
                         )
                     return
-                if not await asyncio.to_thread(supervisor._has_state):
+                if not await asyncio.to_thread(supervisor.running):
                     return
 
                 await asyncio.sleep(0.2)
@@ -969,19 +963,14 @@ class Policy(Generic, EasyResource):
         self._wrist_camera = self._dependency(
             dependencies, Camera, parsed.wrist_camera, "wrist camera"
         )
-        next_policy_server = PolicyServerSupervisor(
-            _model_data_root(parsed), self.name
-        )
         self._detach_policy_server_watcher()
-        if parsed.policy_server_autoclose and self._policy_server is not None:
-            self._policy_server.stop()
         parsed._contract = self._config.contract
         parsed._profile = self._config.profile
         self._config = parsed
         self._binary_gripper_state = parsed.binary_gripper_initial_state
         self._ready = False
         self._readiness_error = ""
-        self._policy_server = next_policy_server
+        self._policy_server = PolicyServerSupervisor(_model_data_root(parsed), self.name)
         self._ensure_policy_server_watcher()
         self._advance_readiness()
 
@@ -2063,5 +2052,4 @@ class Policy(Generic, EasyResource):
         self._closed = True
         self._detach_policy_server_watcher()
         await self._stop_command()
-        if self._config.policy_server_autoclose and self._policy_server is not None:
-            await asyncio.to_thread(self._policy_server.stop)
+        await asyncio.to_thread(self._policy_server.stop)
