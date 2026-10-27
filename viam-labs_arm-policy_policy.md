@@ -58,7 +58,6 @@ the component uses `policy_contract.json` from the deployed `model_path` package
 | `policy_server_host` | `127.0.0.1` | Bind host for the module-owned inference process. |
 | `policy_server_port` | `8000` | Bind port for the module-owned inference process. |
 | `policy_server_readiness_timeout_sec` | `900` | Startup readiness timeout, including first-run environment provisioning. |
-| `policy_server_autoclose` | `false` | Stop the managed policy-server process during component reconfiguration or close. Leave disabled to preserve the server across arm-policy and `viam-server` restarts. |
 
 ### Viam-deployed model
 
@@ -199,9 +198,9 @@ Server startup checks that the package contains the required export files and th
 {"command": "policy_server", "action": "stop"}
 ```
 
-The supervisor is intentionally a module-owned subprocess rather than s6: it needs no host package, records Linux start ticks to avoid PID-reuse kills, and recovers the persistent process state when the component restarts with the same name and data root. By default, only an explicit `policy_server stop` terminates the server. Set `policy_server_autoclose` to `true` to stop it automatically during component reconfiguration or close.
+The supervisor is intentionally a module-owned subprocess rather than s6: it needs no host package and keeps no on-disk state. The server lives exactly as long as the component instance: closing the component stops it, and an explicit `policy_server stop` stops it earlier. Because the Python module SDK rebuilds a resource on every configuration edit (close the old instance, construct the new one), each config edit or `viam-server` restart stops the server and requires a new `policy_server start`, which pays the full startup cost again (typically 60–90 s once the environment is provisioned).
 
-Each start request emits a Viam module info log with its host and port. A successful readiness check emits a second info log with the PID, host, port, child-log path, and whether the start was idempotent. Startup failures also emit an error in the Viam module log before the start command fails. After startup, a background watcher checks for unexpected process exits and logs each failed process once, with its PID, exit status when available, child-log path, and a bounded, credential-redacted log tail. Recovered processes are monitored after component reconfiguration or restart; their exit status may be unavailable. Deliberate stops do not emit failure notifications, and closing or reconfiguring the component detaches its old watcher without changing the `policy_server_autoclose` behavior. The child log remains the full diagnostic record; these notifications do not replace it or constitute an inference health check.
+Each start request emits a Viam module info log with its host and port. A successful readiness check emits a second info log with the PID, host, port, child-log path, and whether the start was idempotent. Startup failures also emit an error in the Viam module log before the start command fails. After startup, a background watcher checks for unexpected process exits and logs each failed process once, with its PID, exit status, child-log path, and a bounded, credential-redacted log tail. Deliberate stops do not emit failure notifications. The child log remains the full diagnostic record; these notifications do not replace it or constitute an inference health check.
 
 At startup the runtime quarantines corrupt Hugging Face Hub cache metadata (tree JSON with an asterisk in `xet_hash`) left by upstream Cosmos downloads, logging both paths in the policy-server log.
 

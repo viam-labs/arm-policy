@@ -502,58 +502,30 @@ def test_execute_requires_request_or_configured_prompt():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("autoclose", [False, True])
-def test_reconfigure_only_stops_policy_server_when_configured(
-    tmp_path, monkeypatch, autoclose
-):
-    contract_path, _, _ = _write_contract(tmp_path)
-    attrs = {
-        "arm": "pick-arm",
-        "gripper": "pick-gripper",
-        "fixed_camera": "scene-cam",
-        "wrist_camera": "wrist-cam",
-        "server_uri": "ws://127.0.0.1:8000",
-        "prompt": "pick",
-        "policy_contract_path": str(contract_path),
-        "policy_server_autoclose": autoclose,
-    }
-
-    class ExistingServer:
-        stopped = False
-
-        def stop(self):
-            self.stopped = True
-
-    existing = ExistingServer()
-    policy = Policy("policy")
-    policy._policy_server = existing
-    monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
-    policy.reconfigure(_config(attrs), {})
-    assert existing.stopped is autoclose
-
-
-@pytest.mark.parametrize("autoclose", [False, True])
-def test_close_only_stops_policy_server_when_configured(autoclose):
-    class ExistingServer:
-        stopped = False
-
-        def stop(self):
-            self.stopped = True
+def test_close_stops_policy_server(tmp_path, monkeypatch):
+    _, contract, _ = _write_contract(tmp_path)
+    package = tmp_path / "package"
+    _deploy_package(package, contract)
+    monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: FakeGripper()))
+    policy = Policy.new(_config(_deployed_attrs(str(package))), {})
+    calls = []
+    monkeypatch.setattr(
+        policy._policy_server,
+        "start",
+        lambda *args: calls.append("start") or {"state": "healthy", "pid": 1},
+    )
+    monkeypatch.setattr(
+        policy._policy_server,
+        "stop",
+        lambda: calls.append("stop") or {"state": "absent", "stopped": True},
+    )
 
     async def scenario():
-        existing = ExistingServer()
-        policy = Policy("policy")
-        policy._config.policy_server_autoclose = autoclose
-        policy._policy_server = existing
-
-        async def stop_execution():
-            return {}
-
-        policy._stop_command = stop_execution
+        await policy.do_command({"command": "policy_server", "action": "start"})
         await policy.close()
-        assert existing.stopped is autoclose
 
     asyncio.run(scenario())
+    assert calls == ["start", "stop"]
 
 
 def test_contract_selects_matching_profile_and_rejects_wrong_joint_order(tmp_path):

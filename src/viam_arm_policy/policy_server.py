@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import http.client
-import json
 import os
 import re
 import signal
@@ -14,7 +13,7 @@ import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, NoReturn, Sequence
 
 _HEALTH_CHECK_TIMEOUT = 0.2
 _HEALTH_RESPONSE = b"OK\n"
@@ -28,58 +27,11 @@ _HUGGING_FACE_TOKEN_RE = re.compile(r"\bhf_[A-Za-z0-9_-]{6,}\b")
 
 
 @dataclass(frozen=True)
-class _ProcessInfo:
-    start_ticks: str
-    state: str
-
-
-@dataclass(frozen=True)
 class _PolicyServerExit:
-    identity: tuple[int, str]
-    pid: int
-    exit_status: int | None
+    process: subprocess.Popen[Any]
+    exit_status: int
     log_path: str
     detail: str
-
-
-def _process_info(pid: int) -> _ProcessInfo | None:
-    try:
-        # `/proc/<pid>/stat` wraps the command in parentheses, so split after
-        # the final delimiter before indexing fields. Field 22 is start time.
-        _, fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(
-            ") ", 1
-        )
-        values = fields.split()
-        return _ProcessInfo(start_ticks=values[19], state=values[0])
-    except (IndexError, OSError, ValueError):
-        return None
-
-
-def _open_identity_pidfd(identity: tuple[int, str]) -> int | None:
-    pidfd_open = getattr(os, "pidfd_open", None)
-    if pidfd_open is None or not hasattr(signal, "pidfd_send_signal"):
-        return None
-    try:
-        pidfd = pidfd_open(identity[0])
-    except OSError:
-        return None
-    info = _process_info(identity[0])
-    if (
-        info is None
-        or info.start_ticks != identity[1]
-        or info.state == "Z"
-    ):
-        os.close(pidfd)
-        return None
-    return pidfd
-
-
-def _send_pidfd_signal(pidfd: int, signum: int) -> bool:
-    try:
-        signal.pidfd_send_signal(pidfd, signum)
-    except OSError:
-        return False
-    return True
 
 
 def _health_ready(host: str, port: int) -> bool:
@@ -99,35 +51,24 @@ def _health_ready(host: str, port: int) -> bool:
             connection.close()
 
 
+def _killpg(pid: int, signum: int) -> None:
+    try:
+        os.killpg(pid, signum)
+    except ProcessLookupError:
+        pass
+
+
 class PolicyServerSupervisor:
-    """State-file supervisor with process-group cleanup and PID identity checks."""
+    """In-memory supervisor: the server lives exactly as long as this object's owner."""
 
     def __init__(self, root: Path, name: str) -> None:
         self.root = root / "policy-server"
-        self.state_path = self.root / f"{name}.json"
         self.log_path = self.root / f"{name}.log"
         self._lock = threading.RLock()
         self._process: subprocess.Popen[Any] | None = None
-        self._owned_identity: tuple[int, str] | None = None
-
-    @staticmethod
-    def _state_identity(state: Mapping[str, Any]) -> tuple[int, str] | None:
-        pid = state.get("pid")
-        ticks = state.get("start_ticks")
-        if not isinstance(pid, int) or not isinstance(ticks, str):
-            return None
-        return pid, ticks
-
-    def _read_state(self) -> dict[str, Any] | None:
-        try:
-            value = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
-
-    def _clear(self) -> None:
-        self.state_path.unlink(missing_ok=True)
-
+        self._host = ""
+        self._port = 0
+        self._ready_deadline = 0.0
 
     @staticmethod
     def _redact_tail(tail: str) -> str:
@@ -156,123 +97,54 @@ class PolicyServerSupervisor:
         except OSError:
             return "no server log was created"
 
-    def _owned_exit_status(self, identity: tuple[int, str]) -> int | None:
-        if self._owned_identity != identity or self._process is None:
-            return None
-        return self._process.poll()
-
-    def _exit_response(
-        self, identity: tuple[int, str], exit_status: int | None
-    ) -> dict[str, Any]:
-        response: dict[str, Any] = {
-            "state": "exited",
-            "pid": identity[0],
-            "log_path": str(self.log_path),
-            "detail": self._log_tail(),
-        }
-        if exit_status is not None:
-            response["exit_status"] = exit_status
-        return response
-
     def _status_locked(self) -> dict[str, Any]:
-        state = self._read_state()
-        if state is None:
+        process = self._process
+        if process is None:
             return {"state": "absent", "log_path": str(self.log_path)}
-        identity = self._state_identity(state)
-        if identity is None:
-            self._clear()
-            return {
-                "state": "absent",
-                "detail": "malformed process state removed",
-                "log_path": str(self.log_path),
-            }
-        exit_status = self._owned_exit_status(identity)
+        exit_status = process.poll()
         if exit_status is not None:
-            return self._exit_response(identity, exit_status)
-        info = _process_info(identity[0])
-        if info is None or info.state == "Z":
-            return self._exit_response(identity, None)
-        if info.start_ticks != identity[1]:
-            self._clear()
             return {
-                "state": "absent",
-                "detail": "stale process identity removed",
+                "state": "exited",
+                "pid": process.pid,
+                "exit_status": exit_status,
                 "log_path": str(self.log_path),
+                "detail": self._log_tail(),
             }
-        host, port = state.get("host"), state.get("port")
-        if not isinstance(host, str) or not isinstance(port, int):
-            self._clear()
-            return {
-                "state": "absent",
-                "detail": "malformed process state removed",
-                "log_path": str(self.log_path),
-            }
-        if _health_ready(host, port):
-            return {
-                "state": "healthy",
-                "pid": identity[0],
-                "host": host,
-                "port": port,
-                "log_path": str(self.log_path),
-            }
-        deadline = state.get("ready_deadline", 0.0)
-        if isinstance(deadline, (int, float)) and time.monotonic() < deadline:
-            return {
-                "state": "starting",
-                "pid": identity[0],
-                "host": host,
-                "port": port,
-                "log_path": str(self.log_path),
-            }
-        return {
-            "state": "unhealthy",
-            "pid": identity[0],
-            "host": host,
-            "port": port,
+        running = {
+            "pid": process.pid,
+            "host": self._host,
+            "port": self._port,
             "log_path": str(self.log_path),
-            "detail": self._log_tail(),
         }
+        if _health_ready(self._host, self._port):
+            return {"state": "healthy", **running}
+        if time.monotonic() < self._ready_deadline:
+            return {"state": "starting", **running}
+        return {"state": "unhealthy", **running, "detail": self._log_tail()}
 
     def status(self) -> dict[str, Any]:
         with self._lock:
             return self._status_locked()
 
-    def _poll_failure_locked(self) -> _PolicyServerExit | None:
-        state = self._read_state()
-        if state is None:
-            return None
-        identity = self._state_identity(state)
-        if identity is None:
-            self._clear()
-            return None
-        exit_status = self._owned_exit_status(identity)
-        if exit_status is not None:
-            return _PolicyServerExit(
-                identity, identity[0], exit_status, str(self.log_path), self._log_tail()
-            )
-        info = _process_info(identity[0])
-        if info is None or info.state == "Z":
-            return _PolicyServerExit(
-                identity, identity[0], None, str(self.log_path), self._log_tail()
-            )
-        if info.start_ticks != identity[1]:
-            self._clear()
-        return None
+    def running(self) -> bool:
+        with self._lock:
+            return self._process is not None
 
     def poll_failure(self) -> _PolicyServerExit | None:
-        """Return an unexpected owned or recovered server exit, if one is observed."""
+        """Return the owned server's exit, if it has exited without being stopped."""
         with self._lock:
-            return self._poll_failure_locked()
+            process = self._process
+            if process is None or process.poll() is None:
+                return None
+            return _PolicyServerExit(
+                process, process.returncode, str(self.log_path), self._log_tail()
+            )
 
-    def _has_state(self) -> bool:
-        with self._lock:
-            return self._read_state() is not None
-
-    def _startup_exit_error(self, exit_status: int | None) -> RuntimeError:
-        status = "unavailable" if exit_status is None else str(exit_status)
-        return RuntimeError(
+    def _fail_startup(self, exit_status: int) -> NoReturn:
+        self._process = None
+        raise RuntimeError(
             "policy server exited before readiness; "
-            f"exit_status={status}; log_path={self.log_path}; tail={self._log_tail()}"
+            f"exit_status={exit_status}; log_path={self.log_path}; tail={self._log_tail()}"
         )
 
     def start(
@@ -287,13 +159,8 @@ class PolicyServerSupervisor:
             current = self._status_locked()
             if current["state"] in ("starting", "healthy"):
                 return {**current, "idempotent": True}
-            if current["state"] in ("unhealthy", "exited"):
-                cleanup = self._stop_locked()
-                if not cleanup.get("stopped", False) and self._read_state() is not None:
-                    raise RuntimeError(
-                        "cannot safely stop previous policy server; "
-                        f"detail={cleanup.get('detail', 'unknown')}"
-                    )
+            if self._process is not None:
+                self._stop_locked()
             if not command:
                 raise ValueError("policy server launch command is empty")
             self.root.mkdir(parents=True, exist_ok=True)
@@ -310,192 +177,56 @@ class PolicyServerSupervisor:
                     close_fds=True,
                     env=process_environment,
                 )
-            info = _process_info(process.pid)
-            if info is None:
+            self._process, self._host, self._port = process, host, port
+            self._ready_deadline = time.monotonic() + readiness_timeout
+            while time.monotonic() < self._ready_deadline:
                 exit_status = process.poll()
                 if exit_status is not None:
-                    raise self._startup_exit_error(exit_status)
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
-                raise RuntimeError(
-                    "cannot record policy server process identity; "
-                    f"log_path={self.log_path}; tail={self._log_tail()}"
-                )
-            identity = (process.pid, info.start_ticks)
-            self._process = process
-            self._owned_identity = identity
-            state = {
-                "pid": process.pid,
-                "start_ticks": info.start_ticks,
-                "host": host,
-                "port": port,
-                "ready_deadline": time.monotonic() + readiness_timeout,
-            }
-            self.state_path.write_text(
-                json.dumps(state, sort_keys=True) + "\n", encoding="utf-8"
-            )
-            while time.monotonic() < state["ready_deadline"]:
-                exit_status = process.poll()
-                if exit_status is not None:
-                    self._clear()
-                    raise self._startup_exit_error(exit_status)
-                status = self._status_locked()
-                if status["state"] == "healthy":
-                    return {**status, "idempotent": False}
-                exit_status = process.poll()
-                if exit_status is not None:
-                    self._clear()
-                    raise self._startup_exit_error(exit_status)
+                    self._fail_startup(exit_status)
+                if _health_ready(host, port):
+                    return {
+                        "state": "healthy",
+                        "pid": process.pid,
+                        "host": host,
+                        "port": port,
+                        "log_path": str(self.log_path),
+                        "idempotent": False,
+                    }
                 time.sleep(0.1)
-            status = self._status_locked()
             exit_status = process.poll()
             if exit_status is not None:
-                self._clear()
-                raise self._startup_exit_error(exit_status)
+                self._fail_startup(exit_status)
             detail = self._log_tail()
             cleanup = self._stop_locked(
                 grace_seconds=min(5.0, max(0.1, readiness_timeout))
             )
             raise RuntimeError(
-                f"policy server did not become ready; state={status['state']}; "
+                "policy server did not become ready; "
                 f"cleanup={cleanup}; log_path={self.log_path}; tail={detail}"
             )
 
     def _stop_locked(self, grace_seconds: float = 5.0) -> dict[str, Any]:
-        state = self._read_state()
-        if state is None:
+        process = self._process
+        if process is None:
             return {"state": "absent", "stopped": False, "log_path": str(self.log_path)}
-        identity = self._state_identity(state)
-        if identity is None:
-            self._clear()
-            return {
-                "state": "absent",
-                "stopped": False,
-                "detail": "malformed process state removed",
-                "log_path": str(self.log_path),
-            }
-        exit_status = self._owned_exit_status(identity)
-        if exit_status is not None:
-            self._clear()
-            return {
-                "state": "absent",
-                "stopped": True,
-                "forced": False,
-                "log_path": str(self.log_path),
-            }
-        info = _process_info(identity[0])
-        if info is None or info.start_ticks != identity[1]:
-            self._clear()
-            return {
-                "state": "absent",
-                "stopped": False,
-                "detail": "stale process identity removed",
-                "log_path": str(self.log_path),
-            }
-        owned = self._owned_identity == identity and self._process is not None
-        pidfd: int | None = None
-        if owned:
-            # An unreaped Popen child cannot have its PID recycled, so its
-            # process group remains safe to clean up as a unit.
+        self._process = None
+        forced = False
+        if process.poll() is None:
+            # The launcher execs the venv python in the same session, so the
+            # group signal is what reaches the GPU process.
+            _killpg(process.pid, signal.SIGTERM)
             try:
-                os.killpg(identity[0], signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        else:
-            if info.state == "Z":
-                self._clear()
-                return {
-                    "state": "absent",
-                    "stopped": True,
-                    "forced": False,
-                    "log_path": str(self.log_path),
-                }
-            pidfd = _open_identity_pidfd(identity)
-            if pidfd is None:
-                current = _process_info(identity[0])
-                if (
-                    current is None
-                    or current.start_ticks != identity[1]
-                    or current.state == "Z"
-                ):
-                    self._clear()
-                    return {
-                        "state": "absent",
-                        "stopped": True,
-                        "forced": False,
-                        "log_path": str(self.log_path),
-                    }
-                return {
-                    "state": "unhealthy",
-                    "stopped": False,
-                    "detail": "cannot safely signal recovered policy server",
-                    "log_path": str(self.log_path),
-                }
-            if not _send_pidfd_signal(pidfd, signal.SIGTERM):
-                os.close(pidfd)
-                current = _process_info(identity[0])
-                if (
-                    current is None
-                    or current.start_ticks != identity[1]
-                    or current.state == "Z"
-                ):
-                    self._clear()
-                    return {
-                        "state": "absent",
-                        "stopped": True,
-                        "forced": False,
-                        "log_path": str(self.log_path),
-                    }
-                return {
-                    "state": "unhealthy",
-                    "stopped": False,
-                    "detail": "cannot safely signal recovered policy server",
-                    "log_path": str(self.log_path),
-                }
-        try:
-            deadline = time.monotonic() + grace_seconds
-            while time.monotonic() < deadline:
-                if self._owned_exit_status(identity) is not None:
-                    break
-                current = _process_info(identity[0])
-                if (
-                    current is None
-                    or current.start_ticks != identity[1]
-                    or current.state == "Z"
-                ):
-                    break
-                time.sleep(0.05)
-            current = _process_info(identity[0])
-            forced = (
-                self._owned_exit_status(identity) is None
-                and current is not None
-                and current.start_ticks == identity[1]
-                and current.state != "Z"
-            )
-            if forced:
-                if owned:
-                    try:
-                        os.killpg(identity[0], signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    assert self._process is not None
-                    self._process.wait()
-                else:
-                    assert pidfd is not None
-                    _send_pidfd_signal(pidfd, signal.SIGKILL)
-            self._clear()
-            return {
-                "state": "absent",
-                "stopped": True,
-                "forced": forced,
-                "log_path": str(self.log_path),
-            }
-        finally:
-            if pidfd is not None:
-                os.close(pidfd)
+                process.wait(grace_seconds)
+            except subprocess.TimeoutExpired:
+                forced = True
+                _killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        return {
+            "state": "absent",
+            "stopped": True,
+            "forced": forced,
+            "log_path": str(self.log_path),
+        }
 
     def stop(self, grace_seconds: float = 5.0) -> dict[str, Any]:
         with self._lock:

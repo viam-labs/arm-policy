@@ -1,5 +1,4 @@
 import asyncio
-import json
 import socket
 import sys
 import time
@@ -66,7 +65,7 @@ class CapturingSupervisor:
     def poll_failure(self):
         return None
 
-    def _has_state(self):
+    def running(self):
         return False
 
 
@@ -419,40 +418,6 @@ def test_expected_stop_is_silent_and_releases_watcher(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_recovered_zombie_reports_exit_without_pid_reuse_kill(tmp_path, monkeypatch):
-    supervisor = PolicyServerSupervisor(tmp_path, "recovered")
-    supervisor.root.mkdir(parents=True)
-    supervisor.state_path.write_text(
-        json.dumps(
-            {
-                "pid": 1234,
-                "start_ticks": "original",
-                "host": "127.0.0.1",
-                "port": 8000,
-                "ready_deadline": 0,
-            }
-        )
-    )
-    monkeypatch.setattr(
-        policy_server_module,
-        "_process_info",
-        lambda pid: policy_server_module._ProcessInfo("original", "Z"),
-    )
-
-    assert supervisor.status()["state"] == "exited"
-    failure = supervisor.poll_failure()
-    assert failure is not None
-    assert failure.exit_status is None
-
-    monkeypatch.setattr(
-        policy_server_module,
-        "_process_info",
-        lambda pid: policy_server_module._ProcessInfo("reused", "S"),
-    )
-    assert supervisor.poll_failure() is None
-    assert supervisor.status()["state"] == "absent"
-
-
 def test_reconfigure_detaches_watcher_without_stopping_retained_server(
     tmp_path, monkeypatch
 ):
@@ -463,7 +428,7 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
         def poll_failure(self):
             return None
 
-        def _has_state(self):
+        def running(self):
             return True
 
         def stop(self):
@@ -484,7 +449,6 @@ def test_reconfigure_detaches_watcher_without_stopping_retained_server(
             fixed_camera_2="",
             wrist_camera="wrist",
             model_data_root=str(tmp_path),
-            policy_server_autoclose=False,
             binary_gripper_initial_state=0.0,
         )
         monkeypatch.setattr(
