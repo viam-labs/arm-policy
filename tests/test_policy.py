@@ -720,6 +720,7 @@ def test_binary_lite6_stops_at_gripper_barrier_and_settles():
     async def scenario():
         actions = _actions()
         actions[:4, 6] = [0.0, 0.75, 0.75, 0.2]
+        actions[:, 6] = 1.0 - actions[:, 6]  # sent inverted, as the server does
         arm = PhysicalFakeArm()
         gripper = PhysicalFakeGripper()
         policy = FakePolicy(
@@ -861,6 +862,7 @@ def test_finite_gripper_outputs_are_projected_to_actuator_limits():
     async def scenario():
         actions = _actions()
         actions[:3, 6] = (-0.4, 1.4, -0.2)
+        actions[:, 6] = 1.0 - actions[:, 6]  # sent inverted, as the server does
         policy = FakePolicy(pack_message({"action": actions}))
 
         result = await policy.do_command(
@@ -1152,9 +1154,8 @@ def test_lite6_profile_floor_admits_recorded_grasp_height():
     assert z >= profile.workspace_floor_m
 
 
-def test_undo_server_gripper_flip_inverts_sent_state_and_returned_gripper():
+def test_server_gripper_flip_is_undone_on_sent_state_and_returned_gripper():
     policy = FakePolicy(b"")
-    policy._config.undo_server_gripper_flip = True
     observation = {
         "observation/joint_position": np.zeros(6, dtype=np.float32),
         "observation/gripper_position": np.array([0.0], dtype=np.float32),
@@ -1172,11 +1173,9 @@ def test_undo_server_gripper_flip_inverts_sent_state_and_returned_gripper():
     assert actions[0, 6] == pytest.approx(0.25)
 
 
-def test_gripper_passes_through_unchanged_by_default():
+def test_replayed_gripper_is_left_as_recorded():
     policy = FakePolicy(b"")
-    observation = {"observation/gripper_position": np.array([0.0], dtype=np.float32)}
-    assert policy._wire_observation(observation)["observation/gripper_position"].tolist() == [0.0]
-    parsed, _timing = policy._parse_chunk({"action": _actions()})
+    parsed, _timing = policy._parse_chunk({"action": _actions()}, from_server=False)
     assert parsed[:, 6] == pytest.approx(0.25)
 
 

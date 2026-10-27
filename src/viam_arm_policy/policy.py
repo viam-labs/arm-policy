@@ -218,11 +218,6 @@ class Config(BaseModel):
     binary_gripper_close_threshold: UnitFloat = 0.6
     binary_gripper_initial_state: BinaryFloat = 0.0
     binary_gripper_settle_sec: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 3.0
-    # The upstream Cosmos policy server inverts the gripper on the way in
-    # (observation/gripper_position) and on the way out (action[:, -1]) for
-    # DROID variants recorded with the opposite convention. Datasets trained
-    # without that flip (e.g. droid_lerobot_20260115_no_noops) need both undone.
-    undo_server_gripper_flip: bool = False
     max_chunks: Annotated[int, Field(ge=1, le=100)] = 1
     action_prefix_steps: Annotated[int, Field(ge=1, le=32)] | None = None
     action_prefix_duration_sec: PositiveFiniteFloat | None = None
@@ -1159,15 +1154,21 @@ class Policy(Generic, EasyResource):
             self._socket = None
             raise
 
+    # The upstream Cosmos policy server always inverts the gripper on the way in
+    # (observation/gripper_position) and on the way out (action[:, -1]), for DROID
+    # variants recorded with the opposite convention. Our exports train on
+    # droid_lerobot_20260115_no_noops, which has no flip, so both are undone here.
+    # Replayed actions never pass through the server and are left as recorded.
     def _wire_observation(self, observation: Mapping[str, Any]) -> dict[str, Any]:
-        """Return the observation as sent, pre-inverting the gripper if needed."""
+        """Return the observation as sent, pre-inverting the gripper."""
         wire = dict(observation)
-        if self._config.undo_server_gripper_flip:
-            gripper = np.asarray(observation["observation/gripper_position"])
-            wire["observation/gripper_position"] = (1.0 - gripper).astype(gripper.dtype)
+        gripper = np.asarray(observation["observation/gripper_position"])
+        wire["observation/gripper_position"] = (1.0 - gripper).astype(gripper.dtype)
         return wire
 
-    def _parse_chunk(self, response: Any) -> tuple[np.ndarray, Mapping[str, Any]]:
+    def _parse_chunk(
+        self, response: Any, *, from_server: bool = True
+    ) -> tuple[np.ndarray, Mapping[str, Any]]:
         if not isinstance(response, Mapping):
             raise ValueError("policy response must be an object")
         actions = response.get("action")
@@ -1183,7 +1184,7 @@ class Policy(Generic, EasyResource):
         if not isinstance(timing, Mapping):
             raise ValueError("server_timing must be an object")
         parsed = np.asarray(actions, dtype=np.float64)
-        if self._config.undo_server_gripper_flip:
+        if from_server:
             parsed = parsed.copy()
             parsed[:, -1] = 1.0 - parsed[:, -1]
         return parsed, dict(timing)
@@ -1336,8 +1337,10 @@ class Policy(Generic, EasyResource):
         history: Sequence[np.ndarray],
         prefix: int,
         conditioner_algorithm: str,
+        *,
+        from_server: bool = True,
     ) -> tuple[np.ndarray, Mapping[str, Any], Mapping[str, Any]]:
-        raw_actions, timing = self._parse_chunk(response)
+        raw_actions, timing = self._parse_chunk(response, from_server=from_server)
         unsmoothed_path_length = float(np.abs(np.diff(raw_actions[:, :6], axis=0)).sum())
         raw_actions = self._smooth_actions(raw_actions)
         algorithm, version = (
@@ -1771,7 +1774,11 @@ class Policy(Generic, EasyResource):
                         self._status.server_timing.append(_value_types(raw_timing))
                 try:
                     actions, _, diagnostics = self._condition_chunk(
-                        response, history, prefix, conditioner_algorithm
+                        response,
+                        history,
+                        prefix,
+                        conditioner_algorithm,
+                        from_server=replay is None,
                     )
                 except ValueError as exc:
                     if consecutive_rejections >= self._max_consecutive_rejections:
