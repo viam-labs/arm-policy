@@ -62,7 +62,11 @@ def _model_view(model: Path) -> Path:
     vae_rel = runtime.get("vae", {}).get("path")
     if not isinstance(vae_rel, str) or not (model / vae_rel).is_file():
         raise SystemExit("portable export has no packaged VAE")
-    digest = hashlib.sha256((model / "config.json").read_bytes() + (model / "runtime_manifest.json").read_bytes()).hexdigest()[:16]
+    # The view links into this model directory, so key it by the directory too: checkpoints of one run
+    # (or one model from two sources) share config and manifest bytes but must not share a view.
+    digest = hashlib.sha256(
+        str(model).encode() + b"\0" + (model / "config.json").read_bytes() + (model / "runtime_manifest.json").read_bytes()
+    ).hexdigest()[:16]
     root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "arm-policy" / f"policy-model-{digest}"
     root.parent.mkdir(parents=True, exist_ok=True)
     with (root.parent / f".{root.name}.lock").open("a+", encoding="utf-8") as lock:

@@ -213,3 +213,28 @@ def test_override_file_is_read_from_the_runtime_directory(tmp_path, monkeypatch)
     (tmp_path / "server_overrides.json").write_text('{"args": "bad"}')
     with pytest.raises(SystemExit):
         service_adapter._override_args()
+
+
+def _portable_model(root: Path) -> Path:
+    (root / "vae").mkdir(parents=True)
+    (root / "vae" / "vae.pth").write_bytes(b"vae")
+    (root / "config.json").write_text(json.dumps({"model": {"config": {"tokenizer": {}}}}), encoding="utf-8")
+    (root / "runtime_manifest.json").write_text(json.dumps({"vae": {"path": "vae/vae.pth"}}), encoding="utf-8")
+    (root / "model.safetensors").write_bytes(root.name.encode())
+    return root.resolve()
+
+
+def test_model_view_is_separate_for_identical_configs_in_different_directories(tmp_path, monkeypatch):
+    from policy_server_runtime.launcher import _model_view
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    first = _portable_model(tmp_path / "iter2000")
+    second = _portable_model(tmp_path / "final")
+
+    first_view, second_view = _model_view(first), _model_view(second)
+
+    assert first_view != second_view
+    assert (second_view / "model.safetensors").resolve() == second / "model.safetensors"
+    vae_path = json.loads((second_view / "config.json").read_text())["model"]["config"]["tokenizer"]["vae_path"]
+    assert vae_path == str(second / "vae" / "vae.pth")
+    assert _model_view(first) == first_view
