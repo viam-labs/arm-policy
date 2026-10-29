@@ -23,17 +23,14 @@ from typing import (
 )
 from uuid import uuid4
 
-import msgpack
 import numpy as np
 from PIL import Image
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    field_validator,
     StringConstraints,
     TypeAdapter,
-    WebsocketUrl,
     model_validator,
 )
 from typing_extensions import Self
@@ -46,16 +43,18 @@ from viam.proto.common import ResourceName
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
+from viam.services.mlmodel import MLModel
 from viam.utils import ValueTypes, struct_to_dict
 
-from .model_export import (
-    default_data_root,
-    validate_data_root,
-    validate_model_path,
-    validate_runtime_manifest,
-)
-from .policy_server import PolicyServerSupervisor, runtime_command
 from .replay_source import ReplayChunkSource, ReplaySpec
+from .wire import (
+    ACTION_SHAPE,
+    ACTION_TENSOR,
+    CONTRACT_EXTRA,
+    PROMPT_TENSOR,
+    SERVER_TIMING_PREFIX,
+    prompt_to_tensor,
+)
 from .trajectory_conditioner import (
     ALGORITHM,
     ALGORITHM_VERSION,
@@ -74,7 +73,6 @@ def get_attrs(config: ComponentConfig) -> dict[str, Any]:
     return struct_to_dict(config.attributes)
 
 
-ACTION_SHAPE = (32, 7)
 CAMERA_KEYS = (
     "observation.images.wrist_image_left",
     "observation.images.exterior_image_1_left",
@@ -184,7 +182,8 @@ class Config(BaseModel):
     fixed_camera: NonEmptyStr = "scene-cam"
     fixed_camera_2: str = "third-cam"
     wrist_camera: NonEmptyStr = "wrist-cam"
-    server_uri: WebsocketUrl | None = None
+    # The viam-labs:arm-policy:cosmos MLModel service that serves the policy.
+    policy_model: NonEmptyStr | None = None
     prompt: Prompt | None = None
     policy_contract_path: NonEmptyStr | None = None
 
@@ -222,25 +221,8 @@ class Config(BaseModel):
     action_prefix_steps: Annotated[int, Field(ge=1, le=32)] | None = None
     action_prefix_duration_sec: PositiveFiniteFloat | None = None
 
-    # A portable export deployed by viam-server from the Viam registry, normally
-    # configured as "${packages.ml_model.<package-name>}".
-    model_path: str | None = None
-    # Holds the managed policy server's runtime state and log.
-    model_data_root: str | None = "/opt/viam/arm-policy"
-    policy_server_host: str = "127.0.0.1"
-    policy_server_port: Annotated[int, Field(ge=1, le=65535)] = 8000
-    policy_server_readiness_timeout_sec: PositiveFiniteFloat = 900.0
-
     _contract: PolicyContract
     _profile: SafetyProfile
-
-    @field_validator("model_path")
-    @classmethod
-    def strip_legacy_model_path_suffix(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return value.removesuffix("/runtime/vae/Wan2.2_VAE.pth")
-
 
     @model_validator(mode="after")
     def validate_static(self) -> Self:
@@ -251,24 +233,8 @@ class Config(BaseModel):
             raise ValueError(
                 "fixed_camera_width/height must both be unset, 1280x720 or 640x360"
             )
-        if self.policy_contract_path is None and self.model_path is None:
-            raise ValueError("configure policy_contract_path or model_path")
-        if self.model_path is not None:
-            validate_model_path(self.model_path)
-        if self.model_data_root is not None:
-            validate_data_root(self.model_data_root)
-        if not self.policy_server_host or any(
-            char.isspace() for char in self.policy_server_host
-        ):
-            raise ValueError(
-                "policy_server_host must be a non-empty hostname or IP address"
-            )
-        if self.server_uri is None:
-            host = self.policy_server_host
-            uri_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-            self.server_uri = WebsocketUrl(
-                f"ws://{uri_host}:{self.policy_server_port}"
-            )
+        if self.policy_contract_path is None and self.policy_model is None:
+            raise ValueError("configure policy_contract_path or policy_model")
         if (self.workspace_task_min_m is None) != (self.workspace_task_max_m is None):
             raise ValueError(
                 "workspace_task_min_m and workspace_task_max_m must be set together"
@@ -340,6 +306,8 @@ class Config(BaseModel):
         required = (self.arm, self.gripper, self.fixed_camera, self.wrist_camera)
         if self.fixed_camera_2:
             required = (*required, self.fixed_camera_2)
+        if self.policy_model is not None:
+            required = (*required, self.policy_model)
         return (self.world, *required) if self.world is not None else required
 
     @property
@@ -370,7 +338,7 @@ class Config(BaseModel):
             fixed_camera="",
             fixed_camera_2="",
             wrist_camera="",
-            server_uri="",
+            policy_model=None,
             prompt=None,
             policy_contract_path="",
         )
@@ -383,14 +351,6 @@ class Config(BaseModel):
         return config
 
 
-def _model_data_root(config: Config) -> Path:
-    return (
-        validate_data_root(config.model_data_root)
-        if config.model_data_root is not None
-        else default_data_root()
-    )
-
-
 class CommandModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -401,11 +361,6 @@ class StopCommand(CommandModel):
 
 class StatusCommand(CommandModel):
     command: Literal["status"]
-
-
-class PolicyServerCommand(CommandModel):
-    command: Literal["policy_server"]
-    action: Literal["start", "status", "stop"]
 
 
 class ExecuteCommand(CommandModel):
@@ -455,10 +410,7 @@ class ExecuteCommand(CommandModel):
 
 
 DoCommand = Annotated[
-    ExecuteCommand
-    | StopCommand
-    | StatusCommand
-    | PolicyServerCommand,
+    ExecuteCommand | StopCommand | StatusCommand,
     Field(discriminator="command"),
 ]
 DO_COMMAND_ADAPTER = TypeAdapter(DoCommand)
@@ -647,6 +599,10 @@ def _read_policy_contract(path_value: Any) -> tuple[PolicyContract, SafetyProfil
         contract_json = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ValueError(f"cannot read policy contract {path}: {exc}") from exc
+    return _parse_policy_contract(contract_json)
+
+
+def _parse_policy_contract(contract_json: str) -> tuple[PolicyContract, SafetyProfile]:
     contract = PolicyContract.model_validate_json(contract_json)
 
     identity = (
@@ -686,56 +642,6 @@ def _read_policy_contract(path_value: Any) -> tuple[PolicyContract, SafetyProfil
             "policy contract transform camera mapping does not match the Viam bridge"
         )
     return contract, profile
-
-
-def _pack_array(value: Any) -> Any:
-    if isinstance(value, (np.ndarray, np.generic)) and value.dtype.kind in (
-        "V",
-        "O",
-        "c",
-    ):
-        raise ValueError(f"unsupported MessagePack dtype {value.dtype}")
-    if isinstance(value, np.ndarray):
-        return {
-            b"__ndarray__": True,
-            b"data": value.tobytes(),
-            b"dtype": value.dtype.str,
-            b"shape": value.shape,
-        }
-    if isinstance(value, np.generic):
-        return {
-            b"__npgeneric__": True,
-            b"data": value.item(),
-            b"dtype": value.dtype.str,
-        }
-    return value
-
-
-def _unpack_array(value: Any) -> Any:
-    if b"__ndarray__" in value:
-        dtype = np.dtype(value[b"dtype"])
-        if dtype.kind in ("V", "O", "c"):
-            raise ValueError(f"unsupported MessagePack dtype {dtype}")
-        shape = tuple(int(item) for item in value[b"shape"])
-        expected = math.prod(shape) * dtype.itemsize
-        data = value[b"data"]
-        if expected != len(data):
-            raise ValueError("ndarray byte length does not match its shape")
-        return np.ndarray(buffer=data, dtype=dtype, shape=shape)
-    if b"__npgeneric__" in value:
-        dtype = np.dtype(value[b"dtype"])
-        if dtype.kind in ("V", "O", "c"):
-            raise ValueError(f"unsupported MessagePack dtype {dtype}")
-        return dtype.type(value[b"data"])
-    return value
-
-
-def pack_message(value: Any) -> bytes:
-    return cast(bytes, msgpack.packb(value, default=_pack_array, use_bin_type=True))
-
-
-def unpack_message(value: bytes) -> Any:
-    return msgpack.unpackb(value, object_hook=_unpack_array, raw=False)
 
 
 def _prefix_steps_from_duration(value: Any, period_s: float) -> int:
@@ -791,101 +697,33 @@ class Policy(Generic, EasyResource):
         self._owner_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._execution_task: Optional[asyncio.Task[Mapping[str, ValueTypes]]] = None
-        self._socket: Any = None
+        self._policy_model: MLModel | None = None
         self._generation = 0
         self._closed = False
         self._ready = False
         self._readiness_error = ""
         self._status: RunStatus = self._idle_status()
         self._last_result: Optional[dict[str, Any]] = None
-        self._policy_server_watch_task: asyncio.Task[None] | None = None
-        self._policy_server_watch_generation = 0
-        self._reported_policy_server_failure: object | None = None
-        self._policy_server = PolicyServerSupervisor(default_data_root(), name)
 
     @property
     def _period_s(self) -> float:
         return 1.0 / self._config.contract.conditioning_fps
 
-    def _detach_policy_server_watcher(self) -> None:
-        self._policy_server_watch_generation += 1
-        task = self._policy_server_watch_task
-        self._policy_server_watch_task = None
-        if task is not None and not task.done():
-            task.cancel()
+    def _mark_not_ready(self, error: str) -> None:
+        self._ready = False
+        self._readiness_error = error
+        self._status = self._idle_status()
+        self._status.state = "wait_contract"
+        self._status.last_error = error
 
-    def _ensure_policy_server_watcher(self, *, replace: bool = False) -> None:
-        if self._closed:
-            return
-        task = self._policy_server_watch_task
-        if task is not None and not task.done():
-            if not replace:
-                return
-            self._detach_policy_server_watcher()
+    def _try_contract(
+        self, loader: Callable[[], tuple[PolicyContract, SafetyProfile]]
+    ) -> bool:
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        generation = self._policy_server_watch_generation
-        supervisor = self._policy_server
-        self._policy_server_watch_task = loop.create_task(
-            self._watch_policy_server(supervisor, generation),
-            name=f"policy-server-watch:{self.name}",
-        )
-
-    async def _watch_policy_server(
-        self, supervisor: PolicyServerSupervisor, generation: int
-    ) -> None:
-        try:
-            while (
-                not self._closed
-                and self._policy_server is supervisor
-                and self._policy_server_watch_generation == generation
-            ):
-                failure = await asyncio.to_thread(supervisor.poll_failure)
-                if (
-                    self._closed
-                    or self._policy_server is not supervisor
-                    or self._policy_server_watch_generation != generation
-                ):
-                    return
-                if failure is not None:
-                    if failure.process is not self._reported_policy_server_failure:
-                        self._reported_policy_server_failure = failure.process
-                        self.logger.error(
-                            "managed policy-server exited unexpectedly; pid=%s; "
-                            "exit_status=%s; log_path=%s; tail=%s",
-                            failure.process.pid,
-                            failure.exit_status,
-                            failure.log_path,
-                            failure.detail,
-                        )
-                    return
-                if not await asyncio.to_thread(supervisor.running):
-                    return
-
-                await asyncio.sleep(0.2)
-        finally:
-            if self._policy_server_watch_task is asyncio.current_task():
-                self._policy_server_watch_task = None
-
-    def _contract_path(self) -> Path:
-        if self._config.policy_contract_path is not None:
-            return Path(self._config.policy_contract_path).expanduser()
-        assert self._config.model_path is not None
-        return validate_model_path(self._config.model_path) / "policy_contract.json"
-
-    def _advance_readiness(self) -> bool:
-        if self._ready:
-            return True
-        try:
-            contract, profile = _read_policy_contract(str(self._contract_path()))
+            contract, profile = loader()
             self._config.validate_contract(contract, profile)
         except (OSError, ValueError) as exc:
-            self._readiness_error = str(exc)
-            self._status = self._idle_status()
-            self._status.state = "wait_contract"
-            self._status.last_error = self._readiness_error
+            self._mark_not_ready(str(exc))
             return False
         self._ready = True
         self._readiness_error = ""
@@ -893,12 +731,46 @@ class Policy(Generic, EasyResource):
         self._status.state = "ready"
         return True
 
-    def _require_ready(self) -> None:
-        if not self._advance_readiness():
+    async def _advance_readiness(self) -> bool:
+        if self._ready:
+            return True
+        path = self._config.policy_contract_path
+        if path is not None:
+            return self._try_contract(lambda: _read_policy_contract(path))
+        if self._policy_model is None:
+            self._mark_not_ready("configure policy_contract_path or policy_model")
+            return False
+        try:
+            metadata = await asyncio.wait_for(
+                self._policy_model.metadata(), self._config.connect_timeout_sec
+            )
+        except Exception as exc:
+            self._mark_not_ready(
+                f"policy model {self._config.policy_model!r} has no contract: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+        contract_json = next(
+            (
+                struct_to_dict(info.extra).get(CONTRACT_EXTRA)
+                for info in metadata.output_info
+                if info.name == ACTION_TENSOR
+            ),
+            None,
+        )
+        if not isinstance(contract_json, str):
+            self._mark_not_ready(
+                f"policy model metadata does not publish {CONTRACT_EXTRA} on {ACTION_TENSOR}"
+            )
+            return False
+        return self._try_contract(lambda: _parse_policy_contract(contract_json))
+
+    async def _require_ready(self) -> None:
+        if not await self._advance_readiness():
             raise RuntimeError(
                 "policy contract is not ready: "
                 f"{self._readiness_error}; configure a valid policy_contract_path or "
-                "wait for viam-server to deploy the configured model_path package"
+                "wait for the policy model to deploy its model_path package"
             )
 
     def _idle_status(self) -> RunStatus:
@@ -963,16 +835,22 @@ class Policy(Generic, EasyResource):
         self._wrist_camera = self._dependency(
             dependencies, Camera, parsed.wrist_camera, "wrist camera"
         )
-        self._detach_policy_server_watcher()
+        self._policy_model = (
+            self._dependency(dependencies, MLModel, parsed.policy_model, "policy model")
+            if parsed.policy_model is not None
+            else None
+        )
         parsed._contract = self._config.contract
         parsed._profile = self._config.profile
         self._config = parsed
         self._binary_gripper_state = parsed.binary_gripper_initial_state
         self._ready = False
         self._readiness_error = ""
-        self._policy_server = PolicyServerSupervisor(_model_data_root(parsed), self.name)
-        self._ensure_policy_server_watcher()
-        self._advance_readiness()
+        if parsed.policy_contract_path is not None:
+            self._try_contract(lambda: _read_policy_contract(parsed.policy_contract_path))
+        else:
+            # The contract is fetched from the policy model on the first status/execute.
+            self._mark_not_ready("policy contract not yet fetched from the policy model")
 
     @staticmethod
     def _decode_image(
@@ -1090,58 +968,25 @@ class Policy(Generic, EasyResource):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
-    async def _recv(
-        self, socket: Any, timeout: float, operation: Any, generation: int
-    ) -> Any:
-        receive = asyncio.create_task(socket.recv())
-        deadline = time.monotonic() + timeout
-        try:
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("policy server receive timed out")
-                done, _ = await asyncio.wait(
-                    (receive,), timeout=min(self._period_s, remaining)
-                )
-                if done:
-                    return receive.result()
-                if await self._cancelled(operation, generation):
-                    raise asyncio.CancelledError
-        finally:
-            if not receive.done():
-                receive.cancel()
-                await asyncio.gather(receive, return_exceptions=True)
+    def _observation_tensors(self, observation: Mapping[str, Any]) -> dict[str, np.ndarray]:
+        wire = self._wire_observation(observation)
+        prompt = wire.pop(PROMPT_TENSOR)
+        tensors = {name: np.ascontiguousarray(value) for name, value in wire.items()}
+        tensors[PROMPT_TENSOR] = prompt_to_tensor(prompt)
+        return tensors
 
-    async def _connect(
-        self, operation: Any, generation: int
-    ) -> tuple[Any, Mapping[str, Any]]:
-        import websockets
-
-        socket = await asyncio.wait_for(
-            websockets.connect(
-                str(self._config.server_uri),
-                ping_interval=None,
-                compression=None,
-                max_size=64 * 1024 * 1024,
-                open_timeout=self._config.connect_timeout_sec,
-            ),
-            timeout=self._config.connect_timeout_sec,
-        )
-        self._socket = socket
-        try:
-            raw = await self._recv(
-                socket, self._config.connect_timeout_sec, operation, generation
-            )
-            if not isinstance(raw, bytes):
-                raise RuntimeError(f"policy server metadata was text: {raw}")
-            metadata = unpack_message(raw)
-            if not isinstance(metadata, Mapping):
-                raise ValueError("policy server metadata must be an object")
-            return socket, metadata
-        except BaseException:
-            await socket.close()
-            self._socket = None
-            raise
+    async def _infer(self, observation: Mapping[str, Any]) -> dict[str, Any]:
+        """Call the policy model and return the OpenPI-shaped response."""
+        outputs = await self._policy_model.infer(self._observation_tensors(observation))
+        response: dict[str, Any] = {ACTION_TENSOR: outputs.get(ACTION_TENSOR)}
+        timing = {
+            name[len(SERVER_TIMING_PREFIX):]: float(np.asarray(value).reshape(-1)[0])
+            for name, value in outputs.items()
+            if name.startswith(SERVER_TIMING_PREFIX) and np.asarray(value).size
+        }
+        if timing:
+            response["server_timing"] = timing
+        return response
 
     # The upstream Cosmos policy server always inverts the gripper on the way in
     # (observation/gripper_position) and on the way out (action[:, -1]), for DROID
@@ -1615,14 +1460,6 @@ class Policy(Generic, EasyResource):
             if isinstance(value, BaseException)
         ]
 
-    async def _close_socket(self) -> None:
-        socket, self._socket = self._socket, None
-        if socket is not None:
-            try:
-                await socket.close()
-            except Exception:
-                pass
-
     async def _execute_run(
         self,
         prompt: str,
@@ -1642,10 +1479,10 @@ class Policy(Generic, EasyResource):
             # position-target versus binary-barrier gripper behavior.
             self._status.state = "connecting"
             if replay is None:
-                socket, metadata = await self._connect(operation, generation)
+                metadata = {"policy_model": self._config.policy_model}
             else:
                 # Recorded rows stand in for the policy server; nothing else changes.
-                socket, metadata = None, replay.metadata()
+                metadata = replay.metadata()
             self._status.server_metadata = _value_types(metadata)
             consecutive_rejections = 0
             for chunk_index in range(max_chunks):
@@ -1713,22 +1550,16 @@ class Policy(Generic, EasyResource):
                     raise asyncio.CancelledError
                 started = time.monotonic()
                 if replay is None:
-                    await self._wait_cancellable(
-                        socket.send(pack_message(self._wire_observation(observation))),
+                    response = await self._wait_cancellable(
+                        self._infer(observation),
                         self._config.inference_timeout_sec,
                         operation,
                         generation,
-                        "policy request send",
-                    )
-                    raw = await self._recv(
-                        socket, self._config.inference_timeout_sec, operation, generation
+                        "policy inference",
                     )
                     inference_ms = (time.monotonic() - started) * 1000.0
                     if await self._cancelled(operation, generation):
                         raise asyncio.CancelledError
-                    if not isinstance(raw, bytes):
-                        raise RuntimeError(f"policy server returned text error: {raw}")
-                    response = unpack_message(raw)
                 else:
                     response = replay.respond(observation)
                     inference_ms = (time.monotonic() - started) * 1000.0
@@ -1842,7 +1673,6 @@ class Policy(Generic, EasyResource):
             return self._finish_result(terminal_state, error)
         finally:
             self._generation += 1
-            await self._close_socket()
             stop_errors = await self._safe_stop()
             self._status.stop_errors = stop_errors
             if stop_errors:
@@ -1877,7 +1707,9 @@ class Policy(Generic, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         if self._closed:
             raise RuntimeError(f"policy {self.name} is closed")
-        self._require_ready()
+        await self._require_ready()
+        if command.replay is None and self._policy_model is None:
+            raise RuntimeError("execute requires a configured policy_model")
         prompt = command.prompt
         max_chunks = command.max_chunks
         prefix = command.prefix_steps(self._period_s)
@@ -1931,7 +1763,6 @@ class Policy(Generic, EasyResource):
         except asyncio.CancelledError:
             self._stop_event.set()
             self._generation += 1
-            await self._close_socket()
             await asyncio.shield(task)
             raise
 
@@ -1941,7 +1772,6 @@ class Policy(Generic, EasyResource):
         task = self._execution_task
         if task is not None and not task.done():
             self._status.state = "stopping"
-        await self._close_socket()
         immediate_errors = await self._safe_stop()
         if task is not None and not task.done() and task is not asyncio.current_task():
             await asyncio.shield(task)
@@ -1954,60 +1784,6 @@ class Policy(Generic, EasyResource):
             )
         return result
 
-    async def _policy_server_model(self) -> Path:
-        if self._config.model_path is None:
-            raise NotImplementedError("policy_server start requires configured model_path")
-        model = validate_model_path(self._config.model_path)
-        await asyncio.to_thread(validate_runtime_manifest, model)
-        return model
-
-    async def _policy_server_command(
-        self, command: PolicyServerCommand
-    ) -> Mapping[str, ValueTypes]:
-        if command.action == "status":
-            self._ensure_policy_server_watcher()
-            return await asyncio.to_thread(self._policy_server.status)
-        if command.action == "stop":
-            self._detach_policy_server_watcher()
-            result = await asyncio.to_thread(self._policy_server.stop)
-            if not result.get("stopped", False):
-                self._ensure_policy_server_watcher()
-            return result
-        self.logger.info(
-            "managed policy-server start requested; host=%s; port=%s",
-            self._config.policy_server_host,
-            self._config.policy_server_port,
-        )
-        model = await self._policy_server_model()
-        runtime_root = Path(__file__).resolve().parents[2] / "policy_server_runtime"
-        try:
-            result = await asyncio.to_thread(
-                self._policy_server.start,
-                runtime_command(
-                    runtime_root,
-                    model,
-                    self._config.policy_server_host,
-                    self._config.policy_server_port,
-                ),
-                self._config.policy_server_host,
-                self._config.policy_server_port,
-                self._config.policy_server_readiness_timeout_sec,
-            )
-        except (OSError, RuntimeError) as exc:
-            self.logger.error("managed policy-server failed during startup: %s", exc)
-            raise
-        self.logger.info(
-            "managed policy-server ready; pid=%s; host=%s; port=%s; "
-            "log_path=%s; idempotent=%s",
-            result.get("pid", "unavailable"),
-            result.get("host", self._config.policy_server_host),
-            result.get("port", self._config.policy_server_port),
-            result.get("log_path", "unavailable"),
-            result.get("idempotent", False),
-        )
-        self._ensure_policy_server_watcher(replace=True)
-        return result
-
     async def do_command(
         self,
         command: Mapping[str, ValueTypes],
@@ -2015,7 +1791,6 @@ class Policy(Generic, EasyResource):
         timeout: Optional[float] = None,
         **kwargs,
     ) -> Mapping[str, ValueTypes]:
-        self._ensure_policy_server_watcher()
         payload: dict[str, Any] = dict(command)
         if payload.get("command") == "execute":
             defaults: dict[str, Any] = {
@@ -2042,14 +1817,12 @@ class Policy(Generic, EasyResource):
         if isinstance(request, StopCommand):
             return await self._stop_command()
         if isinstance(request, StatusCommand):
-            self._advance_readiness()
+            await self._advance_readiness()
             return self._status.to_dict()
-        return await self._policy_server_command(request)
+        raise ValueError(f"unsupported command {request.command!r}")
 
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._detach_policy_server_watcher()
         await self._stop_command()
-        await asyncio.to_thread(self._policy_server.stop)
