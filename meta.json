@@ -6,9 +6,16 @@
   "description": "Safely executes contract-validated arm policies through typed Viam resources",
   "models": [
     {
+      "model": "viam-labs:arm-policy:cosmos",
+      "api": "rdk:service:mlmodel",
+      "short_description": "Serves a Cosmos action-policy export over the MLModel API via a managed OpenPI server",
+      "markdown_link": "viam-labs_arm-policy_policy.md#viam-labsarm-policycosmos-mlmodel-service"
+    },
+    {
       "model": "viam-labs:arm-policy:policy",
       "api": "rdk:component:generic",
-      "short_description": "Bridges arms, grippers, cameras, and an OpenPI policy server with bounded execution"
+      "short_description": "Bridges arms, grippers, cameras, and a policy MLModel with bounded, safety-conditioned execution",
+      "markdown_link": "viam-labs_arm-policy_policy.md#viam-labsarm-policypolicy-controller-component"
     }
   ],
   "applications": null,
