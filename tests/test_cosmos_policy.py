@@ -1,7 +1,6 @@
 import asyncio
 import json
 import threading
-import time
 
 import numpy as np
 import pytest
@@ -48,6 +47,9 @@ class RecordingServer:
     def stop(self):
         self.stops += 1
         return {"state": "absent", "stopped": True}
+
+    def close(self):
+        return self.stop()
 
     def running(self):
         return False
@@ -102,6 +104,57 @@ def test_infer_round_trips_tensors_connecting_per_call():
         assert sent[IMAGE_TENSORS[0]].shape == (480, 640, 3)
         assert set(sent) == {PROMPT_TENSOR, JOINT_TENSOR, GRIPPER_TENSOR, *IMAGE_TENSORS}
         assert unpack_message(socket.sent[1])["prompt"] == "again"
+
+    asyncio.run(scenario())
+
+
+def test_mlmodel_gripper_convention_is_independent_of_cosmos_wire_convention():
+    async def scenario():
+        actions = np.zeros((32, 7), dtype=np.float32)
+        actions[:, 6] = 0.25
+        service = SocketCosmos(FakeSocket(pack_message({"action": actions})))
+        inputs = _inputs()
+        inputs[GRIPPER_TENSOR][0] = 0.2
+        outputs = await service.infer(inputs)
+        sent = unpack_message(service.socket.sent[0])
+        assert sent[GRIPPER_TENSOR].tolist() == pytest.approx([0.8])
+        assert inputs[GRIPPER_TENSOR].tolist() == pytest.approx([0.2])
+        np.testing.assert_allclose(outputs[ACTION_TENSOR][:, 6], 0.75)
+        np.testing.assert_allclose(outputs[ACTION_TENSOR][:, :6], 0.0)
+
+    asyncio.run(scenario())
+
+
+def test_close_cancels_active_inference_and_rejects_queued_calls():
+    async def scenario():
+        connected = asyncio.Event()
+        socket = FakeSocket(None, block=True)
+        service = SocketCosmos(socket)
+
+        async def connect():
+            service.connections += 1
+            connected.set()
+            return socket
+
+        service._connect = connect
+        active = asyncio.create_task(service.infer(_inputs()))
+        await asyncio.wait_for(connected.wait(), 1)
+        queued = asyncio.create_task(service.infer(_inputs()))
+        await asyncio.sleep(0)
+        await service.close()
+        try:
+            assert socket.closed.is_set()
+            with pytest.raises(asyncio.CancelledError):
+                await active
+            with pytest.raises(RuntimeError, match="closed"):
+                await queued
+            with pytest.raises(RuntimeError, match="closed"):
+                await service.infer(_inputs())
+            assert service.connections == 1
+        finally:
+            active.cancel()
+            queued.cancel()
+            await asyncio.gather(active, queued, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -239,34 +292,48 @@ def test_external_server_uri_starts_nothing(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_close_while_the_start_thread_is_launching_still_stops_the_server(tmp_path, monkeypatch):
-    """close()'s stop() may run before the thread launched the child; the thread then stops it."""
+def test_close_before_start_worker_launches_prevents_child_creation(tmp_path, monkeypatch):
+    from test_policy_server import _free_port, _server_command
 
-    class BlockingServer(RecordingServer):
-        release = threading.Event()
-
-        def start(self, *args, **kwargs):
-            result = super().start(*args, **kwargs)
-            self.release.wait(2)
-            return result
-
-    server = BlockingServer()
-    monkeypatch.setattr(
-        "viam_arm_policy.cosmos_policy.PolicyServerSupervisor", lambda root, name: server
-    )
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    marker = tmp_path / "spawned"
+    port = _free_port()
+    command = _server_command(port, 60, 0)
+    command[2] = f"from pathlib import Path\nPath({str(marker)!r}).touch()\n" + command[2]
+    monkeypatch.setattr("viam_arm_policy.cosmos_policy.runtime_command", lambda *args: command)
     monkeypatch.setattr("viam_arm_policy.cosmos_policy.validate_runtime_manifest", lambda model: {})
 
     async def scenario():
-        service = CosmosPolicy.new(_config({"model_path": str(tmp_path)}), {})
-        while not server.starts:
-            await asyncio.sleep(0.01)
-        await service.close()
-        assert server.stops == 1
-        server.release.set()
-        deadline = time.monotonic() + 2
-        while server.stops < 2 and time.monotonic() < deadline:
-            await asyncio.sleep(0.01)
-        assert server.stops == 2
+        service = CosmosPolicy.new(
+            _config({
+                "model_path": str(tmp_path),
+                "model_data_root": str(tmp_path),
+                "policy_server_port": port,
+                "policy_server_readiness_timeout_sec": 2,
+            }), {}
+        )
+        supervisor = service._policy_server
+        start = supervisor.start
+
+        def delayed_start(*args, **kwargs):
+            entered.set()
+            try:
+                release.wait(5)
+                return start(*args, **kwargs)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(supervisor, "start", delayed_start)
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            await service.close()
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 5)
+            assert not marker.exists()
+        finally:
+            release.set()
+            await asyncio.to_thread(supervisor.stop)
+            await service.close()
 
     asyncio.run(scenario())
 

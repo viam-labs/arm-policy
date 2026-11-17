@@ -1,11 +1,8 @@
-# Models `viam-labs:arm-policy:cosmos` and `viam-labs:arm-policy:policy`
+# Model `viam-labs:arm-policy:policy`
 
-The module ships two resources that are configured together:
+An `rdk:component:generic` controller that captures camera and joint observations, validates the export contract published by a [Cosmos MLModel service](viam-labs_arm-policy_cosmos.md), conditions each 32-step trajectory, and executes only a validated receding-horizon prefix. Malformed output, unsafe kinematics, timeouts, cancellation, or missed dispatch deadlines fail closed and stop the arm and gripper.
 
-- `viam-labs:arm-policy:cosmos` (`rdk:service:mlmodel`) owns a portable Cosmos/OpenPI export deployed as a Viam `ml_model` package: it provisions and supervises the pinned Cosmos policy server and exposes inference through the standard MLModel `Infer`/`Metadata` API.
-- `viam-labs:arm-policy:policy` (`rdk:component:generic`) is the controller. It captures camera and joint observations, validates the export contract published by the MLModel service, conditions each 32-step trajectory, and executes only a validated receding-horizon prefix. Malformed output, unsafe kinematics, timeouts, cancellation, or missed dispatch deadlines fail closed and stop the arm and gripper.
-
-The policy server is a subprocess owned by the MLModel service. On its first start, the service checks out the pinned Cosmos revision into its cache and uses that checkout's own `uv sync --all-extras --group=cu130-torch213-train --group=policy-server` dependency definitions. The controller never imports or installs Cosmos, Torch, or CUDA dependencies, so it can run on the robot while the MLModel service runs on a GPU part reached through a remote.
+The controller never imports or installs Cosmos, Torch, or CUDA dependencies. It can run on the robot while the MLModel service runs on a GPU part reached through a remote.
 
 ## Configuration
 
@@ -43,39 +40,8 @@ The policy server is a subprocess owned by the MLModel service. On its first sta
 }
 ```
 
-## `viam-labs:arm-policy:cosmos` (MLModel service)
+See the [MLModel service documentation](viam-labs_arm-policy_cosmos.md) for its attributes, tensor contract, and startup behavior.
 
-| Name | Default | Description |
-|---|---:|---|
-| `model_path` | required | Absolute directory of the deployed portable export, normally `"${packages.ml_model.<name>}"`. A legacy `/runtime/vae/Wan2.2_VAE.pth` suffix is stripped. |
-| `model_data_root` | `/opt/viam/arm-policy` | Holds the managed policy server's log. Set it to another absolute persistent directory when the deployment uses a different writable data location; `null` falls back to `$VIAM_MODULE_DATA/arm-policy`, then `$XDG_DATA_HOME/arm-policy`, then `~/.local/share/viam/arm-policy`. |
-| `policy_server_host` / `policy_server_port` | `127.0.0.1` / `8000` | Bind address of the managed server. |
-| `policy_server_readiness_timeout_sec` | `900` | How long a start waits for `GET /healthz`; includes first-run dependency installation. |
-| `package_reference` | — | Written by the Viam app when a model is deployed to the service; informational only. |
-| `server_uri` | — | `ws://` or `wss://` endpoint of a policy server this service does not manage. When set, no subprocess is started. |
-| `connect_timeout_sec` | `10` | WebSocket connect timeout. |
-| `inference_timeout_sec` | `120` | Per-request WebSocket timeout. |
-
-### Tensor contract
-
-`Metadata` describes the inputs and outputs; `Infer` takes exactly these tensors:
-
-| Direction | Name | dtype | shape |
-|---|---|---|---|
-| in | `observation/wrist_image_left` | uint8 | `[H, W, 3]` RGB |
-| in | `observation/exterior_image_1_left` | uint8 | `[H, W, 3]` RGB |
-| in | `observation/exterior_image_2_left` | uint8 | `[H, W, 3]` RGB |
-| in | `observation/joint_position` | float32 | `[6]` radians |
-| in | `observation/gripper_position` | float32 | `[1]` in `[0, 1]`, 0=open |
-| in | `prompt` | uint8 | `[N]` UTF-8 bytes of the task prompt |
-| out | `action` | float32 | `[32, 7]` absolute joint targets (rad) plus gripper |
-| out | `server_timing/<stage>` | float32 | `[1]` per stage the server reports |
-
-The prompt travels as bytes because tensors cannot carry strings and viam-server does not forward `Infer`'s `extra`. The verbatim `policy_contract.json` is published in the `extra` of the `action` output `TensorInfo` under `policy_contract_json`; the controller reads it from there because the MLModel API has no `DoCommand`.
-
-### Server lifecycle
-
-The service starts the managed server in the background from `reconfigure` whenever `server_uri` is unset; there is no command to start or stop it. The server lives exactly as long as the service instance: closing the service (module or `viam-server` restart, resource removal) stops it. Because the Python module SDK rebuilds a resource on every configuration edit (close the old instance, construct the new one), every edit to the service's attributes, including a `model_path` change, stops the server and starts a fresh one, which pays the full startup cost again (typically 60–90 s once the environment is provisioned). `Metadata` works as soon as `<model_path>/policy_contract.json` is readable; `Infer` fails with the supervisor's state and the last start error until the server answers.
 
 ## `viam-labs:arm-policy:policy` (controller component)
 
@@ -89,7 +55,7 @@ The service starts the managed server in the background from `reconfigure` whene
 | `fixed_camera` | `scene-cam` | Camera returning exactly one 1280x720 or 640x360 image. |
 | `fixed_camera_2` | `third-cam` | Second fixed camera, using the same supported sizes as `fixed_camera`. Set to `""` to reuse `fixed_camera` for both exterior views. |
 | `wrist_camera` | `wrist-cam` | Camera returning exactly one 640x480 image. |
-| `policy_model` | — | Name of the `viam-labs:arm-policy:cosmos` MLModel service (or any MLModel implementing the tensor contract above). Required unless `policy_contract_path` is set and only `replay` executions are used. |
+| `policy_model` | — | Name of the `viam-labs:arm-policy:cosmos` MLModel service (or any MLModel implementing its [tensor contract](viam-labs_arm-policy_cosmos.md#tensor-contract), including `0=open`, `1=closed` gripper values). Required unless `policy_contract_path` is set and only `replay` executions are used. |
 
 `policy_contract_path` is an optional local path to a schema-version-3
 `policy_contract.json`. It is required unless `policy_model` is set. When omitted,
@@ -217,17 +183,6 @@ Command payloads are validated as a Pydantic discriminated union keyed by
 `command`. Unknown commands, actions, fields, and invalid field types are
 rejected before dispatch.
 
-### Managed policy server (MLModel service)
-
-The MLModel service starts the isolated pinned-Cosmos server for its `model_path` package from `reconfigure`; there are no lifecycle DoCommands because the MLModel API has none. The first start requires network access and substantial disk space while the pinned upstream CUDA 13 policy-server environment is provisioned; later starts reuse it. Start waits for HTTP `GET /healthz` on the configured host and port to return status 200 with body `OK\n`, so `policy_server_readiness_timeout_sec` must cover first-time provisioning. A port already answering `/healthz` is refused rather than adopted, because the service cannot know which weights that server loaded. Readiness failures are logged with the log path and a credential-redacted log tail, and are reported by the next `Infer` call together with the supervisor state (`absent`, `starting`, `healthy`, `unhealthy`, or `exited`).
-
-Server startup checks that the package contains the required export files and the VAE, and that the training config and policy contract match their `runtime_manifest.json` SHA-256 digests. It does not traverse the package or hash the VAE or weight shards; payload loading errors remain the policy server's responsibility. A missing file or digest mismatch prevents startup.
-
-The supervisor is intentionally a module-owned subprocess rather than s6: it needs no host package and keeps no on-disk state. The server is stopped whenever the service instance closes, because the MLModel API offers no command to stop an orphaned server afterwards.
-
-Each start emits a Viam module info log with its host and port. A successful readiness check emits a second info log with the PID, host, port, child-log path, and whether the start was idempotent. After startup, a background watcher checks for unexpected process exits and logs each failed process once, with its PID, exit status, child-log path, and a bounded, credential-redacted log tail. Deliberate stops do not emit failure notifications. The child log remains the full diagnostic record; these notifications do not replace it or constitute an inference health check.
-
-At startup the runtime quarantines corrupt Hugging Face Hub cache metadata (tree JSON with an asterisk in `xet_hash`) left by upstream Cosmos downloads, logging both paths in the policy-server log.
 
 ## Workflow client
 

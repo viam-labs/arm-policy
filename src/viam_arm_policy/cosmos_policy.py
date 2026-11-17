@@ -150,6 +150,7 @@ class CosmosPolicy(MLModel, EasyResource):
         self._server_error = ""
         # The upstream server handles one request at a time; serialize callers here.
         self._infer_lock = asyncio.Lock()
+        self._infer_task: asyncio.Task[Any] | None = None
         self._closed = False
 
     @classmethod
@@ -215,19 +216,6 @@ class CosmosPolicy(MLModel, EasyResource):
             return
         await self._watch_policy_server()
 
-    def _launch(self, command: Sequence[str], config: CosmosConfig) -> dict[str, Any]:
-        result = self._policy_server.start(
-            command,
-            config.policy_server_host,
-            config.policy_server_port,
-            config.policy_server_readiness_timeout_sec,
-        )
-        if self._closed:
-            # close() ran before this thread launched the child, so its stop() found nothing.
-            self._policy_server.stop()
-            raise RuntimeError("policy server was stopped during startup")
-        return result
-
     async def _start_policy_server(self) -> Mapping[str, ValueTypes]:
         config = self._require_config()
         self.logger.info(
@@ -240,7 +228,13 @@ class CosmosPolicy(MLModel, EasyResource):
         command = runtime_command(
             _RUNTIME_ROOT, model, config.policy_server_host, config.policy_server_port
         )
-        result = await asyncio.to_thread(self._launch, command, config)
+        result = await asyncio.to_thread(
+            self._policy_server.start,
+            command,
+            config.policy_server_host,
+            config.policy_server_port,
+            config.policy_server_readiness_timeout_sec,
+        )
         self._server_error = ""
         self.logger.info(
             "managed policy-server ready; pid=%s; host=%s; port=%s; "
@@ -336,7 +330,8 @@ class CosmosPolicy(MLModel, EasyResource):
         if gripper.shape != (1,) or not np.isfinite(gripper).all():
             raise ValueError(f"{GRIPPER_TENSOR} must be one finite normalized value")
         observation[JOINT_TENSOR] = joints
-        observation[GRIPPER_TENSOR] = gripper
+        # Undo the pinned Cosmos server's DROID gripper flip; the MLModel API uses 0=open.
+        observation[GRIPPER_TENSOR] = 1.0 - gripper
         return observation
 
     @staticmethod
@@ -351,7 +346,9 @@ class CosmosPolicy(MLModel, EasyResource):
             )
         if actions.dtype.kind not in "fiu" or not np.isfinite(actions).all():
             raise ValueError("policy action must contain only finite numeric values")
-        outputs: Dict[str, NDArray] = {ACTION_TENSOR: np.asarray(actions, dtype=np.float32)}
+        actions = np.array(actions, dtype=np.float32, copy=True)
+        actions[:, -1] = 1.0 - actions[:, -1]
+        outputs: Dict[str, NDArray] = {ACTION_TENSOR: actions}
         timing = response.get("server_timing", {})
         if isinstance(timing, Mapping):
             for key, value in timing.items():
@@ -367,14 +364,22 @@ class CosmosPolicy(MLModel, EasyResource):
         timeout: Optional[float] = None,
     ) -> Dict[str, NDArray]:
         config = self._require_config()
+        if self._closed:
+            raise RuntimeError(f"cosmos policy {self.name} is closed")
         request = pack_message(self._observation(input_tensors))
         async with self._infer_lock:
-            socket = await self._connect()
+            if self._closed:
+                raise RuntimeError(f"cosmos policy {self.name} is closed")
+            self._infer_task = asyncio.current_task()
             try:
-                await asyncio.wait_for(socket.send(request), timeout=config.inference_timeout_sec)
-                raw = await asyncio.wait_for(socket.recv(), timeout=config.inference_timeout_sec)
+                socket = await self._connect()
+                try:
+                    await asyncio.wait_for(socket.send(request), timeout=config.inference_timeout_sec)
+                    raw = await asyncio.wait_for(socket.recv(), timeout=config.inference_timeout_sec)
+                finally:
+                    await socket.close()
             finally:
-                await socket.close()
+                self._infer_task = None
         if not isinstance(raw, bytes):
             # The upstream server answers a failed request with a text traceback.
             raise RuntimeError(f"policy server returned text error: {raw}")
@@ -416,9 +421,12 @@ class CosmosPolicy(MLModel, EasyResource):
         if self._closed:
             return
         self._closed = True
+        if self._infer_task is not None:
+            self._infer_task.cancel()
+            await asyncio.gather(self._infer_task, return_exceptions=True)
         task, self._server_task = self._server_task, None
         if task is not None:
-            # The start thread itself cannot be cancelled; stop() below interrupts it.
+            # The start thread cannot be cancelled; supervisor.close() rejects late launches.
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        await asyncio.to_thread(self._policy_server.stop)
+        await asyncio.to_thread(self._policy_server.close)

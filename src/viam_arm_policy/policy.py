@@ -320,14 +320,6 @@ class Config(BaseModel):
     def wrist_camera_sizes(self) -> tuple[tuple[int, int], ...]:
         return ((self.wrist_camera_width, self.wrist_camera_height),)
 
-    @property
-    def default_prefix_steps(self) -> int:
-        if self.action_prefix_duration_sec is not None:
-            return _prefix_steps_from_duration(
-                self.action_prefix_duration_sec,
-                1.0 / self.contract.conditioning_fps,
-            )
-        return self.action_prefix_steps if self.action_prefix_steps is not None else 8
 
     @classmethod
     def _unconfigured(cls) -> Self:
@@ -745,11 +737,15 @@ class Policy(Generic, EasyResource):
                 self._policy_model.metadata(), self._config.connect_timeout_sec
             )
         except Exception as exc:
+            if self._ready:
+                return True
             self._mark_not_ready(
                 f"policy model {self._config.policy_model!r} has no contract: "
                 f"{type(exc).__name__}: {exc}"
             )
             return False
+        if self._ready:
+            return True
         contract_json = next(
             (
                 struct_to_dict(info.extra).get(CONTRACT_EXTRA)
@@ -969,10 +965,12 @@ class Policy(Generic, EasyResource):
                 await asyncio.gather(task, return_exceptions=True)
 
     def _observation_tensors(self, observation: Mapping[str, Any]) -> dict[str, np.ndarray]:
-        wire = self._wire_observation(observation)
-        prompt = wire.pop(PROMPT_TENSOR)
-        tensors = {name: np.ascontiguousarray(value) for name, value in wire.items()}
-        tensors[PROMPT_TENSOR] = prompt_to_tensor(prompt)
+        tensors = {
+            name: np.ascontiguousarray(value)
+            for name, value in observation.items()
+            if name != PROMPT_TENSOR
+        }
+        tensors[PROMPT_TENSOR] = prompt_to_tensor(observation[PROMPT_TENSOR])
         return tensors
 
     async def _infer(self, observation: Mapping[str, Any]) -> dict[str, Any]:
@@ -988,21 +986,7 @@ class Policy(Generic, EasyResource):
             response["server_timing"] = timing
         return response
 
-    # The upstream Cosmos policy server always inverts the gripper on the way in
-    # (observation/gripper_position) and on the way out (action[:, -1]), for DROID
-    # variants recorded with the opposite convention. Our exports train on
-    # droid_lerobot_20260115_no_noops, which has no flip, so both are undone here.
-    # Replayed actions never pass through the server and are left as recorded.
-    def _wire_observation(self, observation: Mapping[str, Any]) -> dict[str, Any]:
-        """Return the observation as sent, pre-inverting the gripper."""
-        wire = dict(observation)
-        gripper = np.asarray(observation["observation/gripper_position"])
-        wire["observation/gripper_position"] = (1.0 - gripper).astype(gripper.dtype)
-        return wire
-
-    def _parse_chunk(
-        self, response: Any, *, from_server: bool = True
-    ) -> tuple[np.ndarray, Mapping[str, Any]]:
+    def _parse_chunk(self, response: Any) -> tuple[np.ndarray, Mapping[str, Any]]:
         if not isinstance(response, Mapping):
             raise ValueError("policy response must be an object")
         actions = response.get("action")
@@ -1018,9 +1002,6 @@ class Policy(Generic, EasyResource):
         if not isinstance(timing, Mapping):
             raise ValueError("server_timing must be an object")
         parsed = np.asarray(actions, dtype=np.float64)
-        if from_server:
-            parsed = parsed.copy()
-            parsed[:, -1] = 1.0 - parsed[:, -1]
         return parsed, dict(timing)
 
     def _validate_joint_positions(self, actions: np.ndarray) -> None:
@@ -1171,10 +1152,8 @@ class Policy(Generic, EasyResource):
         history: Sequence[np.ndarray],
         prefix: int,
         conditioner_algorithm: str,
-        *,
-        from_server: bool = True,
     ) -> tuple[np.ndarray, Mapping[str, Any], Mapping[str, Any]]:
-        raw_actions, timing = self._parse_chunk(response, from_server=from_server)
+        raw_actions, timing = self._parse_chunk(response)
         unsmoothed_path_length = float(np.abs(np.diff(raw_actions[:, :6], axis=0)).sum())
         raw_actions = self._smooth_actions(raw_actions)
         algorithm, version = (
@@ -1598,7 +1577,6 @@ class Policy(Generic, EasyResource):
                         history,
                         prefix,
                         conditioner_algorithm,
-                        from_server=replay is None,
                     )
                 except ValueError as exc:
                     if consecutive_rejections >= self._max_consecutive_rejections:
@@ -1707,7 +1685,10 @@ class Policy(Generic, EasyResource):
     ) -> Mapping[str, ValueTypes]:
         if self._closed:
             raise RuntimeError(f"policy {self.name} is closed")
+        generation = self._generation
         await self._require_ready()
+        if self._closed or generation != self._generation:
+            raise RuntimeError("execution cancelled while waiting for the policy contract")
         if command.replay is None and self._policy_model is None:
             raise RuntimeError("execute requires a configured policy_model")
         prompt = command.prompt
@@ -1809,7 +1790,14 @@ class Policy(Generic, EasyResource):
                 "action_prefix_steps" not in payload
                 and "action_prefix_duration_sec" not in payload
             ):
-                defaults["action_prefix_steps"] = self._config.default_prefix_steps
+                if self._config.action_prefix_duration_sec is not None:
+                    defaults["action_prefix_duration_sec"] = self._config.action_prefix_duration_sec
+                else:
+                    defaults["action_prefix_steps"] = (
+                        self._config.action_prefix_steps
+                        if self._config.action_prefix_steps is not None
+                        else 8
+                    )
             payload = {**defaults, **payload}
         request = DO_COMMAND_ADAPTER.validate_python(payload)
         if isinstance(request, ExecuteCommand):

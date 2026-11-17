@@ -70,6 +70,7 @@ class PolicyServerSupervisor:
         self._port = 0
         self._model = ""
         self._ready_deadline = 0.0
+        self._closed = False
 
     @staticmethod
     def _redact_tail(tail: str) -> str:
@@ -162,6 +163,8 @@ class PolicyServerSupervisor:
         environment: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("policy server supervisor is closed")
             current = self._status_locked()
             if current["state"] in ("starting", "healthy"):
                 return {**current, "idempotent": True}
@@ -253,6 +256,11 @@ class PolicyServerSupervisor:
     def stop(self, grace_seconds: float = 5.0) -> dict[str, Any]:
         with self._lock:
             return self._stop_locked(grace_seconds)
+
+    def close(self) -> dict[str, Any]:
+        with self._lock:
+            self._closed = True
+            return self._stop_locked()
 
 
 def runtime_command(runtime_root: Path, model: Path, host: str, port: int) -> list[str]:

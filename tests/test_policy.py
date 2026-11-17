@@ -448,6 +448,105 @@ def test_readiness_fetches_contract_from_policy_model(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def _model_backed_policy(tmp_path, *, arm=None):
+    _, contract, _ = _write_contract(tmp_path)
+    policy = FakePolicy(pack_message({"action": _actions()}), arm=arm)
+    config = Config.model_validate(
+        {**_model_attrs(), "world": None, "action_prefix_duration_sec": 0.1}
+    )
+    config._contract = Config._unconfigured().contract
+    config._profile = policy._config.profile
+    policy._config = config
+    policy._ready = False
+    policy._policy_model._contract_json = json.dumps(contract)
+    return policy
+
+
+def test_first_execute_resolves_configured_duration_after_metadata(tmp_path):
+    async def scenario():
+        policy = _model_backed_policy(tmp_path)
+        result = await policy.do_command({"command": "execute"})
+        assert result["state"] == "completed"
+        assert len(policy._arm.targets) == 2
+        assert result["safety_profile"] == "ur20-robotiq-sim-v1"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("interrupt", ["stop", "close"])
+def test_interrupt_during_metadata_prevents_execution(tmp_path, interrupt):
+    async def scenario():
+        policy = _model_backed_policy(tmp_path)
+        started, release = asyncio.Event(), asyncio.Event()
+        metadata = policy._policy_model.metadata
+
+        async def delayed_metadata():
+            started.set()
+            await release.wait()
+            return await metadata()
+
+        policy._policy_model.metadata = delayed_metadata
+        task = asyncio.create_task(
+            policy.do_command({"command": "execute", "action_prefix_steps": 1})
+        )
+        await asyncio.wait_for(started.wait(), 1)
+        if interrupt == "close":
+            await policy.close()
+        else:
+            await policy.do_command({"command": "stop"})
+        release.set()
+        with pytest.raises(RuntimeError, match="cancelled|closed"):
+            await task
+        assert policy._arm.targets == []
+        assert policy._gripper.targets == []
+        assert policy.socket.sent == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("metadata_fails", [False, True])
+def test_late_metadata_status_preserves_active_run(tmp_path, metadata_fails):
+    async def scenario():
+        arm = FakeArm(block=True)
+        policy = _model_backed_policy(tmp_path, arm=arm)
+        started, release = asyncio.Event(), asyncio.Event()
+        metadata = policy._policy_model.metadata
+
+        async def delayed_metadata():
+            if not started.is_set():
+                started.set()
+                await release.wait()
+                if metadata_fails:
+                    raise RuntimeError("metadata unavailable")
+            return await metadata()
+
+        policy._policy_model.metadata = delayed_metadata
+        status_task = asyncio.create_task(policy.do_command({"command": "status"}))
+        await asyncio.wait_for(started.wait(), 1)
+        execution = asyncio.create_task(
+            policy.do_command({"command": "execute", "action_prefix_steps": 2})
+        )
+        try:
+            await asyncio.wait_for(arm.stream_started.wait(), 5)
+            before = await policy.do_command({"command": "status"})
+            release.set()
+            after = await status_task
+            assert after["run_id"] == before["run_id"]
+            assert after["prompt"] == "pick"
+            assert after["state"] == before["state"]
+            assert after["raw_action_chunks"] == before["raw_action_chunks"]
+        finally:
+            release.set()
+            arm.release.set()
+            result = await execution
+            await status_task
+        assert result["state"] == "completed"
+        assert result["chunks_inferred"] == 1
+        assert result["run_id"] == before["run_id"]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -1089,29 +1188,20 @@ def test_lite6_profile_floor_admits_recorded_grasp_height():
     assert z >= profile.workspace_floor_m
 
 
-def test_server_gripper_flip_is_undone_on_sent_state_and_returned_gripper():
-    policy = FakePolicy(b"")
-    observation = {
-        "observation/joint_position": np.zeros(6, dtype=np.float32),
-        "observation/gripper_position": np.array([0.0], dtype=np.float32),
-    }
-    wire = policy._wire_observation(observation)
-    assert wire["observation/gripper_position"].tolist() == [1.0]
-    assert wire["observation/gripper_position"].dtype == np.float32
-    assert observation["observation/gripper_position"].tolist() == [0.0]
+def test_controller_uses_mlmodel_gripper_convention_without_cosmos_compensation():
+    async def scenario():
+        policy = FakePolicy(None)
 
-    actions = _actions()
-    actions[:, :6] = 0.1
-    parsed, _timing = policy._parse_chunk({"action": actions})
-    assert parsed[:, 6] == pytest.approx(0.75)
-    assert parsed[:, :6] == pytest.approx(0.1)
-    assert actions[0, 6] == pytest.approx(0.25)
+        async def infer(inputs):
+            assert inputs["observation/gripper_position"].tolist() == [0.0]
+            return {"action": _actions()}
 
+        policy._policy_model.infer = infer
+        result = await policy.do_command({"command": "execute", "action_prefix_steps": 2})
+        assert result["state"] == "completed"
+        assert policy._gripper.targets == pytest.approx([0.25, 0.25])
 
-def test_replayed_gripper_is_left_as_recorded():
-    policy = FakePolicy(b"")
-    parsed, _timing = policy._parse_chunk({"action": _actions()}, from_server=False)
-    assert parsed[:, 6] == pytest.approx(0.25)
+    asyncio.run(scenario())
 
 
 def test_dataset_replay_retrieves_across_episodes_and_pads_at_episode_end():
