@@ -4,19 +4,18 @@ import json
 import time
 from dataclasses import replace
 from io import BytesIO
-from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image
-from test_model_export import _deployed_export
 from viam.components.arm import Arm, JointPositions
 from viam.media.video import CameraMimeType, ViamImage
 from viam.operations import Operation
 from viam.proto.app.robot import ComponentConfig
+from viam.proto.service.mlmodel import Metadata, TensorInfo
 from viam.utils import dict_to_struct
 
-from viam_arm_policy import model_export
+from viam_arm_policy.cosmos_policy import CosmosConfig, CosmosPolicy
 from viam_arm_policy.policy import (
     CAMERA_ALIASES,
     CAMERA_KEYS,
@@ -24,9 +23,8 @@ from viam_arm_policy.policy import (
     Config,
     Policy,
     _read_policy_contract,
-    pack_message,
-    unpack_message,
 )
+from viam_arm_policy.wire import ACTION_TENSOR, CONTRACT_EXTRA, pack_message, unpack_message
 
 
 def _image(width, height, color):
@@ -133,6 +131,18 @@ class FakeWorld:
         }
 
 
+class FakeCosmos(CosmosPolicy, register=False):
+    """The real MLModel service with its WebSocket replaced by a FakeSocket."""
+
+    def __init__(self, socket):
+        super().__init__("cosmos")
+        self.socket = socket
+        self._config = CosmosConfig(model_path="/tmp/policy-model")
+
+    async def _connect(self):
+        return self.socket
+
+
 class FakePolicy(Policy, register=False):
     def __init__(
         self,
@@ -152,7 +162,8 @@ class FakePolicy(Policy, register=False):
         self._fixed_camera_2 = None
         self._wrist_camera = FakeCamera(_image(640, 480, (4, 5, 6)))
         self.socket = FakeSocket(response, block)
-        self._config.server_uri = "ws://policy.test"
+        self._policy_model = FakeCosmos(self.socket)
+        self._config.policy_model = "cosmos"
         self._config.prompt = "pick"
         self._config.contract.embodiment.gripper_mode = gripper_mode
         self._config.contract.conditioning_fps = fps
@@ -163,10 +174,6 @@ class FakePolicy(Policy, register=False):
             else ("ur20", "robotiq_2f_85")
         ]
         self._ready = True
-
-    async def _connect(self, operation, generation):
-        self._socket = self.socket
-        return self.socket, {}
 
 
 class PhysicalFakeArm:
@@ -288,7 +295,7 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
         "fixed_camera": "scene-cam",
         "fixed_camera_2": "third-cam",
         "wrist_camera": "wrist-cam",
-        "server_uri": "ws://127.0.0.1:8000",
+        "policy_model": "cosmos",
         "prompt": "pick",
         "policy_contract_path": str(contract_path),
     }
@@ -300,6 +307,7 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
         "scene-cam",
         "wrist-cam",
         "third-cam",
+        "cosmos",
     ]
     assert list(optional) == []
     with pytest.raises(ValueError, match="action_chunk_size"):
@@ -311,8 +319,8 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
     Policy.validate_config(
         _config({**attrs, "fixed_camera_width": 640, "fixed_camera_height": 360})
     )
-    with pytest.raises(ValueError, match="server_uri"):
-        Policy.validate_config(_config({**attrs, "server_uri": "http://bad"}))
+    with pytest.raises(ValueError, match="policy_model"):
+        Policy.validate_config(_config({**attrs, "policy_model": ""}))
     Policy.validate_config(_config({**attrs, "max_reach_m": profile.max_reach_m + 1}))
     Policy.validate_config(
         _config(
@@ -337,126 +345,206 @@ def test_policy_config_requires_exact_contract_and_typed_dependency_names(tmp_pa
                 }
             )
         )
-    with pytest.raises(ValueError, match="absolute path"):
-        Policy.validate_config(_config({**attrs, "model_data_root": "relative-data"}))
+    # The inference server moved to the cosmos MLModel service; the controller
+    # ignores its attributes instead of owning them.
+    for removed in (
+        "server_uri",
+        "model_path",
+        "model_data_root",
+        "policy_server_host",
+        "model_source",
+        "hf_token",
+    ):
+        config = Config.model_validate({**attrs, removed: "owner/policy"})
+        assert not hasattr(config, removed)
 
 
-def test_policy_config_derives_managed_server_defaults(tmp_path):
+def test_policy_config_derives_workcell_defaults(tmp_path):
     contract_path, _, _ = _write_contract(tmp_path)
-    config = Config.model_validate(
-        {
-            "arm": "pick-arm",
-            "gripper": "pick-gripper",
-            "fixed_camera": "scene-cam",
-            "wrist_camera": "wrist-cam",
-            "policy_contract_path": str(contract_path),
-            "policy_server_host": "policy.internal",
-            "policy_server_port": 9001,
-        }
-    )
+    config = Config.model_validate({"policy_contract_path": str(contract_path)})
 
-    assert str(config.server_uri) == "ws://policy.internal:9001/"
-    assert config.policy_server_readiness_timeout_sec == 900.0
+    assert config.dependencies == (
+        "sim-world",
+        "pick-arm",
+        "pick-gripper",
+        "scene-cam",
+        "wrist-cam",
+        "third-cam",
+    )
+    assert config.policy_model is None
     assert config.conditioner_algorithm == "toppra"
+    assert config.deadline_tolerance_sec == 0.5
     assert config.prompt is None
 
 
-def _deployed_attrs(model_path: str) -> dict[str, str]:
+def _model_attrs() -> dict[str, str]:
     return {
         "arm": "pick-arm",
         "gripper": "pick-gripper",
         "fixed_camera": "scene-cam",
         "wrist_camera": "wrist-cam",
-        "server_uri": "ws://127.0.0.1:8000",
         "prompt": "pick",
-        "model_path": model_path,
+        "policy_model": "cosmos",
     }
 
 
-def test_model_path_config_is_required_and_absolute(tmp_path):
-    attrs = _deployed_attrs(str(tmp_path / "package"))
+def test_policy_model_or_contract_path_is_required():
+    attrs = _model_attrs()
     Policy.validate_config(_config(attrs))
-    with pytest.raises(ValueError, match="absolute path"):
-        Policy.validate_config(_config({**attrs, "model_path": "relative/package"}))
-    without_model = {key: value for key, value in attrs.items() if key != "model_path"}
-    with pytest.raises(ValueError, match="policy_contract_path or model_path"):
+    without_model = {key: value for key, value in attrs.items() if key != "policy_model"}
+    with pytest.raises(ValueError, match="policy_contract_path or policy_model"):
         Policy.validate_config(_config(without_model))
 
 
-def _deploy_package(package: Path, contract: dict) -> None:
-    _deployed_export(package)
-    (package / "policy_contract.json").write_text(json.dumps(contract))
-    runtime_path = package / "runtime_manifest.json"
-    runtime = json.loads(runtime_path.read_text())
-    runtime["policy_contract"]["sha256"] = model_export._sha256(
-        package / "policy_contract.json"
-    )
-    runtime_path.write_text(json.dumps(runtime))
+class FakeContractModel:
+    """Stands in for the MLModel dependency; `contract_json` None means not deployed yet."""
+
+    def __init__(self, contract_json=None):
+        self.contract_json = contract_json
+        self.calls = 0
+
+    async def metadata(self, **kwargs):
+        self.calls += 1
+        if self.contract_json is None:
+            raise RuntimeError("policy contract is not available yet")
+        return Metadata(
+            name="cosmos",
+            output_info=[
+                TensorInfo(
+                    name=ACTION_TENSOR,
+                    extra=dict_to_struct({CONTRACT_EXTRA: self.contract_json}),
+                )
+            ],
+        )
 
 
-def test_deployed_model_path_waits_for_package_then_starts_server(
-    tmp_path, monkeypatch
-):
+def test_readiness_fetches_contract_from_policy_model(tmp_path, monkeypatch):
     _, contract, _ = _write_contract(tmp_path)
-    package = tmp_path / "package"
-    attrs = _deployed_attrs(str(package))
+    model = FakeContractModel()
+    monkeypatch.setattr(
+        Policy, "_dependency", staticmethod(lambda deps, api, name, kind: model)
+    )
     policy = Policy("policy")
-    monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
-    policy.reconfigure(_config(attrs), {})
+    policy.reconfigure(_config(_model_attrs()), {})
     assert policy._status.state == "wait_contract"
 
-    _deploy_package(package, contract)
-    started = []
-    monkeypatch.setattr(
-        policy._policy_server,
-        "start",
-        lambda command, *args: started.append(command) or {"pid": 1},
-    )
-
     async def scenario():
+        status = await policy.do_command({"command": "status"})
+        assert status["state"] == "wait_contract"
+        assert "not available yet" in status["last_error"]
+        with pytest.raises(RuntimeError, match="not ready"):
+            await policy.do_command({"command": "execute"})
+        model.contract_json = json.dumps(contract)
         assert (await policy.do_command({"command": "status"}))["state"] == "ready"
-        await policy.do_command({"command": "policy_server", "action": "start"})
-        assert str(package) in started[0]
-        (package / "runtime" / "training_config.yaml").write_text("tampered\n")
-        with pytest.raises(ValueError, match="checksum failed"):
-            await policy.do_command({"command": "policy_server", "action": "start"})
-        assert len(started) == 1
+        fetched = model.calls
+        # Ready state is cached until the next reconfigure.
+        assert (await policy.do_command({"command": "status"}))["state"] == "ready"
+        assert model.calls == fetched
+        model.contract_json = "not json"
+        policy.reconfigure(_config(_model_attrs()), {})
+        assert (await policy.do_command({"command": "status"}))["state"] == "wait_contract"
+        assert not policy._ready
 
     asyncio.run(scenario())
 
 
-def test_readiness_reads_only_the_deployed_contract(tmp_path, monkeypatch):
+def _model_backed_policy(tmp_path, *, arm=None):
     _, contract, _ = _write_contract(tmp_path)
-    package = tmp_path / "package"
-    _deploy_package(package, contract)
-    policy = Policy("policy")
-    monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: object()))
-    allowed = {package / "policy_contract.json"}
-    opened = set()
-    original_open = Path.open
+    policy = FakePolicy(pack_message({"action": _actions()}), arm=arm)
+    config = Config.model_validate(
+        {**_model_attrs(), "world": None, "action_prefix_duration_sec": 0.1}
+    )
+    config._contract = Config._unconfigured().contract
+    config._profile = policy._config.profile
+    policy._config = config
+    policy._ready = False
+    policy._policy_model._contract_json = json.dumps(contract)
+    return policy
 
-    def guarded_open(path, *args, **kwargs):
-        assert path in allowed, f"readiness opened unrelated file or payload: {path}"
-        opened.add(path)
-        return original_open(path, *args, **kwargs)
 
-    def no_scan(*args, **kwargs):
-        raise AssertionError("readiness traversed the package")
+def test_first_execute_resolves_configured_duration_after_metadata(tmp_path):
+    async def scenario():
+        policy = _model_backed_policy(tmp_path)
+        result = await policy.do_command({"command": "execute"})
+        assert result["state"] == "completed"
+        assert len(policy._arm.targets) == 2
+        assert result["safety_profile"] == "ur20-robotiq-sim-v1"
 
-    with monkeypatch.context() as guard:
-        guard.setattr(Path, "open", guarded_open)
-        guard.setattr(Path, "rglob", no_scan)
-        guard.setattr(Path, "iterdir", no_scan)
-        for _ in range(2):
-            opened.clear()
-            policy.reconfigure(_config(_deployed_attrs(str(package))), {})
-            assert policy._status.state == "ready"
-            assert opened == allowed
+    asyncio.run(scenario())
 
-    (package / "policy_contract.json").write_text("not json")
-    policy.reconfigure(_config(_deployed_attrs(str(package))), {})
-    assert policy._status.state == "wait_contract"
-    assert not policy._ready
+
+@pytest.mark.parametrize("interrupt", ["stop", "close"])
+def test_interrupt_during_metadata_prevents_execution(tmp_path, interrupt):
+    async def scenario():
+        policy = _model_backed_policy(tmp_path)
+        started, release = asyncio.Event(), asyncio.Event()
+        metadata = policy._policy_model.metadata
+
+        async def delayed_metadata():
+            started.set()
+            await release.wait()
+            return await metadata()
+
+        policy._policy_model.metadata = delayed_metadata
+        task = asyncio.create_task(
+            policy.do_command({"command": "execute", "action_prefix_steps": 1})
+        )
+        await asyncio.wait_for(started.wait(), 1)
+        if interrupt == "close":
+            await policy.close()
+        else:
+            await policy.do_command({"command": "stop"})
+        release.set()
+        with pytest.raises(RuntimeError, match="cancelled|closed"):
+            await task
+        assert policy._arm.targets == []
+        assert policy._gripper.targets == []
+        assert policy.socket.sent == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("metadata_fails", [False, True])
+def test_late_metadata_status_preserves_active_run(tmp_path, metadata_fails):
+    async def scenario():
+        arm = FakeArm(block=True)
+        policy = _model_backed_policy(tmp_path, arm=arm)
+        started, release = asyncio.Event(), asyncio.Event()
+        metadata = policy._policy_model.metadata
+
+        async def delayed_metadata():
+            if not started.is_set():
+                started.set()
+                await release.wait()
+                if metadata_fails:
+                    raise RuntimeError("metadata unavailable")
+            return await metadata()
+
+        policy._policy_model.metadata = delayed_metadata
+        status_task = asyncio.create_task(policy.do_command({"command": "status"}))
+        await asyncio.wait_for(started.wait(), 1)
+        execution = asyncio.create_task(
+            policy.do_command({"command": "execute", "action_prefix_steps": 2})
+        )
+        try:
+            await asyncio.wait_for(arm.stream_started.wait(), 5)
+            before = await policy.do_command({"command": "status"})
+            release.set()
+            after = await status_task
+            assert after["run_id"] == before["run_id"]
+            assert after["prompt"] == "pick"
+            assert after["state"] == before["state"]
+            assert after["raw_action_chunks"] == before["raw_action_chunks"]
+        finally:
+            release.set()
+            arm.release.set()
+            result = await execution
+            await status_task
+        assert result["state"] == "completed"
+        assert result["chunks_inferred"] == 1
+        assert result["run_id"] == before["run_id"]
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
@@ -500,32 +588,6 @@ def test_execute_requires_request_or_configured_prompt():
         assert result["prompt"] == "place the part"
 
     asyncio.run(scenario())
-
-
-def test_close_stops_policy_server(tmp_path, monkeypatch):
-    _, contract, _ = _write_contract(tmp_path)
-    package = tmp_path / "package"
-    _deploy_package(package, contract)
-    monkeypatch.setattr(Policy, "_dependency", staticmethod(lambda *args: FakeGripper()))
-    policy = Policy.new(_config(_deployed_attrs(str(package))), {})
-    calls = []
-    monkeypatch.setattr(
-        policy._policy_server,
-        "start",
-        lambda *args: calls.append("start") or {"state": "healthy", "pid": 1},
-    )
-    monkeypatch.setattr(
-        policy._policy_server,
-        "stop",
-        lambda: calls.append("stop") or {"state": "absent", "stopped": True},
-    )
-
-    async def scenario():
-        await policy.do_command({"command": "policy_server", "action": "start"})
-        await policy.close()
-
-    asyncio.run(scenario())
-    assert calls == ["start", "stop"]
 
 
 def test_contract_selects_matching_profile_and_rejects_wrong_joint_order(tmp_path):
@@ -1126,29 +1188,20 @@ def test_lite6_profile_floor_admits_recorded_grasp_height():
     assert z >= profile.workspace_floor_m
 
 
-def test_server_gripper_flip_is_undone_on_sent_state_and_returned_gripper():
-    policy = FakePolicy(b"")
-    observation = {
-        "observation/joint_position": np.zeros(6, dtype=np.float32),
-        "observation/gripper_position": np.array([0.0], dtype=np.float32),
-    }
-    wire = policy._wire_observation(observation)
-    assert wire["observation/gripper_position"].tolist() == [1.0]
-    assert wire["observation/gripper_position"].dtype == np.float32
-    assert observation["observation/gripper_position"].tolist() == [0.0]
+def test_controller_uses_mlmodel_gripper_convention_without_cosmos_compensation():
+    async def scenario():
+        policy = FakePolicy(None)
 
-    actions = _actions()
-    actions[:, :6] = 0.1
-    parsed, _timing = policy._parse_chunk({"action": actions})
-    assert parsed[:, 6] == pytest.approx(0.75)
-    assert parsed[:, :6] == pytest.approx(0.1)
-    assert actions[0, 6] == pytest.approx(0.25)
+        async def infer(inputs):
+            assert inputs["observation/gripper_position"].tolist() == [0.0]
+            return {"action": _actions()}
 
+        policy._policy_model.infer = infer
+        result = await policy.do_command({"command": "execute", "action_prefix_steps": 2})
+        assert result["state"] == "completed"
+        assert policy._gripper.targets == pytest.approx([0.25, 0.25])
 
-def test_replayed_gripper_is_left_as_recorded():
-    policy = FakePolicy(b"")
-    parsed, _timing = policy._parse_chunk({"action": _actions()}, from_server=False)
-    assert parsed[:, 6] == pytest.approx(0.25)
+    asyncio.run(scenario())
 
 
 def test_dataset_replay_retrieves_across_episodes_and_pads_at_episode_end():

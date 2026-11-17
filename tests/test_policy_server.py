@@ -5,17 +5,14 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from test_model_export import _deployed_export
-from viam.proto.app.robot import ComponentConfig
-from viam.utils import dict_to_struct
 
-import viam_arm_policy.policy as policy_module
+import viam_arm_policy.cosmos_policy as cosmos_module
 import viam_arm_policy.policy_server as policy_server_module
 from viam_arm_policy import model_export
-from viam_arm_policy.policy import Policy
+from viam_arm_policy.cosmos_policy import CosmosConfig, CosmosPolicy
 from viam_arm_policy.policy_server import PolicyServerSupervisor
 
 _SERVER_PROGRAM = """
@@ -80,6 +77,12 @@ def _free_port():
 
 def _server_command(port, lifetime, exit_status):
     return [sys.executable, "-c", _SERVER_PROGRAM, str(port), str(lifetime), str(exit_status)]
+
+
+def _service(name, model_path, port=8000):
+    service = CosmosPolicy(name)
+    service._config = CosmosConfig(model_path=str(model_path), policy_server_port=port)
+    return service
 
 
 def test_health_ready_requires_expected_response(monkeypatch):
@@ -210,28 +213,26 @@ def test_redacted_tail_remains_bounded(tmp_path):
 
 def test_policy_logs_redacted_startup_failure(tmp_path, monkeypatch):
     async def scenario():
-        policy = Policy("startup-log")
+        policy = _service("startup-log", _deployed_export(tmp_path / "model"), _free_port())
         policy._policy_server = PolicyServerSupervisor(tmp_path, "startup-log")
         logger = CapturingLogger()
         monkeypatch.setattr(policy, "logger", logger)
         monkeypatch.setenv("HF_TOKEN", "inherited-secret")
-        policy._config.policy_server_port = _free_port()
-        policy._config.model_path = str(_deployed_export(tmp_path / "model"))
         program = (
             "import os, sys; print('HF_TOKEN=' + os.environ['HF_TOKEN']); "
             "raise SystemExit(9)"
         )
         monkeypatch.setattr(
-            policy_module,
+            cosmos_module,
             "runtime_command",
             lambda *args: [sys.executable, "-c", program],
         )
 
-        with pytest.raises(RuntimeError, match="exit_status=9"):
-            await policy.do_command({"command": "policy_server", "action": "start"})
+        await policy._run_policy_server()
 
+        assert "exit_status=9" in policy._server_error
         assert len(logger.errors) == 1
-        assert "failed during startup" in logger.errors[0]
+        assert "start failed" in logger.errors[0]
         assert "inherited-secret" not in logger.errors[0]
         assert len(logger.infos) == 1
         assert "start requested" in logger.infos[0]
@@ -242,21 +243,17 @@ def test_policy_logs_redacted_startup_failure(tmp_path, monkeypatch):
 def test_policy_logs_server_start_and_readiness(tmp_path, monkeypatch):
     async def scenario():
         port = _free_port()
-        policy = Policy("startup-ready-log")
+        policy = _service("startup-ready-log", _deployed_export(tmp_path / "model"), port)
         policy._policy_server = PolicyServerSupervisor(tmp_path, "startup-ready-log")
-        policy._config.policy_server_port = port
-        policy._config.model_path = str(_deployed_export(tmp_path / "model"))
         logger = CapturingLogger()
         monkeypatch.setattr(policy, "logger", logger)
         monkeypatch.setattr(
-            policy_module,
+            cosmos_module,
             "runtime_command",
             lambda *args: _server_command(port, 30, 0),
         )
 
-        result = await policy.do_command(
-            {"command": "policy_server", "action": "start"}
-        )
+        result = await policy._start_policy_server()
 
         assert result["state"] == "healthy"
         assert len(logger.infos) == 2
@@ -264,25 +261,18 @@ def test_policy_logs_server_start_and_readiness(tmp_path, monkeypatch):
         assert "ready" in logger.infos[1]
         assert f"pid={result['pid']}" in logger.infos[1]
         assert logger.errors == []
-        await policy.do_command({"command": "policy_server", "action": "stop"})
+        await asyncio.to_thread(policy._policy_server.stop)
 
     asyncio.run(scenario())
 
 
 def _start_deployed(policy):
-    async def scenario():
-        try:
-            return await policy.do_command({"command": "policy_server", "action": "start"})
-        finally:
-            policy._detach_policy_server_watcher()
-
-    return asyncio.run(scenario())
+    return asyncio.run(policy._start_policy_server())
 
 
 def test_deployed_start_reads_only_the_package_without_weights(tmp_path, monkeypatch):
     target = _deployed_export(tmp_path / "package")
-    policy = Policy("deployed-start")
-    policy._config.model_path = str(target)
+    policy = _service("deployed-start", target)
     supervisor = CapturingSupervisor()
     policy._policy_server = supervisor
     opened = set()
@@ -318,8 +308,7 @@ def test_deployed_start_leaves_weight_loading_to_the_server(tmp_path, mutation):
         weights.unlink()
     else:
         weights.write_bytes(b"tampered")
-    policy = Policy("weights-start")
-    policy._config.model_path = str(target)
+    policy = _service("weights-start", target)
     supervisor = CapturingSupervisor()
     policy._policy_server = supervisor
 
@@ -330,8 +319,7 @@ def test_deployed_start_leaves_weight_loading_to_the_server(tmp_path, mutation):
 def test_deployed_start_does_not_hash_vae(tmp_path):
     target = _deployed_export(tmp_path / "package")
     (target / "runtime" / "vae" / "fixture.bin").write_bytes(b"tampered")
-    policy = Policy("vae-start")
-    policy._config.model_path = str(target)
+    policy = _service("vae-start", target)
     supervisor = CapturingSupervisor()
     policy._policy_server = supervisor
 
@@ -356,8 +344,7 @@ def test_deployed_start_rejects_invalid_runtime_files(tmp_path, payload, mutatio
         path.unlink()
     else:
         path.write_bytes(b"tampered")
-    policy = Policy("invalid-start")
-    policy._config.model_path = str(target)
+    policy = _service("invalid-start", target)
     supervisor = CapturingSupervisor()
     policy._policy_server = supervisor
 
@@ -366,10 +353,10 @@ def test_deployed_start_rejects_invalid_runtime_files(tmp_path, payload, mutatio
     assert supervisor.commands == []
 
 
-def test_start_requires_model_path(tmp_path):
-    policy = Policy("no-model")
+def test_start_requires_configuration(tmp_path):
+    policy = CosmosPolicy("no-model")
     policy._policy_server = CapturingSupervisor()
-    with pytest.raises(NotImplementedError, match="requires configured model_path"):
+    with pytest.raises(RuntimeError, match="not configured"):
         _start_deployed(policy)
 
 
@@ -378,22 +365,17 @@ def test_watcher_logs_owned_exit_once_with_exit_status(tmp_path, monkeypatch):
         port = _free_port()
         supervisor = PolicyServerSupervisor(tmp_path, "watch")
         supervisor.start(_server_command(port, 0.2, 7), "127.0.0.1", port, 2)
-        policy = Policy("watch")
+        policy = CosmosPolicy("watch")
         logger = CapturingLogger()
         monkeypatch.setattr(policy, "logger", logger)
         policy._policy_server = supervisor
-        policy._ensure_policy_server_watcher()
 
-        deadline = time.monotonic() + 3
-        while not logger.errors and time.monotonic() < deadline:
-            await asyncio.sleep(0.02)
+        await asyncio.wait_for(policy._watch_policy_server(), 3)
 
         assert len(logger.errors) == 1
         assert "exit_status=7" in logger.errors[0]
         assert str(supervisor.log_path) in logger.errors[0]
-        await asyncio.sleep(0.3)
-        assert len(logger.errors) == 1
-        assert policy._policy_server_watch_task is None
+        assert "exited with status 7" in policy._server_error
 
     asyncio.run(scenario())
 
@@ -403,79 +385,19 @@ def test_expected_stop_is_silent_and_releases_watcher(tmp_path, monkeypatch):
         port = _free_port()
         supervisor = PolicyServerSupervisor(tmp_path, "stop")
         supervisor.start(_server_command(port, 30, 0), "127.0.0.1", port, 2)
-        policy = Policy("stop")
+        policy = CosmosPolicy("stop")
         logger = CapturingLogger()
         monkeypatch.setattr(policy, "logger", logger)
         policy._policy_server = supervisor
-        policy._ensure_policy_server_watcher()
+        watcher = asyncio.create_task(policy._watch_policy_server())
 
         await asyncio.sleep(0.05)
-        await policy.do_command({"command": "policy_server", "action": "stop"})
-        deadline = time.monotonic() + 2
-        while policy._policy_server_watch_task is not None and time.monotonic() < deadline:
-            await asyncio.sleep(0.02)
+        await asyncio.to_thread(supervisor.stop)
+        await asyncio.wait_for(watcher, 2)
 
         assert logger.errors == []
-        assert policy._policy_server_watch_task is None
 
     asyncio.run(scenario())
-
-
-def test_reconfigure_detaches_watcher_without_stopping_retained_server(
-    tmp_path, monkeypatch
-):
-    class RetainedServer:
-        def __init__(self):
-            self.stop_calls = 0
-
-        def poll_failure(self):
-            return None
-
-        def running(self):
-            return True
-
-        def stop(self):
-            self.stop_calls += 1
-
-    async def scenario():
-        policy = Policy("reconfigure")
-        retained = RetainedServer()
-        policy._policy_server = retained
-        policy._ensure_policy_server_watcher()
-        watcher = policy._policy_server_watch_task
-        assert watcher is not None
-        parsed = SimpleNamespace(
-            world=None,
-            arm="arm",
-            gripper="gripper",
-            fixed_camera="fixed",
-            fixed_camera_2="",
-            wrist_camera="wrist",
-            model_data_root=str(tmp_path),
-            binary_gripper_initial_state=0.0,
-        )
-        monkeypatch.setattr(
-            policy_module.Config,
-            "model_validate",
-            classmethod(lambda cls, config: parsed),
-        )
-        monkeypatch.setattr(
-            Policy, "_dependency", staticmethod(lambda *args: object())
-        )
-        monkeypatch.setattr(Policy, "_advance_readiness", lambda self: True)
-
-        policy.reconfigure(
-            ComponentConfig(name="reconfigure", attributes=dict_to_struct({})), {}
-        )
-        await asyncio.sleep(0)
-
-        assert retained.stop_calls == 0
-        assert watcher.done()
-        policy._stop_command = lambda: asyncio.sleep(0, result={})
-        await policy.close()
-
-    asyncio.run(scenario())
-
 
 
 def test_start_refuses_a_port_already_served_by_a_foreign_server(tmp_path):
