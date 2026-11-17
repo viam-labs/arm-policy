@@ -144,7 +144,7 @@ def test_close_cancels_active_inference_and_rejects_queued_calls():
         await service.close()
         try:
             assert socket.closed.is_set()
-            with pytest.raises(asyncio.CancelledError):
+            with pytest.raises(RuntimeError, match="closed"):
                 await active
             with pytest.raises(RuntimeError, match="closed"):
                 await queued
@@ -155,6 +155,54 @@ def test_close_cancels_active_inference_and_rejects_queued_calls():
             active.cancel()
             queued.cancel()
             await asyncio.gather(active, queued, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("service_closes", [True, False])
+def test_inference_rpc_shutdown_preserves_caller_cancellation(service_closes):
+    from grpclib.client import Channel
+    from grpclib.exceptions import GRPCError
+    from viam.rpc.server import Server
+    from viam.services.mlmodel.client import MLModelClient
+
+    async def scenario():
+        connected = asyncio.Event()
+        socket = FakeSocket(None, block=True)
+        service = SocketCosmos(socket)
+
+        async def connect():
+            connected.set()
+            return socket
+
+        service._connect = connect
+        rpc = Server([service])
+        await rpc._server.start("127.0.0.1", 0)
+        channel = Channel("127.0.0.1", rpc._server._server.sockets[0].getsockname()[1])
+        client = MLModelClient("cosmos", channel)
+        active = asyncio.create_task(client.infer(_inputs(), timeout=5))
+        try:
+            await asyncio.wait_for(connected.wait(), 1)
+            if service_closes:
+                await service.close()
+                with pytest.raises(GRPCError, match="closed"):
+                    await asyncio.wait_for(active, 1)
+            else:
+                active.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await active
+                await asyncio.wait_for(socket.closed.wait(), 1)
+                socket.response = pack_message({"action": np.zeros((32, 7))})
+                socket.block = False
+                output = await client.infer(_inputs(), timeout=2)
+                np.testing.assert_array_equal(output[ACTION_TENSOR][:, :6], 0)
+        finally:
+            active.cancel()
+            await asyncio.gather(active, return_exceptions=True)
+            channel.close()
+            rpc._server.close()
+            await rpc._server.wait_closed()
+            await service.close()
 
     asyncio.run(scenario())
 

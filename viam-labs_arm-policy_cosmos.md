@@ -55,7 +55,7 @@ Gripper values on the MLModel API follow the contract: `0=open`, `1=closed`. The
 
 The service starts the managed server in the background from `reconfigure` whenever `server_uri` is unset; there is no command to start or stop it. The server lives exactly as long as the service instance: closing the service (module or `viam-server` restart, resource removal) stops it. Because the Python module SDK rebuilds a resource on every configuration edit (close the old instance, construct the new one), every edit to the service's attributes, including a `model_path` change, stops the server and starts a fresh one, which pays the full startup cost again (typically 60–90 s once the environment is provisioned). `Metadata` works as soon as `<model_path>/policy_contract.json` is readable; `Infer` fails with the supervisor's state and the last start error until the server answers.
 
-Closing also cancels active inference, closes its WebSocket, and rejects queued or later calls. Supervisor shutdown prevents a delayed startup worker from launching a child after the service closes. An external server configured with `server_uri` is never stopped by the service.
+Closing also cancels active inference, closes its WebSocket, and returns a closed-service error to active, queued, or later `Infer` calls without waiting for their client deadlines. Caller-requested cancellation remains cancellation. Supervisor shutdown prevents a delayed startup worker from launching a child after the service closes. An external server configured with `server_uri` is never stopped by the service.
 
 ### Managed policy server (MLModel service)
 

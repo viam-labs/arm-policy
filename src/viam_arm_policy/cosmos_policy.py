@@ -378,6 +378,10 @@ class CosmosPolicy(MLModel, EasyResource):
                     raw = await asyncio.wait_for(socket.recv(), timeout=config.inference_timeout_sec)
                 finally:
                     await socket.close()
+            except asyncio.CancelledError:
+                if self._closed:
+                    raise RuntimeError(f"cosmos policy {self.name} is closed") from None
+                raise
             finally:
                 self._infer_task = None
         if not isinstance(raw, bytes):
